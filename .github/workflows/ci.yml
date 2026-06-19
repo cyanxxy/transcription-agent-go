@@ -1,0 +1,66 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build-test:
+    name: build · test · lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          check-latest: true
+          cache: true
+
+      - name: Install ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+
+      - name: Verify formatting
+        run: |
+          fmt_diff=$(gofmt -s -l .)
+          if [ -n "$fmt_diff" ]; then
+            echo "::error::gofmt detected changes in:"
+            echo "$fmt_diff"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v8
+        with:
+          version: v2.12.2
+
+      - name: Unit tests (race detector)
+        run: go test ./... -race -count=1
+
+      - name: Build binaries
+        run: |
+          go build -trimpath -ldflags "-s -w -X main.version=ci" -o bin/transcription-server ./cmd/server
+          go build -trimpath -ldflags "-s -w -X main.version=ci" -o bin/transcriber-cli      ./cmd/cli
+
+      - name: Server smoke test
+        run: |
+          GEMINI_API_KEY=dummy ./bin/transcription-server --addr 127.0.0.1:8765 &
+          PID=$!
+          # Wait for /readyz to come up.
+          for i in $(seq 1 20); do
+            if curl -fs http://127.0.0.1:8765/readyz >/dev/null; then break; fi
+            sleep 0.5
+          done
+          curl -fs http://127.0.0.1:8765/healthz
+          curl -fs http://127.0.0.1:8765/readyz
+          curl -fs http://127.0.0.1:8765/ -o /dev/null
+          kill -TERM $PID
+          wait $PID || true

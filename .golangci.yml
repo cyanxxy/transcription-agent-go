@@ -1,0 +1,66 @@
+# golangci-lint v2 configuration.
+# Run with: golangci-lint run   (and `golangci-lint fmt` for the formatters).
+# The target Go version is inferred from go.mod (single source of truth).
+version: "2"
+run:
+  tests: true
+linters:
+  default: none
+  enable:
+    - bodyclose
+    - copyloopvar
+    - errcheck
+    - govet
+    - ineffassign
+    - misspell
+    - nilerr
+    - prealloc
+    - revive
+    - staticcheck
+    - unconvert
+    - unparam
+    - unused
+  settings:
+    misspell:
+      locale: US
+    revive:
+      rules:
+        - name: var-naming
+        - name: package-comments
+        - name: error-strings
+        - name: error-return
+        - name: error-naming
+        - name: unused-parameter
+          disabled: true
+  exclusions:
+    generated: lax
+    presets:
+      - comments
+      - common-false-positives
+      - legacy
+      - std-error-handling
+    rules:
+      - linters:
+          - errcheck
+          - prealloc
+          - revive
+          - unparam
+        path: _test\.go
+      - linters:
+          - unused
+        path: cmd/
+        text: is unused
+    paths:
+      - third_party$
+      - builtin$
+      - examples$
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  exclusions:
+    generated: lax
+    paths:
+      - third_party$
+      - builtin$
+      - examples$

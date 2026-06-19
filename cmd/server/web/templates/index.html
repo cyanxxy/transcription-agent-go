@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Transcription Agent (Go)</title>
+  <link rel="icon" href="data:," />
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <main class="shell">
+    <header class="hero glass-panel">
+      <div class="hero-copy">
+        <p class="eyebrow">ExactTranscriber</p>
+        <h1>Transcription Studio</h1>
+        <p class="subtitle">
+          Candidate fan-out, judge fan-in, and timestamp-aware review for long-form audio.
+        </p>
+      </div>
+      <div class="hero-status" aria-label="Pipeline defaults">
+        <span><b></b>Judge pipeline</span>
+        <span>Dual Gemini default</span>
+        <span>SSE progress stream</span>
+      </div>
+    </header>
+
+    <section class="glass-panel" id="upload-card">
+      <div class="section-heading">
+        <p class="eyebrow">Input</p>
+        <h2>Upload audio</h2>
+      </div>
+      <form id="upload-form" enctype="multipart/form-data">
+        <div class="dropzone" id="dropzone">
+          <input type="file" name="audio" id="audio-input" accept=".mp3,.wav,.m4a,.flac,.ogg" aria-label="Audio file" aria-describedby="file-hint" required />
+          <span class="dropzone-kicker">Audio source</span>
+          <p class="file-name" id="file-name">Drop an audio file here, or click to browse.</p>
+          <p class="hint" id="file-hint">Supported: mp3 &middot; wav &middot; m4a &middot; flac &middot; ogg</p>
+        </div>
+
+        <fieldset class="grid">
+          <legend>Pipeline controls</legend>
+          <label>
+            <span>Primary model</span>
+            <select name="model_name">
+              <option value="gemini-3-flash-preview">Gemini 3 Flash</option>
+              <option value="gemini-3.1-flash-lite">Gemini 3.1 Flash-Lite</option>
+              <option value="gemini-3.1-pro-preview" selected>Gemini 3.1 Pro</option>
+              <option value="gemini-3.5-flash">Gemini 3.5 Flash</option>
+            </select>
+          </label>
+          <label>
+            <span>Judge model</span>
+            <select name="judge_model_name">
+              <option value="gemini-3-flash-preview">Gemini 3 Flash</option>
+              <option value="gemini-3.1-flash-lite">Gemini 3.1 Flash-Lite</option>
+              <option value="gemini-3.1-pro-preview" selected>Gemini 3.1 Pro</option>
+              <option value="gemini-3.5-flash">Gemini 3.5 Flash</option>
+            </select>
+          </label>
+          <label>
+            <span>Candidate strategy</span>
+            <select name="candidate_strategy">
+              <option value="single_gemini">Single Gemini</option>
+              <option value="dual_gemini" selected>Dual Gemini</option>
+              <option value="gemini_plus_parakeet">Gemini + Parakeet</option>
+            </select>
+          </label>
+          <label>
+            <span>Service tier</span>
+            <select name="service_tier">
+              <option value="standard" selected>Standard</option>
+              <option value="flex">Flex</option>
+              <option value="priority">Priority</option>
+            </select>
+          </label>
+          <label>
+            <span>Chunk parallelism</span>
+            <input name="chunk_concurrency" type="number" min="1" max="8" value="3" />
+          </label>
+          <label>
+            <span>Chunk planner</span>
+            <select name="chunk_strategy">
+              <option value="adaptive" selected>Adaptive silence-aware</option>
+              <option value="fixed">Fixed windows</option>
+            </select>
+          </label>
+          <label>
+            <span>Thinking (transcription)</span>
+            <select name="transcription_thinking_level">
+              <option value="minimal">minimal</option>
+              <option value="low">low</option>
+              <option value="medium">medium</option>
+              <option value="high" selected>high</option>
+            </select>
+          </label>
+          <label>
+            <span>Thinking (judge)</span>
+            <select name="judge_thinking_level">
+              <option value="minimal">minimal</option>
+              <option value="low">low</option>
+              <option value="medium">medium</option>
+              <option value="high" selected>high</option>
+            </select>
+          </label>
+          <label class="toggle">
+            <input type="checkbox" name="use_judge_pipeline" checked />
+            <span>Enable judge pipeline</span>
+          </label>
+          <label class="toggle">
+            <input type="checkbox" name="auto_format" checked />
+            <span>Auto-format transcript</span>
+          </label>
+          <label class="toggle">
+            <input type="checkbox" name="remove_fillers" />
+            <span>Remove filler words</span>
+          </label>
+        </fieldset>
+
+        <fieldset class="grid">
+          <legend>Context guidance</legend>
+          <label class="full">
+            <span>Topic</span>
+            <input name="topic" type="text" placeholder="e.g. quarterly product review" />
+          </label>
+          <label class="full">
+            <span>Speakers (one per line)</span>
+            <textarea name="speakers" rows="2" placeholder="Alice&#10;Bob"></textarea>
+          </label>
+          <label class="full">
+            <span>Technical terms (comma-separated)</span>
+            <input name="technical_terms" type="text" placeholder="kubernetes, BLAS, anchored backprop" />
+          </label>
+          <label class="full">
+            <span>Custom instructions</span>
+            <textarea name="custom_instructions" rows="2"></textarea>
+          </label>
+        </fieldset>
+
+        <button type="submit" class="primary" id="submit-btn">
+          <span class="label">Transcribe</span>
+          <span class="spinner" hidden></span>
+        </button>
+      </form>
+    </section>
+
+    <section class="glass-panel" id="status-card" hidden>
+      <div class="section-heading">
+        <p class="eyebrow">Run state</p>
+        <h2>Progress</h2>
+      </div>
+      <div class="progress" role="progressbar" aria-labelledby="progress-label" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+        <div class="progress-bar" id="progress-bar"></div>
+      </div>
+      <p class="progress-label" id="progress-label" aria-live="polite">Initializing...</p>
+      <pre class="log" id="log" aria-live="polite"></pre>
+    </section>
+
+    <section class="glass-panel" id="result-card" hidden>
+      <div class="section-heading">
+        <p class="eyebrow">Output</p>
+        <h2>Result</h2>
+      </div>
+      <div class="result-summary" id="result-summary" aria-live="polite"></div>
+      <div class="tabs" role="tablist" aria-label="Transcript result views">
+        <button data-tab="formatted" class="tab active" id="tab-button-formatted" role="tab" aria-selected="true" aria-controls="tab-formatted">Formatted</button>
+        <button data-tab="srt" class="tab" id="tab-button-srt" role="tab" aria-selected="false" aria-controls="tab-srt">SRT</button>
+        <button data-tab="json" class="tab" id="tab-button-json" role="tab" aria-selected="false" aria-controls="tab-json">JSON</button>
+        <button data-tab="judge" class="tab" id="tab-button-judge" role="tab" aria-selected="false" aria-controls="tab-judge">Judge notes</button>
+        <button data-tab="quality" class="tab" id="tab-button-quality" role="tab" aria-selected="false" aria-controls="tab-quality">Quality</button>
+      </div>
+      <pre class="output" id="tab-formatted" role="tabpanel" aria-labelledby="tab-button-formatted"></pre>
+      <pre class="output" id="tab-srt" role="tabpanel" aria-labelledby="tab-button-srt" hidden></pre>
+      <pre class="output" id="tab-json" role="tabpanel" aria-labelledby="tab-button-json" hidden></pre>
+      <pre class="output" id="tab-judge" role="tabpanel" aria-labelledby="tab-button-judge" hidden></pre>
+      <pre class="output" id="tab-quality" role="tabpanel" aria-labelledby="tab-button-quality" hidden></pre>
+      <div class="actions">
+        <button class="ghost" id="download-txt">Download .txt</button>
+        <button class="ghost" id="download-srt">Download .srt</button>
+        <button class="ghost" id="download-json">Download .json</button>
+      </div>
+    </section>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

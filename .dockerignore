@@ -1,0 +1,16 @@
+bin/
+.git/
+.github/
+README.md
+*.md
+docker-compose*.yml
+Dockerfile*
+.dockerignore
+.gitignore
+.golangci.yml
+Makefile
+tools/
+
+# Skill packs ship in the image (their SKILL.md bodies are read at runtime).
+!.skills
+!.skills/**

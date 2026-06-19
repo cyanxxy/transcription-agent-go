@@ -1,0 +1,22 @@
+# Build artifacts
+/bin/
+*.exe
+*.out
+
+# Test / coverage
+coverage.out
+coverage.html
+
+# Go workspace
+go.work
+go.work.sum
+
+# Editor / OS
+.DS_Store
+*.swp
+.idea/
+.vscode/
+
+# Local secrets / env
+.env
+*.local
