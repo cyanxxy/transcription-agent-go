@@ -1,12 +1,10 @@
 // Package gemini is a lean wrapper around the Gemini REST API that exposes
 // the operations the transcription pipeline needs:
 //   - resumable file upload (so we can pass audio by URI rather than inline)
-//   - generateContent calls with system instructions, thinking config, and
-//     structured (JSON-schema-driven) output
+//   - Interactions API calls with typed multimodal input, structured output,
+//     exact execution steps, and client-side function tools
 //
-// It depends only on the Go standard library so the project stays dependency
-// free, which matches the brief: the same multi-agent architecture, this time
-// in Go.
+// It depends only on the Go standard library.
 //
 // Production hardening:
 //   - retries with exponential backoff + jitter on 408/425/429/5xx and
@@ -67,6 +65,29 @@ type Client struct {
 	endpoint string
 	http     *http.Client
 	retry    RetryConfig
+}
+
+// ModelCallObservation exposes generateContent request and usage boundaries to
+// orchestration budgets without coupling the client to workflow types.
+type ModelCallObservation struct {
+	Phase     string
+	Operation string
+	Usage     *UsageMetadata
+}
+
+type ModelCallObserver func(ModelCallObservation) error
+type modelCallObserverContextKey struct{}
+
+func WithModelCallObserver(ctx context.Context, observer ModelCallObserver) context.Context {
+	return context.WithValue(ctx, modelCallObserverContextKey{}, observer)
+}
+
+func observeModelCall(ctx context.Context, observation ModelCallObservation) error {
+	observer, _ := ctx.Value(modelCallObserverContextKey{}).(ModelCallObserver)
+	if observer == nil {
+		return nil
+	}
+	return observer(observation)
 }
 
 // NewClient builds a client bound to the given API key. If endpoint is empty
@@ -159,6 +180,9 @@ func (c *Client) UploadFile(ctx context.Context, path string) (*FileInfo, error)
 
 	final, err := c.waitFileActive(ctx, fileInfo.Name)
 	if err != nil {
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+		defer cancel()
+		_ = c.DeleteFile(cleanupCtx, fileInfo.Name)
 		return nil, err
 	}
 	return final, nil
@@ -324,6 +348,7 @@ type FileData struct {
 
 // FunctionCall is a model-requested client-side tool invocation.
 type FunctionCall struct {
+	ID   string         `json:"id,omitempty"`
 	Name string         `json:"name"`
 	Args map[string]any `json:"args,omitempty"`
 }
@@ -568,6 +593,10 @@ func (c *Client) GenerateContentWithTools(
 
 // GenerateContent calls the Gemini generateContent endpoint.
 func (c *Client) GenerateContent(ctx context.Context, model string, req *GenerateRequest) (*GenerateResponse, error) {
+	operation := "models." + model + ":generateContent"
+	if err := observeModelCall(ctx, ModelCallObservation{Phase: "before_request", Operation: operation}); err != nil {
+		return nil, err
+	}
 	endpoint := fmt.Sprintf("%s/%s/models/%s:generateContent", c.endpoint, apiVersion, url.PathEscape(model))
 	bs, err := json.Marshal(req)
 	if err != nil {
@@ -595,6 +624,9 @@ func (c *Client) GenerateContent(ctx context.Context, model string, req *Generat
 	var out GenerateResponse
 	if err := json.Unmarshal(body, &out); err != nil {
 		return nil, fmt.Errorf("decode response: %w (body=%s)", err, snippetScrubbed(body, 512, c.apiKey))
+	}
+	if err := observeModelCall(ctx, ModelCallObservation{Phase: "after_response", Operation: operation, Usage: out.UsageMetadata}); err != nil {
+		return nil, err
 	}
 	// Surface terminal finish/block reasons as typed errors so callers get a
 	// clear signal instead of a confusing downstream JSON-parse failure on
@@ -813,7 +845,7 @@ func guessMime(path string) string {
 	ext := strings.ToLower(filepath.Ext(path))
 	switch ext {
 	case ".mp3":
-		return "audio/mpeg"
+		return "audio/mp3"
 	case ".wav":
 		return "audio/wav"
 	case ".m4a":

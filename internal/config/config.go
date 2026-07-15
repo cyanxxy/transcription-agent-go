@@ -90,13 +90,13 @@ func ResolveDualGeminiSecondaryModel(primary string) string {
 	case "gemini-3-flash-preview":
 		return "gemini-3.1-flash-lite"
 	case "gemini-3.1-flash-lite":
-		return "gemini-3-flash-preview"
+		return "gemini-3.5-flash"
 	case "gemini-3.1-pro-preview":
-		return "gemini-3-flash-preview"
+		return "gemini-3.5-flash"
 	case "gemini-3.5-flash":
-		return "gemini-3-flash-preview"
+		return "gemini-3.1-flash-lite"
 	}
-	return "gemini-3-flash-preview"
+	return "gemini-3.1-flash-lite"
 }
 
 // CandidateSpec describes one candidate transcription run.
@@ -132,13 +132,22 @@ type TranscriptionDeps struct {
 	SkillRoots                 []string
 	UseSkills                  bool
 	UseSkillRouter             bool
+	AgenticMode                bool
+	AgentMaxCandidateRuns      int
+	AgentMaxJudgeCalls         int
+	AgentMaxPlannerTurns       int
+	AgentMaxSpanEscalations    int
+	AgentEscalationScore       float64
+	AgentGlobalReview          bool
+	AgentMaxTokens             int
+	tempDirOwned               bool
 }
 
 // NewTranscriptionDeps constructs a validated TranscriptionDeps.
 func NewTranscriptionDeps(apiKey string, opts ...TranscriptionOption) (*TranscriptionDeps, error) {
 	d := &TranscriptionDeps{
 		APIKey:                     apiKey,
-		ModelName:                  "gemini-3-flash-preview",
+		ModelName:                  "gemini-3.5-flash",
 		JudgeModelName:             "gemini-3.1-pro-preview",
 		CandidateStrategy:          "dual_gemini",
 		MaxFileSizeMB:              200,
@@ -157,6 +166,14 @@ func NewTranscriptionDeps(apiKey string, opts ...TranscriptionOption) (*Transcri
 		UseJudgePipeline:           true,
 		UseSkills:                  true,
 		UseSkillRouter:             false,
+		AgenticMode:                true,
+		AgentMaxCandidateRuns:      3,
+		AgentMaxJudgeCalls:         4,
+		AgentMaxPlannerTurns:       3,
+		AgentMaxSpanEscalations:    4,
+		AgentEscalationScore:       78,
+		AgentGlobalReview:          true,
+		AgentMaxTokens:             1000000,
 	}
 	for _, opt := range opts {
 		opt(d)
@@ -190,8 +207,11 @@ func NewTranscriptionDeps(apiKey string, opts ...TranscriptionOption) (*Transcri
 		return nil, err
 	}
 	d.JudgeThinkingLevel = level
-	if d.ChunkDurationMS <= 0 {
-		return nil, fmt.Errorf("chunk_duration_ms must be > 0")
+	if d.MaxFileSizeMB < 1 || d.MaxFileSizeMB > 2048 {
+		return nil, fmt.Errorf("max_file_size_mb must be between 1 and 2048")
+	}
+	if d.ChunkDurationMS < 10000 || d.ChunkDurationMS > 3600000 {
+		return nil, fmt.Errorf("chunk_duration_ms must be between 10000 and 3600000")
 	}
 	if d.ChunkOverlapMS < 0 {
 		return nil, fmt.Errorf("chunk_overlap_ms must be >= 0")
@@ -199,8 +219,29 @@ func NewTranscriptionDeps(apiKey string, opts ...TranscriptionOption) (*Transcri
 	if d.ChunkOverlapMS >= d.ChunkDurationMS {
 		return nil, fmt.Errorf("chunk_overlap_ms must be less than chunk_duration_ms")
 	}
-	if d.ChunkConcurrency <= 0 {
-		return nil, fmt.Errorf("chunk_concurrency must be > 0")
+	if d.ChunkConcurrency < 1 || d.ChunkConcurrency > 16 {
+		return nil, fmt.Errorf("chunk_concurrency must be between 1 and 16")
+	}
+	if d.MaxOutputTokens < 1024 || d.MaxOutputTokens > 65536 {
+		return nil, fmt.Errorf("max_output_tokens must be between 1024 and 65536")
+	}
+	if d.AgentMaxCandidateRuns < 1 || d.AgentMaxCandidateRuns > 8 {
+		return nil, fmt.Errorf("agent_max_candidate_runs must be between 1 and 8")
+	}
+	if d.AgentMaxJudgeCalls < 1 || d.AgentMaxJudgeCalls > 16 {
+		return nil, fmt.Errorf("agent_max_judge_calls must be between 1 and 16")
+	}
+	if d.AgentMaxPlannerTurns < 1 || d.AgentMaxPlannerTurns > 8 {
+		return nil, fmt.Errorf("agent_max_planner_turns must be between 1 and 8")
+	}
+	if d.AgentMaxSpanEscalations < 0 || d.AgentMaxSpanEscalations > 32 {
+		return nil, fmt.Errorf("agent_max_span_escalations must be between 0 and 32")
+	}
+	if d.AgentEscalationScore < 0 || d.AgentEscalationScore > 100 {
+		return nil, fmt.Errorf("agent_escalation_score must be between 0 and 100")
+	}
+	if d.AgentMaxTokens < 10000 || d.AgentMaxTokens > 10000000 {
+		return nil, fmt.Errorf("agent_max_tokens must be between 10000 and 10000000")
 	}
 	if d.TempDir == "" {
 		dir, err := os.MkdirTemp("", "transcriber_")
@@ -208,6 +249,7 @@ func NewTranscriptionDeps(apiKey string, opts ...TranscriptionOption) (*Transcri
 			return nil, fmt.Errorf("create temp dir: %w", err)
 		}
 		d.TempDir = dir
+		d.tempDirOwned = true
 	} else if err := os.MkdirAll(d.TempDir, 0o755); err != nil {
 		return nil, fmt.Errorf("create temp dir %s: %w", d.TempDir, err)
 	}
@@ -309,12 +351,13 @@ func (d *TranscriptionDeps) WithModel(model string) *TranscriptionDeps {
 func (d *TranscriptionDeps) WithTempDir(dir string) *TranscriptionDeps {
 	c := d.Clone()
 	c.TempDir = dir
+	c.tempDirOwned = false
 	return c
 }
 
 // Cleanup removes the deps' temp directory.
 func (d *TranscriptionDeps) Cleanup() error {
-	if d.TempDir == "" {
+	if d.TempDir == "" || !d.tempDirOwned {
 		return nil
 	}
 	return os.RemoveAll(d.TempDir)
@@ -380,6 +423,26 @@ func WithUseSkills(v bool) TranscriptionOption {
 func WithUseSkillRouter(v bool) TranscriptionOption {
 	return func(d *TranscriptionDeps) { d.UseSkillRouter = v }
 }
+func WithAgenticMode(v bool) TranscriptionOption {
+	return func(d *TranscriptionDeps) { d.AgenticMode = v }
+}
+func WithAgentBudgets(candidateRuns, judgeCalls, plannerTurns, spanEscalations int) TranscriptionOption {
+	return func(d *TranscriptionDeps) {
+		d.AgentMaxCandidateRuns = candidateRuns
+		d.AgentMaxJudgeCalls = judgeCalls
+		d.AgentMaxPlannerTurns = plannerTurns
+		d.AgentMaxSpanEscalations = spanEscalations
+	}
+}
+func WithAgentEscalationScore(v float64) TranscriptionOption {
+	return func(d *TranscriptionDeps) { d.AgentEscalationScore = v }
+}
+func WithAgentGlobalReview(v bool) TranscriptionOption {
+	return func(d *TranscriptionDeps) { d.AgentGlobalReview = v }
+}
+func WithAgentMaxTokens(v int) TranscriptionOption {
+	return func(d *TranscriptionDeps) { d.AgentMaxTokens = v }
+}
 
 // EditingDeps mirrors the editing options.
 type EditingDeps struct {
@@ -401,20 +464,14 @@ func DefaultEditingDeps() EditingDeps {
 		PreserveTimestamps:    true,
 		MaxUndoHistory:        50,
 		RemoveFillers:         false,
-		SentenceCase:          true,
+		SentenceCase:          false,
 		RemoveExtraSpaces:     true,
-		FixPunctuationSpacing: true,
+		FixPunctuationSpacing: false,
 		FillerWords: []string{
 			"um", "uh", "like", "you know", "I mean",
 			"sort of", "kind of", "basically", "actually",
 		},
-		Replacements: map[string]string{
-			"gonna": "going to",
-			"wanna": "want to",
-			"gotta": "got to",
-			"kinda": "kind of",
-			"sorta": "sort of",
-		},
+		Replacements: nil,
 	}
 }
 

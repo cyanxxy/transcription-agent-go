@@ -570,6 +570,55 @@ button.ghost:hover {
   font-weight: 620;
 }
 
+.run-status-row {
+	min-height: 44px;
+	display: flex;
+	align-items: flex-start;
+	justify-content: space-between;
+	gap: 16px;
+}
+
+.job-reference {
+	margin: 5px 0 0;
+	color: var(--ink-muted);
+	font: 0.76rem/1.4 ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+	overflow-wrap: anywhere;
+}
+
+.status-badge {
+	min-width: 78px;
+	min-height: 28px;
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	padding: 5px 10px;
+	color: var(--ink-soft);
+	background: rgba(255, 255, 255, 0.48);
+	border: 1px solid rgba(34, 45, 59, 0.12);
+	border-radius: 999px;
+	font-size: 0.76rem;
+	font-weight: 760;
+	white-space: nowrap;
+}
+
+.status-badge[data-state="active"] {
+	color: var(--success);
+	border-color: rgba(28, 143, 87, 0.24);
+	background: rgba(28, 143, 87, 0.08);
+}
+
+.status-badge[data-state="pending"] {
+	color: var(--warn);
+	border-color: rgba(182, 107, 0, 0.24);
+	background: rgba(255, 159, 10, 0.1);
+}
+
+.status-badge[data-state="error"] {
+	color: var(--err);
+	border-color: rgba(196, 59, 59, 0.24);
+	background: rgba(196, 59, 59, 0.08);
+}
+
 pre.log,
 pre.output {
   max-height: 380px;
@@ -653,6 +702,51 @@ pre.log {
   color: var(--ink);
   font-size: 1.16rem;
   font-weight: 780;
+}
+
+.review-panel {
+	margin-top: 18px;
+	padding-top: 18px;
+	border-top: 1px solid var(--hairline);
+}
+
+.review-header {
+	display: flex;
+	align-items: flex-start;
+	justify-content: space-between;
+	gap: 20px;
+}
+
+.review-panel h3 {
+	margin: 5px 0 0;
+	font-size: 1.18rem;
+	line-height: 1.25;
+	letter-spacing: 0;
+}
+
+.review-deadline {
+	margin: 0;
+	color: var(--warn);
+	font: 0.78rem/1.45 ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+	font-weight: 680;
+	text-align: right;
+}
+
+.review-reasons {
+	max-width: 78ch;
+	margin: 12px 0 16px;
+	color: var(--ink-soft);
+	font-size: 0.9rem;
+	line-height: 1.55;
+}
+
+.review-note {
+	max-width: 720px;
+}
+
+button:disabled {
+	cursor: not-allowed;
+	opacity: 0.62;
 }
 
 .actions {
@@ -751,6 +845,15 @@ pre.log {
     width: 100%;
     border-radius: 18px;
   }
+
+	.review-header {
+		flex-direction: column;
+		gap: 8px;
+	}
+
+	.review-deadline {
+		text-align: left;
+	}
 
   .tab {
     flex: 1 1 auto;

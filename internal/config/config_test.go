@@ -1,6 +1,10 @@
 package config
 
-import "testing"
+import (
+	"os"
+	"path/filepath"
+	"testing"
+)
 
 func TestNormalizeGeminiModelName(t *testing.T) {
 	cases := map[string]string{
@@ -94,8 +98,23 @@ func TestResolveCandidateSpecsDualGemini35Flash(t *testing.T) {
 	if specs[0].Label != "Gemini 3.5 Flash" {
 		t.Errorf("primary label = %s", specs[0].Label)
 	}
-	if specs[1].ModelName != "gemini-3-flash-preview" {
+	if specs[1].ModelName != "gemini-3.1-flash-lite" {
 		t.Errorf("secondary model = %s", specs[1].ModelName)
+	}
+}
+
+func TestDefaultsUseCurrentGeminiModels(t *testing.T) {
+	deps, err := NewTranscriptionDeps("test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer deps.Cleanup()
+	if deps.ModelName != "gemini-3.5-flash" || deps.JudgeModelName != "gemini-3.1-pro-preview" {
+		t.Fatalf("unexpected model defaults: primary=%s judge=%s", deps.ModelName, deps.JudgeModelName)
+	}
+	specs := deps.ResolveCandidateSpecs()
+	if len(specs) != 2 || specs[1].ModelName != "gemini-3.1-flash-lite" {
+		t.Fatalf("unexpected default evidence plan: %#v", specs)
 	}
 }
 
@@ -298,5 +317,40 @@ func TestCoercesLegacyProThinking(t *testing.T) {
 	if deps.TranscriptionThinkingLevel != "low" || deps.JudgeThinkingLevel != "low" {
 		t.Errorf("legacy minimal should coerce to low; got %s / %s",
 			deps.TranscriptionThinkingLevel, deps.JudgeThinkingLevel)
+	}
+}
+
+func TestRejectsUnsafeResourceBounds(t *testing.T) {
+	tests := []TranscriptionOption{
+		WithMaxFileSizeMB(0), WithMaxFileSizeMB(2049),
+		WithChunkDurationMS(9999), WithChunkDurationMS(3600001),
+		WithChunkConcurrency(17),
+		WithAgentBudgets(0, 1, 1, 1), WithAgentBudgets(1, 17, 1, 1),
+		WithAgentEscalationScore(101),
+		WithAgentMaxTokens(9999),
+	}
+	for index, option := range tests {
+		if deps, err := NewTranscriptionDeps("test", option); err == nil {
+			_ = deps.Cleanup()
+			t.Errorf("case %d accepted an unsafe bound", index)
+		}
+	}
+}
+
+func TestCleanupPreservesCallerOwnedTempRoot(t *testing.T) {
+	root := t.TempDir()
+	marker := filepath.Join(root, "keep")
+	if err := os.WriteFile(marker, []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	deps, err := NewTranscriptionDeps("test", WithTempDir(root))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := deps.Cleanup(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("cleanup removed caller-owned temp root: %v", err)
 	}
 }

@@ -10,7 +10,7 @@ import (
 
 // generator is the subset of *gemini.Client the router needs (eases testing).
 type generator interface {
-	GenerateContent(ctx context.Context, model string, req *gemini.GenerateRequest) (*gemini.GenerateResponse, error)
+	CreateInteraction(ctx context.Context, req *gemini.InteractionRequest) (*gemini.Interaction, error)
 }
 
 // Router uses the model to pick a format skill from the user's textual context
@@ -49,7 +49,8 @@ func (rt *Router) RouteFormat(ctx context.Context, hint string) (formatKey, skil
 		return "", "", nil
 	}
 	catalog := rt.reg.FormatCatalog()
-	tool := gemini.Tool{FunctionDeclarations: []gemini.FunctionDeclaration{{
+	tool := gemini.InteractionTool{
+		Type:        "function",
 		Name:        "activate_skill",
 		Description: "Activate the transcription skill that best matches the audio context.",
 		Parameters: map[string]any{
@@ -63,19 +64,26 @@ func (rt *Router) RouteFormat(ctx context.Context, hint string) (formatKey, skil
 			},
 			"required": []string{"name"},
 		},
-	}}}
+	}
 
 	prompt := "Available skills:\n" + catalog + "\n\nUser context:\n" + strings.TrimSpace(hint) +
 		"\n\nCall activate_skill with the best-matching skill, or nothing if none fits."
 
-	req := &gemini.GenerateRequest{
-		SystemInstruction: &gemini.Content{Parts: []gemini.Part{{Text: routerSystemInstruction}}},
-		Contents:          []gemini.Content{{Role: "user", Parts: []gemini.Part{{Text: prompt}}}},
-		Tools:             []gemini.Tool{tool},
+	store := false
+	req := &gemini.InteractionRequest{
+		Model: rt.model, Input: prompt, Store: &store,
+		SystemInstruction: routerSystemInstruction,
+		Tools:             []gemini.InteractionTool{tool},
+		GenerationConfig: &gemini.InteractionGenerationConfig{
+			MaxOutputTokens: 1024,
+		},
 	}
 
-	resp, err := rt.client.GenerateContent(ctx, rt.model, req)
+	resp, err := rt.client.CreateInteraction(ctx, req)
 	if err != nil {
+		return "", "", fmt.Errorf("route skill: %w", err)
+	}
+	if err := resp.ValidateStatus(); err != nil {
 		return "", "", fmt.Errorf("route skill: %w", err)
 	}
 	for _, call := range resp.FunctionCalls() {

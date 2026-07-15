@@ -3,6 +3,7 @@ package agents
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -95,11 +96,11 @@ func (j *JudgeAgent) Run(ctx context.Context, in JudgeInput) (*models.JudgeDecis
 	if len(in.Candidates) == 0 {
 		return &models.JudgeDecision{
 			ProcessingNotes: []string{"Judge skipped because no candidates were available."},
+			DecisionMethod:  "skipped_no_candidates",
 		}, nil
 	}
 	toolTracker := newJudgeToolUsageTracker()
 	prompt := buildJudgePrompt(in.Candidates, in.ContextPrompt, in.SpeakerNames, in.ChunkLabel)
-	temperature := 1.0
 	sysText := judgeSystemInstruction
 	var allowed []string
 	if guidance, a, ok := j.Skills.JudgeSkill(); ok {
@@ -108,43 +109,46 @@ func (j *JudgeAgent) Run(ctx context.Context, in JudgeInput) (*models.JudgeDecis
 			sysText = judgeSystemInstruction + "\n\n" + guidance
 		}
 	}
-	req := &gemini.GenerateRequest{
-		SystemInstruction: &gemini.Content{
-			Parts: []gemini.Part{{Text: sysText}},
+	store := false
+	req := &gemini.InteractionRequest{
+		Model:             j.Deps.Transcription.JudgeModelName,
+		Input:             prompt,
+		Store:             &store,
+		SystemInstruction: sysText,
+		ServiceTier:       j.Deps.Transcription.ServiceTier,
+		Tools:             judgeTranscriptTools(allowed),
+		GenerationConfig: &gemini.InteractionGenerationConfig{
+			MaxOutputTokens: j.Deps.Transcription.MaxOutputTokens,
+			ThinkingLevel:   j.Deps.Transcription.JudgeThinkingLevel,
 		},
-		ServiceTier: j.Deps.Transcription.ServiceTier,
-		Contents: []gemini.Content{
-			{
-				Role:  "user",
-				Parts: []gemini.Part{{Text: prompt}},
-			},
-		},
-		Tools: judgeTranscriptTools(allowed),
-		GenerationConfig: &gemini.GenerationConfig{
-			Temperature:      &temperature,
-			MaxOutputTokens:  j.Deps.Transcription.MaxOutputTokens,
-			ResponseMIMEType: "application/json",
-			ResponseSchema:   judgeResponseSchema,
-			ThinkingConfig: &gemini.ThinkingConfig{
-				ThinkingLevel: j.Deps.Transcription.JudgeThinkingLevel,
-			},
+		ResponseFormat: &gemini.InteractionResponseFormat{
+			Type:     "text",
+			MIMEType: "application/json",
+			Schema:   judgeResponseSchema,
 		},
 	}
 
-	resp, err := j.Client.GenerateContentWithTools(
+	resp, err := j.Client.RunInteractionWithTools(
 		ctx,
-		j.Deps.Transcription.JudgeModelName,
 		req,
 		toolTracker.wrap(buildJudgeToolExecutors(j.Deps.Quality, in.Candidates, allowed)),
-		2,
+		gemini.InteractionLoopLimits{
+			MaxToolTurns:    2,
+			MaxCallsPerTurn: 4,
+			MaxTotalCalls:   8,
+		},
 	)
 	if err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return nil, err
+		}
 		fallback := in.Candidates[0]
 		return &models.JudgeDecision{
 			Segments:             fallback.Segments,
 			SelectedCandidateIDs: []string{fallback.CandidateID},
 			ProcessingNotes:      []string{fmt.Sprintf("Judge failed, falling back to %s: %v", fallback.Label, err)},
 			ToolUsage:            toolTracker.usage(),
+			DecisionMethod:       "fallback_interaction_error",
 		}, nil
 	}
 
@@ -156,6 +160,7 @@ func (j *JudgeAgent) Run(ctx context.Context, in JudgeInput) (*models.JudgeDecis
 			SelectedCandidateIDs: []string{fallback.CandidateID},
 			ProcessingNotes:      []string{fmt.Sprintf("Judge output unparseable; falling back to %s: %v", fallback.Label, parseErr)},
 			ToolUsage:            toolTracker.usage(),
+			DecisionMethod:       "fallback_unparseable_output",
 		}, nil
 	}
 	if err := ValidateJudgeDecision(decision); err != nil {
@@ -165,6 +170,7 @@ func (j *JudgeAgent) Run(ctx context.Context, in JudgeInput) (*models.JudgeDecis
 			SelectedCandidateIDs: []string{fallback.CandidateID},
 			ProcessingNotes:      []string{fmt.Sprintf("Judge decision invalid; falling back to %s: %v", fallback.Label, err)},
 			ToolUsage:            toolTracker.usage(),
+			DecisionMethod:       "fallback_invalid_decision",
 		}, nil
 	}
 	// Drop any candidate IDs the model invented that don't match the inputs.
@@ -180,6 +186,17 @@ func (j *JudgeAgent) Run(ctx context.Context, in JudgeInput) (*models.JudgeDecis
 	}
 	decision.SelectedCandidateIDs = filtered
 	decision.ToolUsage = toolTracker.usage()
+	if len(decision.SelectedCandidateIDs) == 0 {
+		fallback := in.Candidates[0]
+		return &models.JudgeDecision{
+			Segments:             fallback.Segments,
+			SelectedCandidateIDs: []string{fallback.CandidateID},
+			ProcessingNotes:      []string{"Judge selected no valid candidate IDs; used the primary candidate."},
+			ToolUsage:            toolTracker.usage(),
+			DecisionMethod:       "fallback_invalid_selection",
+		}, nil
+	}
+	decision.DecisionMethod = "model"
 
 	return decision, nil
 }
@@ -193,7 +210,11 @@ func parseJudgeDecision(raw string) (*models.JudgeDecision, error) {
 	if err := json.Unmarshal([]byte(raw), &decision); err != nil {
 		return nil, fmt.Errorf("decode judge output: %w (body=%s)", err, truncate(raw, 256))
 	}
-	decision.Segments = cleanSegments(decision.Segments)
+	segments, err := validateAndCleanSegments(decision.Segments)
+	if err != nil {
+		return nil, err
+	}
+	decision.Segments = segments
 	return &decision, nil
 }
 
@@ -204,6 +225,11 @@ func ValidateJudgeDecision(d *models.JudgeDecision) error {
 	}
 	if len(d.Segments) == 0 {
 		return fmt.Errorf("judge returned no segments")
+	}
+	for i, segment := range d.Segments {
+		if err := segment.Validate(); err != nil {
+			return fmt.Errorf("judge segment %d is invalid: %w", i, err)
+		}
 	}
 	if !timestampsMonotonic(d.Segments) {
 		return fmt.Errorf("judge returned non-monotonic timestamps")

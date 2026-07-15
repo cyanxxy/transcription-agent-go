@@ -1,6 +1,7 @@
 package agents
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -11,6 +12,8 @@ import (
 	"github.com/cyanxxy/transcription-agent-go/internal/config"
 	"github.com/cyanxxy/transcription-agent-go/internal/models"
 )
+
+const maxSidecarOutputBytes = 16 << 20
 
 // TimestampAnalysis is the result of analyzing how trustworthy the model's
 // timestamps look. Mirrors timestamp_tool.analyze_timestamp_quality.
@@ -176,6 +179,9 @@ func (p *ParakeetSidecar) Transcribe(ctx context.Context, audioPath string, spea
 		return nil, fmt.Errorf("parakeet sidecar: %s", output.Error)
 	}
 	if len(output.Segments) > 0 {
+		if err := validateSidecarSegments(output.Segments); err != nil {
+			return nil, fmt.Errorf("invalid parakeet transcript: %w", err)
+		}
 		return output.Segments, nil
 	}
 	if len(output.Words) > 0 {
@@ -205,7 +211,46 @@ func (p *ParakeetSidecar) Align(ctx context.Context, audioPath string, segs []mo
 	if len(output.Segments) == 0 {
 		return segs, nil
 	}
-	return output.Segments, nil
+	if len(output.Segments) != len(segs) {
+		return segs, fmt.Errorf("invalid parakeet alignment: segment count changed from %d to %d", len(segs), len(output.Segments))
+	}
+	if err := validateSidecarSegments(output.Segments); err != nil {
+		return segs, fmt.Errorf("invalid parakeet alignment: %w", err)
+	}
+	aligned := make([]models.TranscriptSegment, len(segs))
+	for i := range segs {
+		if output.Segments[i].Text != segs[i].Text || output.Segments[i].Speaker != segs[i].Speaker || !confidenceEqual(output.Segments[i].Confidence, segs[i].Confidence) {
+			return segs, fmt.Errorf("invalid parakeet alignment: segment %d changed transcript content", i)
+		}
+		aligned[i] = segs[i]
+		aligned[i].Timestamp = output.Segments[i].Timestamp
+	}
+	return aligned, nil
+}
+
+func confidenceEqual(a, b *float64) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	return *a == *b
+}
+
+func validateSidecarSegments(segs []models.TranscriptSegment) error {
+	previous := -1.0
+	for i, seg := range segs {
+		if err := seg.Validate(); err != nil {
+			return fmt.Errorf("segment %d: %w", i, err)
+		}
+		seconds, err := seg.TimestampSeconds()
+		if err != nil {
+			return fmt.Errorf("segment %d: %w", i, err)
+		}
+		if seconds < previous {
+			return fmt.Errorf("segment %d timestamp is not monotonic", i)
+		}
+		previous = seconds
+	}
+	return nil
 }
 
 func (p *ParakeetSidecar) invoke(ctx context.Context, payload map[string]any) (*sidecarOutput, error) {
@@ -219,18 +264,49 @@ func (p *ParakeetSidecar) invoke(ctx context.Context, payload map[string]any) (*
 	}
 	cmd := exec.CommandContext(ctx, args[0], args[1:]...)
 	cmd.Stdin = strings.NewReader(string(body))
-	out, err := cmd.Output()
+	stdout := &limitedOutputBuffer{limit: maxSidecarOutputBytes}
+	stderr := &limitedOutputBuffer{limit: 1 << 20}
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
+	err = cmd.Run()
 	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
 		if ee, ok := err.(*exec.ExitError); ok {
-			return nil, fmt.Errorf("parakeet sidecar exited %d: %s", ee.ExitCode(), strings.TrimSpace(string(ee.Stderr)))
+			return nil, fmt.Errorf("parakeet sidecar exited %d: %s", ee.ExitCode(), strings.TrimSpace(stderr.String()))
 		}
 		return nil, fmt.Errorf("parakeet sidecar: %w", err)
 	}
+	if stdout.overflow {
+		return nil, fmt.Errorf("parakeet sidecar output exceeds %d bytes", maxSidecarOutputBytes)
+	}
 	var parsed sidecarOutput
-	if err := json.Unmarshal(out, &parsed); err != nil {
+	if err := json.Unmarshal(stdout.Bytes(), &parsed); err != nil {
 		return nil, fmt.Errorf("decode sidecar output: %w", err)
 	}
 	return &parsed, nil
+}
+
+type limitedOutputBuffer struct {
+	bytes.Buffer
+	limit    int
+	overflow bool
+}
+
+func (b *limitedOutputBuffer) Write(p []byte) (int, error) {
+	original := len(p)
+	remaining := b.limit - b.Len()
+	if remaining <= 0 {
+		b.overflow = true
+		return original, nil
+	}
+	if len(p) > remaining {
+		p = p[:remaining]
+		b.overflow = true
+	}
+	_, _ = b.Buffer.Write(p)
+	return original, nil
 }
 
 func groupParakeetWords(words []struct {

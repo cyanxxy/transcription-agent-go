@@ -37,6 +37,9 @@ COPY --from=builder /out/transcriber-cli      /usr/local/bin/transcriber-cli
 # Skill packs are read from ./.skills at runtime (default --skills-dir).
 COPY --from=builder /src/.skills ./.skills
 
+RUN mkdir -p /app/data/jobs \
+ && chown -R transcriber:transcriber /app/data
+
 USER transcriber:transcriber
 
 EXPOSE 8080

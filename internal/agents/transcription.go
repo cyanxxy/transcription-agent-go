@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"math"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -96,11 +97,13 @@ func NewTranscriptionAgent(deps *config.TranscriptionDeps, client *gemini.Client
 
 // TranscribeInput captures the per-call request.
 type TranscribeInput struct {
-	AudioPath       string
-	CustomPrompt    string
-	ChunkInfo       *ChunkInfo
-	PreviousContext string
-	SpeakerNames    []string
+	AudioPath            string
+	CustomPrompt         string
+	ChunkInfo            *ChunkInfo
+	PreviousContext      string
+	SpeakerNames         []string
+	UploadedFile         *gemini.FileInfo
+	AudioDurationSeconds float64
 }
 
 // ChunkInfo describes a chunk being transcribed.
@@ -118,55 +121,62 @@ func (a *TranscriptionAgent) Run(ctx context.Context, in TranscribeInput) ([]mod
 		return nil, fmt.Errorf("audio path is required")
 	}
 	logger := obs.LoggerFrom(ctx).With("component", "transcription", "model", a.Deps.ModelName)
-	file, err := a.Client.UploadFile(ctx, in.AudioPath)
-	if err != nil {
-		return nil, fmt.Errorf("upload audio: %w", err)
-	}
-	defer func() {
-		// Best-effort delete; don't surface this on the happy path. Use a
-		// short, detached context so cleanup still runs if the caller's
-		// context is already canceled.
-		cleanupCtx, cancel := obs.DetachWithTimeout(ctx, defaultCleanupTimeout)
-		defer cancel()
-		if delErr := a.Client.DeleteFile(cleanupCtx, file.Name); delErr != nil {
-			logger.Warn("failed to delete uploaded file", slog.String("file", file.Name), slog.String("error", delErr.Error()))
+	file := in.UploadedFile
+	ownedUpload := false
+	if file == nil {
+		var err error
+		file, err = a.Client.UploadFile(ctx, in.AudioPath)
+		if err != nil {
+			return nil, fmt.Errorf("upload audio: %w", err)
 		}
-	}()
+		ownedUpload = true
+	}
+	if ownedUpload {
+		defer func() {
+			// Best-effort delete; don't surface this on the happy path. Use a
+			// short, detached context so cleanup still runs if the caller's
+			// context is already canceled.
+			cleanupCtx, cancel := obs.DetachWithTimeout(ctx, defaultCleanupTimeout)
+			defer cancel()
+			if delErr := a.Client.DeleteFile(cleanupCtx, file.Name); delErr != nil {
+				logger.Warn("failed to delete uploaded file", slog.String("file", file.Name), slog.String("error", delErr.Error()))
+			}
+		}()
+	}
 
 	prompt := BuildTranscriptionPrompt(in.CustomPrompt, in.PreviousContext, in.ChunkInfo, in.SpeakerNames)
 	mimeType := file.MIMEType
 	if mimeType == "" {
 		mimeType = guessMIMEFromPath(in.AudioPath)
 	}
-	temperature := 1.0
-	req := &gemini.GenerateRequest{
-		SystemInstruction: &gemini.Content{
-			Parts: []gemini.Part{{Text: transcriptionSystemInstruction}},
+	store := false
+	req := &gemini.InteractionRequest{
+		Model: a.Deps.ModelName,
+		Input: []gemini.InteractionContent{
+			{Type: "text", Text: prompt},
+			{Type: "audio", URI: file.URI, MIMEType: mimeType},
 		},
-		ServiceTier: a.Deps.ServiceTier,
-		Contents: []gemini.Content{
-			{
-				Role: "user",
-				Parts: []gemini.Part{
-					{Text: prompt},
-					{FileData: &gemini.FileData{MIMEType: mimeType, FileURI: file.URI}},
-				},
-			},
+		Store:             &store,
+		SystemInstruction: transcriptionSystemInstruction,
+		ServiceTier:       a.Deps.ServiceTier,
+		GenerationConfig: &gemini.InteractionGenerationConfig{
+			MaxOutputTokens: a.Deps.MaxOutputTokens,
+			ThinkingLevel:   a.Deps.TranscriptionThinkingLevel,
 		},
-		GenerationConfig: &gemini.GenerationConfig{
-			Temperature:      &temperature,
-			MaxOutputTokens:  a.Deps.MaxOutputTokens,
-			ResponseMIMEType: "application/json",
-			ResponseSchema:   transcriptResponseSchema,
-			ThinkingConfig: &gemini.ThinkingConfig{
-				ThinkingLevel: a.Deps.TranscriptionThinkingLevel,
-			},
+		ResponseFormat: &gemini.InteractionResponseFormat{
+			Type:     "text",
+			MIMEType: "application/json",
+			Schema:   transcriptResponseSchema,
 		},
+		EstimatedInputTokens: int(math.Ceil(max(0, in.AudioDurationSeconds) * 32)),
 	}
 
-	resp, err := a.Client.GenerateContent(ctx, a.Deps.ModelName, req)
+	resp, err := a.Client.CreateInteraction(ctx, req)
 	if err != nil {
-		return nil, fmt.Errorf("generate transcription: %w", err)
+		return nil, fmt.Errorf("create transcription interaction: %w", err)
+	}
+	if err := resp.ValidateStatus(); err != nil {
+		return nil, fmt.Errorf("transcription interaction: %w", err)
 	}
 	segments, err := parseSegments(resp.Text())
 	if err != nil {
@@ -223,30 +233,33 @@ func parseSegments(raw string) ([]models.TranscriptSegment, error) {
 	}
 	var payload transcriptionPayload
 	if err := json.Unmarshal([]byte(raw), &payload); err == nil && len(payload.Segments) > 0 {
-		return cleanSegments(payload.Segments), nil
+		return validateAndCleanSegments(payload.Segments)
 	}
 	var bare []models.TranscriptSegment
 	if err := json.Unmarshal([]byte(raw), &bare); err == nil && len(bare) > 0 {
-		return cleanSegments(bare), nil
+		return validateAndCleanSegments(bare)
 	}
 	return nil, fmt.Errorf("response did not contain a usable transcript: %q", truncate(raw, 256))
 }
 
-func cleanSegments(in []models.TranscriptSegment) []models.TranscriptSegment {
+func validateAndCleanSegments(in []models.TranscriptSegment) ([]models.TranscriptSegment, error) {
 	out := make([]models.TranscriptSegment, 0, len(in))
-	for _, seg := range in {
+	previous := -1.0
+	for i, seg := range in {
 		seg.Timestamp = models.NormalizeTimestamp(strings.TrimSpace(seg.Timestamp))
 		seg.Speaker = strings.TrimSpace(seg.Speaker)
 		seg.Text = strings.TrimSpace(seg.Text)
-		if seg.Timestamp == "" || seg.Speaker == "" || seg.Text == "" {
-			continue
-		}
 		if err := seg.Validate(); err != nil {
-			continue
+			return nil, fmt.Errorf("segment %d: %w", i, err)
 		}
+		seconds, _ := seg.TimestampSeconds()
+		if seconds < previous {
+			return nil, fmt.Errorf("segment %d timestamp is not monotonic", i)
+		}
+		previous = seconds
 		out = append(out, seg)
 	}
-	return out
+	return out, nil
 }
 
 func stripCodeFences(s string) string {
@@ -269,7 +282,7 @@ func truncate(s string, n int) string {
 func guessMIMEFromPath(path string) string {
 	switch strings.ToLower(filepath.Ext(path)) {
 	case ".mp3":
-		return "audio/mpeg"
+		return "audio/mp3"
 	case ".wav":
 		return "audio/wav"
 	case ".m4a":

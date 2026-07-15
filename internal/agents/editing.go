@@ -66,7 +66,7 @@ func AutoFormatTranscript(deps config.EditingDeps, segs []models.TranscriptSegme
 var (
 	whitespaceRE       = regexp.MustCompile(`\s+`)
 	spaceBeforePunctRE = regexp.MustCompile(`\s+([,.!?;:])`)
-	missingSpaceAfter  = regexp.MustCompile(`([,.!?;:])([A-Za-z])`)
+	missingSpaceAfter  = regexp.MustCompile(`([,!?;:])([A-Za-z])`)
 	// RE2 has no backreferences, so we enumerate the terminators we care
 	// about. Dots are handled separately as "any run of 2+" -> ellipsis.
 	repeatedBang     = regexp.MustCompile(`!{2,}`)
@@ -107,7 +107,8 @@ func RemoveFillerWords(text string, fillers []string) string {
 
 var sentenceSplitRE = regexp.MustCompile(`([.!?]+)`)
 
-// ApplySentenceCase capitalizes sentence starts and preserves "I".
+// ApplySentenceCase capitalizes sentence starts without lowercasing existing
+// words. Transcription cleanup must not destroy acronyms or proper nouns.
 func ApplySentenceCase(text string) string {
 	if text == "" {
 		return text
@@ -118,8 +119,13 @@ func ApplySentenceCase(text string) string {
 	for i, part := range parts {
 		trimmed := strings.TrimSpace(part)
 		if trimmed != "" {
-			runes := []rune(strings.ToLower(trimmed))
-			runes[0] = unicode.ToUpper(runes[0])
+			runes := []rune(trimmed)
+			for j, r := range runes {
+				if unicode.IsLetter(r) {
+					runes[j] = unicode.ToUpper(r)
+					break
+				}
+			}
 			trimmed = string(runes)
 			trimmed = capitalizeI(trimmed)
 		}
@@ -165,9 +171,22 @@ func capitalizeI(s string) string {
 
 // ApplyReplacements substitutes common phrases (case-insensitive, whole-word).
 func ApplyReplacements(text string, repl map[string]string) string {
-	for from, to := range repl {
+	keys := make([]string, 0, len(repl))
+	for from := range repl {
+		if from != "" {
+			keys = append(keys, from)
+		}
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		if len(keys[i]) != len(keys[j]) {
+			return len(keys[i]) > len(keys[j])
+		}
+		return keys[i] < keys[j]
+	})
+	for _, from := range keys {
+		to := repl[from]
 		pattern := `(?i)\b` + regexp.QuoteMeta(from) + `\b`
-		text = regexp.MustCompile(pattern).ReplaceAllString(text, to)
+		text = regexp.MustCompile(pattern).ReplaceAllStringFunc(text, func(string) string { return to })
 	}
 	return text
 }
@@ -182,6 +201,9 @@ type FindAndReplaceResult struct {
 
 // FindAndReplace performs find/replace across segments.
 func FindAndReplace(segs []models.TranscriptSegment, find, replace string, caseSensitive, wholeWord bool) FindAndReplaceResult {
+	if find == "" {
+		return FindAndReplaceResult{Segments: append([]models.TranscriptSegment(nil), segs...)}
+	}
 	flag := "(?i)"
 	if caseSensitive {
 		flag = ""
@@ -202,7 +224,7 @@ func FindAndReplace(segs []models.TranscriptSegment, find, replace string, caseS
 			out[i] = models.TranscriptSegment{
 				Timestamp:  seg.Timestamp,
 				Speaker:    seg.Speaker,
-				Text:       re.ReplaceAllString(seg.Text, replace),
+				Text:       re.ReplaceAllStringFunc(seg.Text, func(string) string { return replace }),
 				Confidence: seg.Confidence,
 			}
 		} else {

@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cyanxxy/transcription-agent-go/internal/agents"
 	"github.com/cyanxxy/transcription-agent-go/internal/audio"
 	"github.com/cyanxxy/transcription-agent-go/internal/config"
 	"github.com/cyanxxy/transcription-agent-go/internal/gemini"
@@ -84,6 +85,24 @@ func TestSanitizeFilename(t *testing.T) {
 	}
 	if strings.ContainsAny(got, "!@# /") {
 		t.Errorf("unsafe characters remained: %s", got)
+	}
+}
+
+func TestStageInputPathPreservesOriginalExtensionForMIME(t *testing.T) {
+	source := filepath.Join(t.TempDir(), "audio.bin")
+	if err := os.WriteFile(source, []byte("mp3 bytes"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	staged, err := stageInputPath(t.TempDir(), source, "meeting.mp3")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if filepath.Ext(staged) != ".mp3" {
+		t.Fatalf("staged path %q did not preserve the original extension", staged)
+	}
+	body, err := os.ReadFile(staged)
+	if err != nil || string(body) != "mp3 bytes" {
+		t.Fatalf("staged input does not reference source bytes: body=%q err=%v", body, err)
 	}
 }
 
@@ -172,6 +191,146 @@ func TestMergeJudgeToolUsage(t *testing.T) {
 	}
 	if got[1].Name != "candidate_diff" || got[1].Count != 2 {
 		t.Fatalf("candidate diff usage wrong: %#v", got)
+	}
+}
+
+func TestBuildSpanRunsReturnsErrorForMismatchedInputs(t *testing.T) {
+	if _, err := buildSpanRuns([]judgeChunkResult{{}}, nil); err == nil {
+		t.Fatal("buildSpanRuns accepted judge results without matching audio spans")
+	}
+}
+
+func TestRunUnitWithJudgeRejectsOutOfSpanOutput(t *testing.T) {
+	mux := http.NewServeMux()
+	srv := httptest.NewUnstartedServer(mux)
+	srv.Start()
+	defer srv.Close()
+
+	mux.HandleFunc("/upload/v1beta/files", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("X-Goog-Upload-URL", srv.URL+"/upload-finish")
+		w.WriteHeader(http.StatusOK)
+	})
+	mux.HandleFunc("/upload-finish", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"file": map[string]any{
+			"name": "files/chunk", "uri": "https://example.test/chunk", "state": "ACTIVE", "mimeType": "audio/wav",
+		}})
+	})
+	mux.HandleFunc("/v1beta/files/chunk", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodDelete {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"name": "files/chunk", "uri": "https://example.test/chunk", "state": "ACTIVE", "mimeType": "audio/wav",
+		})
+	})
+	mux.HandleFunc("/v1beta/interactions", func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Error(err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		text := `{"segments":[{"timestamp":"[00:20:00]","speaker":"S","text":"invented boundary"}],"selected_candidate_ids":["gemini_3.5_flash"],"processing_notes":["judge output"]}`
+		if interactionInputHasType(body, "audio") {
+			text = `{"segments":[{"timestamp":"[00:00:00]","speaker":"S","text":"candidate evidence"}]}`
+		}
+		_ = json.NewEncoder(w).Encode(gemini.Interaction{
+			ID: "interaction", Status: "completed", Steps: []gemini.InteractionStep{{
+				Type: "model_output", Content: []gemini.InteractionContent{{Type: "text", Text: text}},
+			}},
+		})
+	})
+
+	audioPath := filepath.Join(t.TempDir(), "chunk.wav")
+	if err := os.WriteFile(audioPath, []byte("audio"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	wfl, err := New("key",
+		config.WithCandidateStrategy("single_gemini"),
+		config.WithAgenticMode(false),
+		config.WithTempDir(t.TempDir()),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wfl.WithClient(gemini.NewClient("key").WithEndpoint(srv.URL))
+	result, err := wfl.runUnitWithJudge(
+		context.Background(), wfl.Deps.Transcription, audioPath,
+		&agents.ChunkInfo{Index: 0, StartMS: 60000, EndMS: 70000, DurationMS: 10000},
+		"", "", nil, "chunk 1 of 2", 10,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.decisionMethod != "fallback_out_of_span_judge_output" {
+		t.Fatalf("decision method = %q, want span-validation fallback", result.decisionMethod)
+	}
+	if len(result.finalSegments) != 1 || result.finalSegments[0].Timestamp != "[00:01:00]" || result.finalSegments[0].Text != "candidate evidence" {
+		t.Fatalf("out-of-span judge output was accepted: %#v", result.finalSegments)
+	}
+	if len(result.selectedCandidateIDs) != 1 || result.selectedCandidateIDs[0] != "gemini_3.5_flash" {
+		t.Fatalf("fallback provenance is wrong: %#v", result.selectedCandidateIDs)
+	}
+	if !strings.Contains(strings.Join(result.judgeNotes, " "), "rejected by span validation") {
+		t.Fatalf("span rejection was not recorded: %#v", result.judgeNotes)
+	}
+}
+
+func TestDualGeminiCandidatesShareOneFilesUpload(t *testing.T) {
+	var uploads, generations, deletes atomic.Int32
+	mux := http.NewServeMux()
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	mux.HandleFunc("/upload/v1beta/files", func(w http.ResponseWriter, _ *http.Request) {
+		uploads.Add(1)
+		w.Header().Set("X-Goog-Upload-URL", srv.URL+"/upload-finish")
+		w.WriteHeader(http.StatusOK)
+	})
+	mux.HandleFunc("/upload-finish", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"file": map[string]any{
+			"name": "files/shared", "uri": "https://example.test/shared", "state": "ACTIVE", "mimeType": "audio/wav",
+		}})
+	})
+	mux.HandleFunc("/v1beta/files/shared", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodDelete {
+			deletes.Add(1)
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"name": "files/shared", "uri": "https://example.test/shared", "state": "ACTIVE", "mimeType": "audio/wav",
+		})
+	})
+	mux.HandleFunc("/v1beta/interactions", func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		if !interactionInputHasType(body, "audio") || body["store"] != false || body["response_format"] == nil {
+			t.Errorf("unexpected audio interaction: %#v", body)
+		}
+		generations.Add(1)
+		_ = json.NewEncoder(w).Encode(gemini.Interaction{ID: "candidate", Status: "completed", Steps: []gemini.InteractionStep{{
+			Type: "model_output", Content: []gemini.InteractionContent{{Type: "text", Text: `{"segments":[{"timestamp":"[00:00:00]","speaker":"S","text":"hello"}]}`}},
+		}}})
+	})
+
+	audioPath := filepath.Join(t.TempDir(), "audio.wav")
+	if err := os.WriteFile(audioPath, []byte("wav"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	wfl, err := New("key", config.WithCandidateStrategy("dual_gemini"), config.WithAgenticMode(false), config.WithTempDir(t.TempDir()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	wfl.WithClient(gemini.NewClient("key").WithEndpoint(srv.URL))
+	candidates, err := wfl.generateCandidates(context.Background(), wfl.Deps.Transcription, audioPath, nil, "", "", nil, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(candidates) != 2 || uploads.Load() != 1 || generations.Load() != 2 || deletes.Load() != 1 {
+		t.Fatalf("candidates=%d uploads=%d generations=%d deletes=%d", len(candidates), uploads.Load(), generations.Load(), deletes.Load())
 	}
 }
 
@@ -303,16 +462,9 @@ func TestTranscribeEndToEndJudgePipeline(t *testing.T) {
 	).Run(); err != nil {
 		t.Fatalf("ffmpeg failed to generate test wav: %v", err)
 	}
-	wavBytes, err := os.ReadFile(wavPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// A single canned generateContent body that satisfies BOTH the transcript
-	// schema (segments) and the judge schema (segments + selected_candidate_ids
-	// + processing_notes), so the same handler works for the candidate model and
-	// the judge model.
-	const cannedText = `{"segments":[{"timestamp":"[00:00:00]","speaker":"Alice","text":"Hello world"}],"selected_candidate_ids":["gemini_3_flash_preview"],"processing_notes":["ok"]}`
+	const transcriptText = `{"segments":[{"timestamp":"[00:00:00]","speaker":"Alice","text":"Hello world"}]}`
+	const cannedText = `{"segments":[{"timestamp":"[00:00:00]","speaker":"Alice","text":"Hello world"}],"selected_candidate_ids":["gemini_3.5_flash"],"processing_notes":["ok"]}`
+	var judgeRequests atomic.Int32
 
 	mux := http.NewServeMux()
 	srv := httptest.NewUnstartedServer(mux)
@@ -346,17 +498,29 @@ func TestTranscribeEndToEndJudgePipeline(t *testing.T) {
 			"mimeType": "audio/wav",
 		})
 	})
-	// Catch-all: any generateContent call (candidate transcription + judge).
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		if !strings.Contains(r.URL.Path, ":generateContent") {
-			http.NotFound(w, r)
-			return
+	mux.HandleFunc("/v1beta/interactions", func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		text := cannedText
+		id := "workflow_judge"
+		if interactionInputHasType(body, "audio") {
+			text = transcriptText
+			id = "workflow_candidate"
+		} else {
+			judgeRequests.Add(1)
+		}
+		if body["store"] != false || body["response_format"] == nil {
+			t.Errorf("unexpected interaction request: %#v", body)
 		}
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(gemini.GenerateResponse{
-			Candidates: []gemini.Candidate{{
-				Content:      gemini.Content{Role: "model", Parts: []gemini.Part{{Text: cannedText}}},
-				FinishReason: "STOP",
+		json.NewEncoder(w).Encode(gemini.Interaction{
+			ID:     id,
+			Status: "completed",
+			Steps: []gemini.InteractionStep{{
+				Type:    "model_output",
+				Content: []gemini.InteractionContent{{Type: "text", Text: text}},
 			}},
 		})
 	})
@@ -373,8 +537,8 @@ func TestTranscribeEndToEndJudgePipeline(t *testing.T) {
 	wfl.WithClient(c)
 
 	res, err := wfl.Transcribe(context.Background(), TranscribeInput{
-		FileBytes: wavBytes,
-		Filename:  "test.wav",
+		FilePath: wavPath,
+		Filename: "test.wav",
 	})
 	if err != nil {
 		t.Fatalf("Transcribe returned error: %v", err)
@@ -388,13 +552,19 @@ func TestTranscribeEndToEndJudgePipeline(t *testing.T) {
 	if !res.JudgeUsed {
 		t.Errorf("expected JudgeUsed == true")
 	}
+	if judgeRequests.Load() != 1 {
+		t.Errorf("judge interaction requests = %d, want 1", judgeRequests.Load())
+	}
+	if len(res.JudgeNotes) == 0 || res.JudgeNotes[0] != "ok" {
+		t.Errorf("judge decision was not applied: %#v", res.JudgeNotes)
+	}
 	if res.CandidateStrategy != "single_gemini" {
 		t.Errorf("CandidateStrategy = %q, want single_gemini", res.CandidateStrategy)
 	}
 }
 
 // TestTranscribeInjectsFormatSkill verifies that a deterministically-selected
-// format skill's body is injected into the generateContent requests.
+// format skill's body is injected into the Interactions requests.
 func TestTranscribeInjectsFormatSkill(t *testing.T) {
 	if _, err := exec.LookPath("ffmpeg"); err != nil {
 		t.Skip("ffmpeg not installed")
@@ -418,10 +588,12 @@ func TestTranscribeInjectsFormatSkill(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	const cannedText = `{"segments":[{"timestamp":"[00:00:00]","speaker":"Alice","text":"Hello world"}],"selected_candidate_ids":["gemini_3_flash_preview"],"processing_notes":["ok"]}`
+	const transcriptText = `{"segments":[{"timestamp":"[00:00:00]","speaker":"Alice","text":"Hello world"}]}`
+	const cannedText = `{"segments":[{"timestamp":"[00:00:00]","speaker":"Alice","text":"Hello world"}],"selected_candidate_ids":["gemini_3.5_flash"],"processing_notes":["ok"]}`
 
 	var mu sync.Mutex
 	var bodies []string
+	var judgeRequests atomic.Int32
 	mux := http.NewServeMux()
 	srv := httptest.NewUnstartedServer(mux)
 	srv.Start()
@@ -441,19 +613,32 @@ func TestTranscribeInjectsFormatSkill(t *testing.T) {
 			"name": "files/x", "uri": "https://api.example/files/x", "state": "ACTIVE", "mimeType": "audio/wav",
 		})
 	})
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		if !strings.Contains(r.URL.Path, ":generateContent") {
-			http.NotFound(w, r)
-			return
-		}
+	mux.HandleFunc("/v1beta/interactions", func(w http.ResponseWriter, r *http.Request) {
 		b, _ := io.ReadAll(r.Body)
 		mu.Lock()
 		bodies = append(bodies, string(b))
 		mu.Unlock()
+		var body map[string]any
+		if err := json.Unmarshal(b, &body); err != nil {
+			t.Fatal(err)
+		}
+		text := cannedText
+		id := "skill_judge"
+		if interactionInputHasType(body, "audio") {
+			text = transcriptText
+			id = "skill_candidate"
+		} else {
+			judgeRequests.Add(1)
+		}
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(gemini.GenerateResponse{Candidates: []gemini.Candidate{{
-			Content: gemini.Content{Role: "model", Parts: []gemini.Part{{Text: cannedText}}}, FinishReason: "STOP",
-		}}})
+		_ = json.NewEncoder(w).Encode(gemini.Interaction{
+			ID:     id,
+			Status: "completed",
+			Steps: []gemini.InteractionStep{{
+				Type:    "model_output",
+				Content: []gemini.InteractionContent{{Type: "text", Text: text}},
+			}},
+		})
 	})
 
 	c := gemini.NewClient("k").WithEndpoint(srv.URL)
@@ -489,7 +674,10 @@ func TestTranscribeInjectsFormatSkill(t *testing.T) {
 		}
 	}
 	if !found {
-		t.Errorf("medical skill guidance not injected into any of %d generateContent requests", len(bodies))
+		t.Errorf("medical skill guidance not injected into any of %d Gemini requests", len(bodies))
+	}
+	if judgeRequests.Load() != 1 {
+		t.Errorf("judge interaction requests = %d, want 1", judgeRequests.Load())
 	}
 }
 
@@ -499,4 +687,15 @@ func TestTranscribeInjectsFormatSkill(t *testing.T) {
 func workflowNewForTest(t *testing.T, opts ...config.TranscriptionOption) (*Workflow, error) {
 	t.Helper()
 	return New("k", opts...)
+}
+
+func interactionInputHasType(body map[string]any, contentType string) bool {
+	input, _ := body["input"].([]any)
+	for _, item := range input {
+		content, _ := item.(map[string]any)
+		if content["type"] == contentType {
+			return true
+		}
+	}
+	return false
 }

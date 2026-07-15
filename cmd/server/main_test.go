@@ -177,14 +177,14 @@ func TestBuildOptionsIncludesServiceTier(t *testing.T) {
 	}
 }
 
-func TestPublicErrorMessageTruncatesAndStripsNewlines(t *testing.T) {
-	long := strings.Repeat("a", 300) + "\nsecond line"
-	got := publicErrorMessage(errStub(long))
-	if strings.Contains(got, "\n") {
-		t.Errorf("public message should have no newlines, got %q", got)
+func TestPublicErrorMessageDoesNotExposeInternalDetails(t *testing.T) {
+	secret := "/private/job/audio.wav: backend key=secret"
+	got := publicErrorMessage(errStub(secret))
+	if strings.Contains(got, secret) || strings.Contains(got, "/private/") || strings.Contains(got, "secret") {
+		t.Fatalf("public message exposed internal details: %q", got)
 	}
-	if len(got) > 244 { // 240 + "..."
-		t.Errorf("public message too long: %d chars", len(got))
+	if got != "transcription failed; see server logs using the request id" {
+		t.Fatalf("unexpected public message: %q", got)
 	}
 }
 

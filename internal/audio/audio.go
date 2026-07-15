@@ -9,6 +9,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
@@ -17,6 +18,8 @@ import (
 
 	"github.com/cyanxxy/transcription-agent-go/internal/models"
 )
+
+const MaxPlannedChunks = 10000
 
 // Probe captures the bits of metadata we care about.
 type Probe struct {
@@ -43,6 +46,13 @@ type ffprobeOutput struct {
 
 // ProbeFile runs ffprobe to extract duration and audio characteristics.
 func ProbeFile(ctx context.Context, path string) (*Probe, error) {
+	fileInfo, err := os.Stat(path)
+	if err != nil {
+		return nil, fmt.Errorf("stat audio: %w", err)
+	}
+	if fileInfo.IsDir() {
+		return nil, fmt.Errorf("audio path is a directory")
+	}
 	cmd := exec.CommandContext(ctx, "ffprobe",
 		"-v", "error",
 		"-print_format", "json",
@@ -52,6 +62,9 @@ func ProbeFile(ctx context.Context, path string) (*Probe, error) {
 	)
 	output, err := cmd.Output()
 	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
 		if ee, ok := err.(*exec.ExitError); ok {
 			return nil, fmt.Errorf("ffprobe failed: %s", strings.TrimSpace(string(ee.Stderr)))
 		}
@@ -62,24 +75,31 @@ func ProbeFile(ctx context.Context, path string) (*Probe, error) {
 		return nil, fmt.Errorf("decode ffprobe output: %w", err)
 	}
 
-	duration, _ := strconv.ParseFloat(data.Format.Duration, 64)
-	size, _ := strconv.ParseInt(data.Format.Size, 10, 64)
+	duration, err := strconv.ParseFloat(data.Format.Duration, 64)
+	if err != nil || duration <= 0 {
+		return nil, fmt.Errorf("ffprobe returned invalid duration %q", data.Format.Duration)
+	}
 	probe := &Probe{
 		Path:       path,
 		DurationMS: int(duration * 1000),
-		SizeBytes:  size,
+		SizeBytes:  fileInfo.Size(),
 	}
 	ext := strings.ToLower(strings.TrimPrefix(filepath.Ext(path), "."))
 	probe.Format = models.AudioFormat(ext)
+	audioFound := false
 	for _, stream := range data.Streams {
 		if stream.CodecType != "audio" {
 			continue
 		}
+		audioFound = true
 		if rate, err := strconv.Atoi(stream.SampleRate); err == nil {
 			probe.SampleRate = rate
 		}
 		probe.Channels = stream.Channels
 		break
+	}
+	if !audioFound {
+		return nil, fmt.Errorf("ffprobe found no audio stream")
 	}
 	return probe, nil
 }
@@ -89,6 +109,14 @@ func Validate(ctx context.Context, path, originalName string, maxMB int) error {
 	ext := strings.ToLower(strings.TrimPrefix(filepath.Ext(originalName), "."))
 	if !models.IsSupportedFormat(ext) {
 		return fmt.Errorf("unsupported file format: %s", ext)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return fmt.Errorf("validate audio: %w", err)
+	}
+	if info.Size() > int64(maxMB)*1024*1024 {
+		mb := float64(info.Size()) / (1024.0 * 1024.0)
+		return fmt.Errorf("file size (%.1fMB) exceeds limit (%dMB)", mb, maxMB)
 	}
 	probe, err := ProbeFile(ctx, path)
 	if err != nil {
@@ -208,6 +236,10 @@ func PlanAdaptiveChunks(totalMS int, opts ChunkPlanOptions) ([]Chunk, error) {
 	}
 	if overlapMS >= durationMS {
 		return nil, fmt.Errorf("invalid chunking parameters: overlap >= duration")
+	}
+	plannedCount := ChunkPlanCount(totalMS, durationMS, overlapMS)
+	if plannedCount < 1 || plannedCount > MaxPlannedChunks {
+		return nil, fmt.Errorf("chunk plan would create %d chunks; maximum is %d", plannedCount, MaxPlannedChunks)
 	}
 	strategy := opts.Strategy
 	if strategy == "" {
@@ -426,6 +458,9 @@ func Metadata(probe *Probe, filename string, needsChunking bool, chunkCount int,
 // ChunkPlanCount mirrors Python's calculation of how many chunks will be
 // produced for a recording of `totalMS` milliseconds.
 func ChunkPlanCount(totalMS, durationMS, overlapMS int) int {
+	if totalMS <= 0 || durationMS <= 0 || overlapMS < 0 || overlapMS >= durationMS {
+		return 0
+	}
 	if totalMS <= durationMS {
 		return 1
 	}

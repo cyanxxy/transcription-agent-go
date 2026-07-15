@@ -3,8 +3,10 @@ package agents
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -18,6 +20,12 @@ import (
 
 func seg(ts, speaker, text string) models.TranscriptSegment {
 	return models.TranscriptSegment{Timestamp: ts, Speaker: speaker, Text: text}
+}
+
+func TestGuessMIMEFromPathUsesDocumentedMP3Type(t *testing.T) {
+	if got := guessMIMEFromPath("recording.mp3"); got != "audio/mp3" {
+		t.Fatalf("guessMIMEFromPath(mp3) = %q, want audio/mp3", got)
+	}
 }
 
 func TestMergeChunksDropsOverlap(t *testing.T) {
@@ -227,29 +235,45 @@ func TestJudgeAgentRunsToolLoopBeforeParsingDecision(t *testing.T) {
 	requests := 0
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requests++
+		if r.URL.Path != "/v1beta/interactions" {
+			t.Errorf("judge path = %q", r.URL.Path)
+		}
+		if r.Header.Get("Api-Revision") != "2026-05-20" {
+			t.Errorf("missing Interactions API revision header")
+		}
 		w.Header().Set("Content-Type", "application/json")
 		if requests == 1 {
-			json.NewEncoder(w).Encode(gemini.GenerateResponse{
-				Candidates: []gemini.Candidate{{
-					Content: gemini.Content{Role: "model", Parts: []gemini.Part{
-						{FunctionCall: &gemini.FunctionCall{
-							Name: "quality_metrics",
-							Args: map[string]any{"candidate_id": "gemini_a"},
-						}},
-					}},
-					FinishReason: "STOP",
+			json.NewEncoder(w).Encode(gemini.Interaction{
+				ID:     "judge_interaction_1",
+				Status: "requires_action",
+				Steps: []gemini.InteractionStep{{
+					Type:      "function_call",
+					ID:        "judge_call_1",
+					Name:      "quality_metrics",
+					Arguments: map[string]any{"candidate_id": "gemini_a"},
 				}},
 			})
 			return
 		}
-		json.NewEncoder(w).Encode(gemini.GenerateResponse{
-			Candidates: []gemini.Candidate{{
-				Content: gemini.Content{Role: "model", Parts: []gemini.Part{{Text: `{
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		history := body["input"].([]any)
+		result := history[len(history)-1].(map[string]any)
+		if result["call_id"] != "judge_call_1" {
+			t.Errorf("judge function result call_id = %#v", result["call_id"])
+		}
+		json.NewEncoder(w).Encode(gemini.Interaction{
+			ID:     "judge_interaction_2",
+			Status: "completed",
+			Steps: []gemini.InteractionStep{{
+				Type: "model_output",
+				Content: []gemini.InteractionContent{{Type: "text", Text: `{
 					"segments":[{"timestamp":"[00:00:00]","speaker":"Speaker 1","text":"Hello there."}],
 					"selected_candidate_ids":["gemini_a"],
 					"processing_notes":["Used quality metrics tool."]
-				}`}}},
-				FinishReason: "STOP",
+				}`}},
 			}},
 		})
 	}))
@@ -283,6 +307,27 @@ func TestJudgeAgentRunsToolLoopBeforeParsingDecision(t *testing.T) {
 	}
 	if len(decision.ToolUsage) != 1 || decision.ToolUsage[0].Name != "quality_metrics" || decision.ToolUsage[0].Count != 1 {
 		t.Fatalf("expected quality_metrics usage to be recorded, got %#v", decision.ToolUsage)
+	}
+}
+
+func TestJudgeAgentPropagatesCancellation(t *testing.T) {
+	deps, err := config.NewAppDeps("test-key", config.WithCandidateStrategy("single_gemini"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer deps.Cleanup()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	judge := NewJudgeAgent(deps, gemini.NewClient("test-key"))
+	_, err = judge.Run(ctx, JudgeInput{Candidates: []models.TranscriptCandidate{{
+		CandidateID: "gemini_a",
+		Label:       "Gemini A",
+		Kind:        models.CandidateGemini,
+		Segments:    []models.TranscriptSegment{seg("[00:00:00]", "Speaker 1", "Hello.")},
+	}}})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context cancellation, got %v", err)
 	}
 }
 
@@ -334,6 +379,112 @@ func TestAutoFormatRemovesExtraSpacesAndFixesPunctuation(t *testing.T) {
 	}
 	if len(changes) == 0 {
 		t.Errorf("expected some changes recorded")
+	}
+}
+
+func TestAutoFormatDefaultPreservesLexicalContentAndCase(t *testing.T) {
+	input := "NASA  API at https://example.com uses v1.2beta; we're gonna ship."
+	out, _ := AutoFormatTranscript(config.DefaultEditingDeps(), []models.TranscriptSegment{seg("[00:00:00]", "Alice", input)})
+	want := "NASA API at https://example.com uses v1.2beta; we're gonna ship."
+	if out[0].Text != want {
+		t.Fatalf("default cleanup changed lexical content: got %q want %q", out[0].Text, want)
+	}
+}
+
+func TestApplyReplacementsDeterministicAndLiteral(t *testing.T) {
+	replacements := map[string]string{"new york": "$NY", "new": "old"}
+	for i := 0; i < 20; i++ {
+		if got := ApplyReplacements("New York is new", replacements); got != "$NY is old" {
+			t.Fatalf("replacement pass %d = %q", i, got)
+		}
+	}
+	result := FindAndReplace([]models.TranscriptSegment{seg("[00:00:00]", "S", "price x")}, "x", "$1", true, false)
+	if result.Segments[0].Text != "price $1" {
+		t.Fatalf("replacement interpreted dollar expansion: %q", result.Segments[0].Text)
+	}
+	if empty := FindAndReplace(result.Segments, "", "bad", true, false); empty.Success || empty.Segments[0].Text != "price $1" {
+		t.Fatalf("empty find should be rejected: %#v", empty)
+	}
+}
+
+func TestParseSegmentsRejectsAnyInvalidSegment(t *testing.T) {
+	for _, raw := range []string{
+		`{"segments":[{"timestamp":"bad","speaker":"S","text":"x"}]}`,
+		`{"segments":[{"timestamp":"[00:00:00]","speaker":"S","text":"ok"},{"timestamp":"bad","speaker":"S","text":"lost"}]}`,
+		`{"segments":[{"timestamp":"[00:00:10]","speaker":"S","text":"a"},{"timestamp":"[00:00:05]","speaker":"S","text":"b"}]}`,
+	} {
+		if _, err := parseSegments(raw); err == nil {
+			t.Fatalf("invalid model payload was accepted: %s", raw)
+		}
+	}
+}
+
+func TestBuildContextPromptIncludesKeywords(t *testing.T) {
+	prompt := BuildContextPrompt(models.TranscriptContext{Keywords: []string{"OpenAI", "Gemini"}})
+	if !strings.Contains(prompt, "KEYWORDS TO VERIFY: OpenAI, Gemini") {
+		t.Fatalf("keywords missing from context prompt: %s", prompt)
+	}
+}
+
+func TestParakeetAlignRejectsContentMutation(t *testing.T) {
+	dir := t.TempDir()
+	script := filepath.Join(dir, "sidecar.sh")
+	body := "#!/bin/sh\nprintf '%s' '{\"segments\":[{\"timestamp\":\"[00:00:01]\",\"speaker\":\"Mallory\",\"text\":\"changed\"}]}'\n"
+	if err := os.WriteFile(script, []byte(body), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	sidecar := &ParakeetSidecar{Command: script, Model: "test"}
+	original := []models.TranscriptSegment{seg("[00:00:00]", "Alice", "original")}
+	if _, err := sidecar.Align(context.Background(), "audio.wav", original); err == nil {
+		t.Fatal("expected alignment content mutation to be rejected")
+	}
+}
+
+func TestValidateGlobalReviewDecisionRejectsInventedSpan(t *testing.T) {
+	spans := map[string]models.SpanRun{"span_0000": {SpanID: "span_0000"}}
+	err := validateGlobalReviewDecision(&models.GlobalReviewDecision{
+		Verdict: "rejudge", RejudgeSpanIDs: []string{"span_9999"},
+	}, spans)
+	if err == nil {
+		t.Fatal("global review accepted an invented span id")
+	}
+	if err := validateGlobalReviewDecision(&models.GlobalReviewDecision{Verdict: "pass"}, spans); err != nil {
+		t.Fatalf("valid pass decision rejected: %v", err)
+	}
+}
+
+func TestGlobalReviewAgentUsesReadOnlySpanTool(t *testing.T) {
+	requests := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests++
+		w.Header().Set("Content-Type", "application/json")
+		if requests == 1 {
+			_ = json.NewEncoder(w).Encode(gemini.Interaction{
+				ID: "review_1", Status: "requires_action",
+				Steps: []gemini.InteractionStep{{Type: "function_call", ID: "call_1", Name: "span_diagnostics", Arguments: map[string]any{"span_id": "span_0000"}}},
+			})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(gemini.Interaction{
+			ID: "review_2", Status: "completed",
+			Steps: []gemini.InteractionStep{{Type: "model_output", Content: []gemini.InteractionContent{{Type: "text", Text: `{"verdict":"pass","rejudge_span_ids":[],"reasons":["consistent"]}`}}}},
+		})
+	}))
+	defer srv.Close()
+	deps, err := config.NewAppDeps("key")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer deps.Cleanup()
+	agent := NewGlobalReviewAgent(deps, gemini.NewClient("key").WithEndpoint(srv.URL))
+	decision, err := agent.Run(context.Background(), []models.SpanRun{
+		{SpanID: "span_0000", Index: 0}, {SpanID: "span_0001", Index: 1},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decision.Verdict != "pass" || decision.Method != "model" || len(decision.ToolUsage) != 1 || decision.ToolUsage[0].Name != "span_diagnostics" {
+		t.Fatalf("unexpected global review decision: %#v", decision)
 	}
 }
 

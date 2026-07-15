@@ -199,6 +199,7 @@ type CandidateKind string
 const (
 	CandidateGemini   CandidateKind = "gemini"
 	CandidateParakeet CandidateKind = "parakeet"
+	CandidateJudge    CandidateKind = "judge"
 )
 
 // TranscriptCandidate is one candidate transcript fed to the judge.
@@ -218,6 +219,7 @@ type JudgeDecision struct {
 	SelectedCandidateIDs []string            `json:"selected_candidate_ids"`
 	ProcessingNotes      []string            `json:"processing_notes"`
 	ToolUsage            []JudgeToolUsage    `json:"tool_usage,omitempty"`
+	DecisionMethod       string              `json:"decision_method,omitempty"`
 }
 
 // JudgeToolUsage records how often a judge-side transcript tool was called.
@@ -235,6 +237,186 @@ type TranscriptContext struct {
 	LanguageHints      string   `json:"language_hints,omitempty"`
 	ExpectedFormat     string   `json:"expected_format,omitempty"`
 	Keywords           []string `json:"keywords,omitempty"`
+}
+
+// AgentRunStatus describes the lifecycle of the adaptive transcription run.
+type AgentRunStatus string
+
+const (
+	AgentRunPlanning       AgentRunStatus = "planning"
+	AgentRunRunning        AgentRunStatus = "running"
+	AgentRunReviewRequired AgentRunStatus = "review_required"
+	AgentRunCompleted      AgentRunStatus = "completed"
+	AgentRunFailed         AgentRunStatus = "failed"
+	AgentRunCanceled       AgentRunStatus = "canceled"
+)
+
+// AgentStepStatus describes one planner or executor step.
+type AgentStepStatus string
+
+const (
+	AgentStepRunning   AgentStepStatus = "running"
+	AgentStepCompleted AgentStepStatus = "completed"
+	AgentStepSkipped   AgentStepStatus = "skipped"
+	AgentStepFailed    AgentStepStatus = "failed"
+)
+
+// AgentBudget is the hard, auditable limit for one adaptive run.
+type AgentBudget struct {
+	MaxCandidateRuns        int   `json:"max_candidate_runs"`
+	CandidateRunsUsed       int   `json:"candidate_runs_used"`
+	MaxJudgeCalls           int   `json:"max_judge_calls"`
+	JudgeCallsUsed          int   `json:"judge_calls_used"`
+	MaxPlannerTurns         int   `json:"max_planner_turns"`
+	PlannerTurnsUsed        int   `json:"planner_turns_used"`
+	MaxSpanEscalations      int   `json:"max_span_escalations"`
+	SpanEscalationsUsed     int   `json:"span_escalations_used"`
+	MaxInteractionRequests  int   `json:"max_interaction_requests"`
+	InteractionRequestsUsed int   `json:"interaction_requests_used"`
+	MaxToolCalls            int   `json:"max_tool_calls"`
+	ToolCallsUsed           int   `json:"tool_calls_used"`
+	InputTokensUsed         int   `json:"input_tokens_used"`
+	OutputTokensUsed        int   `json:"output_tokens_used"`
+	ThoughtTokensUsed       int   `json:"thought_tokens_used"`
+	MaxGlobalReviews        int   `json:"max_global_reviews"`
+	GlobalReviewsUsed       int   `json:"global_reviews_used"`
+	MaxWallTimeSeconds      int   `json:"max_wall_time_seconds"`
+	ElapsedMilliseconds     int64 `json:"elapsed_milliseconds"`
+	MaxTotalTokens          int   `json:"max_total_tokens"`
+	TotalTokensUsed         int   `json:"total_tokens_used"`
+}
+
+// AgentPlan records the policy envelope selected before tools execute.
+type AgentPlan struct {
+	Mode                     string   `json:"mode"`
+	CandidateStrategy        string   `json:"candidate_strategy"`
+	PrimaryCandidateID       string   `json:"primary_candidate_id"`
+	AllowedCandidateIDs      []string `json:"allowed_candidate_ids"`
+	EscalationScoreThreshold float64  `json:"escalation_score_threshold"`
+	RequireGlobalReview      bool     `json:"require_global_review"`
+}
+
+// AgentStep is one observable planner, tool, evaluator, or review action.
+type AgentStep struct {
+	StepID       string          `json:"step_id"`
+	Kind         string          `json:"kind"`
+	Status       AgentStepStatus `json:"status"`
+	Decision     string          `json:"decision,omitempty"`
+	Reason       string          `json:"reason,omitempty"`
+	CandidateIDs []string        `json:"candidate_ids,omitempty"`
+	Metadata     map[string]any  `json:"metadata,omitempty"`
+	StartedAt    time.Time       `json:"started_at"`
+	CompletedAt  *time.Time      `json:"completed_at,omitempty"`
+	SpanID       string          `json:"span_id,omitempty"`
+}
+
+// SegmentEvidence links a final segment to the candidates and evaluations that
+// support it. A disputed segment is never represented as silently resolved.
+type SegmentEvidence struct {
+	SegmentIndex       int      `json:"segment_index"`
+	SpanID             string   `json:"span_id,omitempty"`
+	SourceCandidateIDs []string `json:"source_candidate_ids"`
+	SourceAttemptIDs   []string `json:"source_attempt_ids,omitempty"`
+	Confidence         *float64 `json:"confidence,omitempty"`
+	Disputed           bool     `json:"disputed"`
+	Notes              []string `json:"notes,omitempty"`
+}
+
+// StateTransition is one validated span lifecycle transition.
+type StateTransition struct {
+	From      string    `json:"from"`
+	To        string    `json:"to"`
+	Reason    string    `json:"reason,omitempty"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+// CandidateAttempt is the immutable provenance record for one candidate tool
+// execution on one deterministic audio span.
+type CandidateAttempt struct {
+	AttemptID   string              `json:"attempt_id"`
+	CandidateID string              `json:"candidate_id"`
+	Attempt     int                 `json:"attempt"`
+	Kind        CandidateKind       `json:"kind"`
+	ModelName   string              `json:"model_name"`
+	Status      string              `json:"status"`
+	Segments    []TranscriptSegment `json:"segments,omitempty"`
+	Notes       []string            `json:"notes,omitempty"`
+}
+
+// SpanEvaluation is the deterministic local evaluator output used to admit
+// optional candidate work and inform the global review router.
+type SpanEvaluation struct {
+	Severity       float64  `json:"severity"`
+	QualityScore   float64  `json:"quality_score"`
+	TimestampScore int      `json:"timestamp_score"`
+	Disagreement   float64  `json:"disagreement"`
+	NeedsEvidence  bool     `json:"needs_evidence"`
+	Reasons        []string `json:"reasons,omitempty"`
+}
+
+// JudgeExecution classifies whether the span decision came from Gemini or a
+// bounded fallback and records the exact candidate IDs used.
+type JudgeExecution struct {
+	Method               string   `json:"method"`
+	SelectedCandidateIDs []string `json:"selected_candidate_ids"`
+	Notes                []string `json:"notes,omitempty"`
+	RejudgeCount         int      `json:"rejudge_count"`
+}
+
+// SpanRun is the auditable state for one fixed audio span.
+type SpanRun struct {
+	SpanID       string              `json:"span_id"`
+	Index        int                 `json:"index"`
+	StartSeconds float64             `json:"start_seconds"`
+	EndSeconds   float64             `json:"end_seconds"`
+	State        string              `json:"state"`
+	Attempts     []CandidateAttempt  `json:"attempts"`
+	Evaluation   SpanEvaluation      `json:"evaluation"`
+	Judge        JudgeExecution      `json:"judge"`
+	Segments     []TranscriptSegment `json:"segments"`
+	Transitions  []StateTransition   `json:"transitions"`
+}
+
+// GlobalReviewDecision is a read-only routing verdict. It can request one
+// bounded span rejudge, but it cannot create or edit transcript text.
+type GlobalReviewDecision struct {
+	Verdict        string           `json:"verdict"`
+	RejudgeSpanIDs []string         `json:"rejudge_span_ids,omitempty"`
+	Reasons        []string         `json:"reasons,omitempty"`
+	Method         string           `json:"method"`
+	ToolUsage      []JudgeToolUsage `json:"tool_usage,omitempty"`
+}
+
+// DisputedSpan identifies an unresolved or adjudicated area of disagreement.
+type DisputedSpan struct {
+	StartTimestamp string   `json:"start_timestamp"`
+	EndTimestamp   string   `json:"end_timestamp"`
+	SegmentIndexes []int    `json:"segment_indexes"`
+	CandidateIDs   []string `json:"candidate_ids"`
+	Reason         string   `json:"reason"`
+	Status         string   `json:"status"`
+}
+
+// HumanReview records whether a person should inspect the result and why.
+type HumanReview struct {
+	Status  string   `json:"status"`
+	Reasons []string `json:"reasons,omitempty"`
+}
+
+// AgentRun is the durable, public trace of the adaptive orchestration loop.
+type AgentRun struct {
+	RunID         string                `json:"run_id"`
+	Status        AgentRunStatus        `json:"status"`
+	Plan          AgentPlan             `json:"plan"`
+	Budget        AgentBudget           `json:"budget"`
+	Steps         []AgentStep           `json:"steps"`
+	Evidence      []SegmentEvidence     `json:"evidence"`
+	DisputedSpans []DisputedSpan        `json:"disputed_spans"`
+	Spans         []SpanRun             `json:"spans"`
+	GlobalReview  *GlobalReviewDecision `json:"global_review,omitempty"`
+	HumanReview   HumanReview           `json:"human_review"`
+	StartedAt     time.Time             `json:"started_at"`
+	CompletedAt   *time.Time            `json:"completed_at,omitempty"`
 }
 
 // TranscriptResult is the final pipeline output.
@@ -255,6 +437,7 @@ type TranscriptResult struct {
 	JudgeSelectedCandidateIDs []string              `json:"judge_selected_candidate_ids"`
 	JudgeNotes                []string              `json:"judge_notes"`
 	JudgeToolUsage            []JudgeToolUsage      `json:"judge_tool_usage,omitempty"`
+	AgentRun                  *AgentRun             `json:"agent_run,omitempty"`
 }
 
 // FullText returns the transcript without timestamps.

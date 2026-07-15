@@ -1,7 +1,9 @@
 package skills
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
@@ -244,12 +246,22 @@ func TestLoadShippedSkills(t *testing.T) {
 
 // fakeGenerator returns a canned response; used to test the router.
 type fakeGenerator struct {
-	resp *gemini.GenerateResponse
+	resp *gemini.Interaction
 	err  error
 }
 
-func (f fakeGenerator) GenerateContent(_ context.Context, _ string, _ *gemini.GenerateRequest) (*gemini.GenerateResponse, error) {
+func (f fakeGenerator) CreateInteraction(_ context.Context, _ *gemini.InteractionRequest) (*gemini.Interaction, error) {
 	return f.resp, f.err
+}
+
+type recordingGenerator struct {
+	req  *gemini.InteractionRequest
+	resp *gemini.Interaction
+}
+
+func (g *recordingGenerator) CreateInteraction(_ context.Context, req *gemini.InteractionRequest) (*gemini.Interaction, error) {
+	g.req = req
+	return g.resp, nil
 }
 
 func TestRouterSelectsSkill(t *testing.T) {
@@ -259,13 +271,11 @@ func TestRouterSelectsSkill(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	resp := &gemini.GenerateResponse{Candidates: []gemini.Candidate{{
-		Content: gemini.Content{Parts: []gemini.Part{{
-			FunctionCall: &gemini.FunctionCall{Name: "activate_skill", Args: map[string]any{"name": "transcribing-medical"}},
-		}}},
-		FinishReason: "STOP",
+	resp := &gemini.Interaction{ID: "router", Status: "requires_action", Steps: []gemini.InteractionStep{{
+		Type: "function_call", ID: "call_1", Name: "activate_skill", Arguments: map[string]any{"name": "transcribing-medical"},
 	}}}
-	rt := NewRouter(reg, fakeGenerator{resp: resp}, "gemini-3-flash-preview")
+	generator := &recordingGenerator{resp: resp}
+	rt := NewRouter(reg, generator, "gemini-3-flash-preview")
 	key, name, err := rt.RouteFormat(context.Background(), "a doctor discussing medication dosage")
 	if err != nil {
 		t.Fatal(err)
@@ -273,9 +283,19 @@ func TestRouterSelectsSkill(t *testing.T) {
 	if key != "medical" || name != "transcribing-medical" {
 		t.Errorf("router selected key=%q name=%q", key, name)
 	}
+	if generator.req == nil || generator.req.Store == nil || *generator.req.Store || len(generator.req.Tools) != 1 {
+		t.Fatalf("router request is missing stateless/tool configuration: %#v", generator.req)
+	}
+	wire, err := json.Marshal(generator.req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(wire, []byte(`"tool_choice"`)) {
+		t.Fatalf("router should rely on the documented default auto tool choice: %s", wire)
+	}
 
 	// No function call => no selection.
-	rt2 := NewRouter(reg, fakeGenerator{resp: &gemini.GenerateResponse{Candidates: []gemini.Candidate{{FinishReason: "STOP"}}}}, "m")
+	rt2 := NewRouter(reg, fakeGenerator{resp: &gemini.Interaction{ID: "router_empty", Status: "completed"}}, "m")
 	if key, _, _ := rt2.RouteFormat(context.Background(), "generic audio"); key != "" {
 		t.Errorf("expected no selection, got %q", key)
 	}

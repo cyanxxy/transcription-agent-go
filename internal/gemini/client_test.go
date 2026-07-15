@@ -46,6 +46,38 @@ func TestGenerateContentParsesResponse(t *testing.T) {
 	}
 }
 
+func TestUploadFileDeletesFinalizedFileWhenActivationFails(t *testing.T) {
+	var deleted atomic.Bool
+	mux := http.NewServeMux()
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	mux.HandleFunc("/upload/v1beta/files", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("X-Goog-Upload-URL", srv.URL+"/finish")
+		w.WriteHeader(http.StatusOK)
+	})
+	mux.HandleFunc("/finish", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"file": map[string]any{"name": "files/failed", "state": "PROCESSING"}})
+	})
+	mux.HandleFunc("/v1beta/files/failed", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodDelete {
+			deleted.Store(true)
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(FileInfo{Name: "files/failed", State: "FAILED"})
+	})
+	path := filepath.Join(t.TempDir(), "audio.wav")
+	if err := os.WriteFile(path, []byte("audio"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewClient("key").WithEndpoint(srv.URL).UploadFile(context.Background(), path); err == nil {
+		t.Fatal("expected activation failure")
+	}
+	if !deleted.Load() {
+		t.Fatal("finalized file was orphaned after activation failure")
+	}
+}
+
 func TestGenerateContentSendsServiceTier(t *testing.T) {
 	var body map[string]any
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -606,3 +638,9 @@ func TestGenerateContentSurfacesFinishReason(t *testing.T) {
 // Compile-time assertion that fakeNetError satisfies net.Error (so the retry
 // path treats it as a timeout-eligible network error).
 var _ net.Error = fakeNetError{}
+
+func TestGuessMimeUsesDocumentedMP3Type(t *testing.T) {
+	if got := guessMime("recording.mp3"); got != "audio/mp3" {
+		t.Fatalf("guessMime(mp3) = %q, want audio/mp3", got)
+	}
+}

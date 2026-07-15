@@ -31,7 +31,6 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"io"
 	"io/fs"
 	"log/slog"
 	"net"
@@ -39,7 +38,6 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
@@ -47,12 +45,10 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/cyanxxy/transcription-agent-go/internal/agents"
 	"github.com/cyanxxy/transcription-agent-go/internal/config"
 	"github.com/cyanxxy/transcription-agent-go/internal/models"
 	"github.com/cyanxxy/transcription-agent-go/internal/obs"
 	"github.com/cyanxxy/transcription-agent-go/internal/skills"
-	"github.com/cyanxxy/transcription-agent-go/internal/workflow"
 )
 
 //go:embed web/templates/index.html web/static
@@ -66,73 +62,8 @@ const (
 	defaultJobTTL               = 30 * time.Minute
 	defaultShutdownGrace        = 30 * time.Second
 	defaultMaxConcurrency       = 4
+	defaultMaxQueued            = 12
 )
-
-type job struct {
-	id         string
-	createdAt  time.Time
-	finishedAt time.Time
-	cancel     context.CancelFunc
-
-	mu        sync.Mutex
-	events    []sseEvent
-	done      bool
-	listeners []chan struct{}
-}
-
-type sseEvent struct {
-	Name string
-	Data string
-}
-
-func (j *job) push(name string, data any) {
-	bs, _ := json.Marshal(data)
-	j.mu.Lock()
-	j.events = append(j.events, sseEvent{Name: name, Data: string(bs)})
-	listeners := j.listeners
-	j.listeners = nil
-	j.mu.Unlock()
-	for _, l := range listeners {
-		close(l)
-	}
-}
-
-func (j *job) close() {
-	j.mu.Lock()
-	if j.done {
-		j.mu.Unlock()
-		return
-	}
-	j.done = true
-	j.finishedAt = time.Now()
-	listeners := j.listeners
-	j.listeners = nil
-	j.mu.Unlock()
-	for _, l := range listeners {
-		close(l)
-	}
-}
-
-// snapshot returns all events seen after the given cursor, plus a channel
-// that closes when new events arrive (or the job ends).
-func (j *job) snapshot(after int) ([]sseEvent, <-chan struct{}, bool) {
-	j.mu.Lock()
-	defer j.mu.Unlock()
-	if after < len(j.events) {
-		copied := append([]sseEvent(nil), j.events[after:]...)
-		ch := make(chan struct{})
-		close(ch)
-		return copied, ch, j.done
-	}
-	if j.done {
-		ch := make(chan struct{})
-		close(ch)
-		return nil, ch, true
-	}
-	wait := make(chan struct{})
-	j.listeners = append(j.listeners, wait)
-	return nil, wait, false
-}
 
 type server struct {
 	apiKey         string
@@ -142,15 +73,23 @@ type server struct {
 	jobTTL         time.Duration
 	maxUploadBytes int64
 	maxConcurrency int
+	maxQueued      int
+	jobDir         string
 	shutdownGrace  time.Duration
 	logger         *slog.Logger
 	indexHTML      []byte
 	static         http.Handler
 	jobs           sync.Map // map[string]*job
-	concurrency    chan struct{}
+	queue          chan *job
+	workerCtx      context.Context
+	stopWorkers    context.CancelFunc
 	jobWG          sync.WaitGroup
 	jobsMu         sync.Mutex
 	cancelFns      map[string]context.CancelFunc // for shutdown to cancel in-flight jobs
+	admissionMu    sync.Mutex
+	admitted       int
+	idempotencyMu  sync.Mutex
+	idempotency    map[string]*idempotencyBinding
 	ready          atomic.Bool
 	skillsReg      *skills.Registry
 	skillRouter    bool
@@ -164,7 +103,9 @@ func main() {
 	parakeet := flag.String("parakeet-cmd", os.Getenv("TRANSCRIBER_PARAKEET_CMD"), "Optional Parakeet sidecar command")
 	maxUploadBytes := flag.Int64("max-upload-bytes", envInt64("MAX_UPLOAD_BYTES", defaultMaxUploadBytes), "Maximum upload size in bytes")
 	maxConcurrency := flag.Int("max-concurrency", envInt("MAX_CONCURRENCY", defaultMaxConcurrency), "Maximum concurrent transcription jobs")
-	jobTTL := flag.Duration("job-ttl", envDuration("JOB_TTL", defaultJobTTL), "How long to keep completed job state in memory")
+	maxQueued := flag.Int("max-queued", envInt("MAX_QUEUED", defaultMaxQueued), "Maximum accepted jobs waiting for a worker")
+	jobDir := flag.String("job-dir", envOr("JOB_DIR", "./data/jobs"), "Persistent job journal directory")
+	jobTTL := flag.Duration("job-ttl", envDuration("JOB_TTL", defaultJobTTL), "How long to retain completed jobs or wait for human review")
 	shutdownGrace := flag.Duration("shutdown-grace", envDuration("SHUTDOWN_GRACE", defaultShutdownGrace), "Graceful shutdown drain period")
 	skillsDir := flag.String("skills-dir", envOr("SKILLS_DIR", ".skills"), "Directory of skill packs (SKILL.md folders)")
 	skillRouter := flag.Bool("skill-router", parseBool(os.Getenv("SKILL_ROUTER"), false), "Let the model auto-select a format skill when no expected-format is given")
@@ -192,13 +133,32 @@ func main() {
 		jobTTL:         *jobTTL,
 		maxUploadBytes: *maxUploadBytes,
 		maxConcurrency: *maxConcurrency,
+		maxQueued:      *maxQueued,
+		jobDir:         *jobDir,
 		shutdownGrace:  *shutdownGrace,
 		logger:         logger,
-		concurrency:    make(chan struct{}, *maxConcurrency),
 		cancelFns:      make(map[string]context.CancelFunc),
+		idempotency:    make(map[string]*idempotencyBinding),
 		skillRouter:    *skillRouter,
 	}
 	s.ready.Store(true)
+	if s.maxConcurrency < 1 || s.maxConcurrency > 64 || s.maxQueued < 0 || s.maxQueued > 10000 ||
+		s.maxUploadBytes < 1 || s.jobTTL < time.Second || s.shutdownGrace < time.Second {
+		logger.Error("invalid server limits",
+			"max_concurrency", s.maxConcurrency,
+			"max_queued", s.maxQueued,
+			"max_upload_bytes", s.maxUploadBytes,
+			"job_ttl", s.jobTTL,
+			"shutdown_grace", s.shutdownGrace,
+		)
+		os.Exit(2)
+	}
+	recoverable, storeErr := s.initializeJobStore()
+	if storeErr != nil {
+		logger.Error("initialize durable job store", "error", storeErr)
+		os.Exit(1)
+	}
+	s.startJobWorkers(recoverable)
 
 	if reg, lerr := skills.Load(skillRoots(*skillsDir)...); reg != nil {
 		if lerr != nil {
@@ -239,6 +199,8 @@ func main() {
 		slog.String("addr", *addr),
 		slog.String("version", version),
 		slog.Int("max_concurrency", s.maxConcurrency),
+		slog.Int("max_queued", s.maxQueued),
+		slog.String("job_dir", s.jobDir),
 		slog.Int64("max_upload_bytes", s.maxUploadBytes),
 		slog.Duration("job_ttl", s.jobTTL),
 	)
@@ -307,12 +269,16 @@ func newTestServer(apiKey string, maxConcurrency int) *server {
 		jobTTL:         defaultJobTTL,
 		maxUploadBytes: defaultMaxUploadBytes,
 		maxConcurrency: maxConcurrency,
+		maxQueued:      defaultMaxQueued,
+		jobDir:         mustTempJobDir(),
 		shutdownGrace:  defaultShutdownGrace,
 		logger:         logger,
-		concurrency:    make(chan struct{}, maxConcurrency),
 		cancelFns:      make(map[string]context.CancelFunc),
+		idempotency:    make(map[string]*idempotencyBinding),
 	}
 	s.ready.Store(true)
+	recoverable, _ := s.initializeJobStore()
+	s.startJobWorkers(recoverable)
 	_ = s.loadAssets() // best effort; tests can stub.
 	return s
 }
@@ -326,6 +292,9 @@ func (s *server) gracefulShutdown(srv *http.Server) {
 	// won't wait for SSE listeners that ignore ctx.Done(), so we explicitly
 	// cancel running jobs in parallel.
 	s.cancelAllJobs()
+	if s.stopWorkers != nil {
+		s.stopWorkers()
+	}
 
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		s.logger.Warn("http shutdown returned an error", "error", err)
@@ -355,25 +324,43 @@ func (s *server) cancelAllJobs() {
 	}
 }
 
-// janitor purges completed jobs that exceed jobTTL. It runs until the process
-// exits.
+// janitor purges completed jobs and expires abandoned human-review jobs once
+// they exceed jobTTL. It runs until the process exits.
 func (s *server) janitor() {
 	ticker := time.NewTicker(s.jobTTL / 4)
 	defer ticker.Stop()
 	for range ticker.C {
-		cutoff := time.Now().Add(-s.jobTTL)
-		s.jobs.Range(func(key, value any) bool {
-			j := value.(*job)
-			j.mu.Lock()
-			expired := j.done && !j.finishedAt.IsZero() && j.finishedAt.Before(cutoff)
-			j.mu.Unlock()
-			if expired {
-				s.jobs.Delete(key)
-				s.logger.Debug("purged expired job", slog.String("job_id", key.(string)))
-			}
-			return true
-		})
+		s.purgeExpiredJobs(time.Now())
 	}
+}
+
+func (s *server) purgeExpiredJobs(now time.Time) {
+	cutoff := now.Add(-s.jobTTL)
+	s.jobs.Range(func(key, value any) bool {
+		j := value.(*job)
+		expired, err := j.expireForRetention(cutoff)
+		if err != nil {
+			s.logger.Error("expire retained job", slog.String("job_id", j.id), "error", err)
+			return true
+		}
+		if !expired {
+			return true
+		}
+		s.jobs.Delete(key)
+		if j.request.Idempotency != "" {
+			s.idempotencyMu.Lock()
+			binding := s.idempotency[j.request.Idempotency]
+			if binding != nil && binding.jobID == j.id {
+				delete(s.idempotency, j.request.Idempotency)
+			}
+			s.idempotencyMu.Unlock()
+		}
+		if err := os.RemoveAll(j.dir); err != nil {
+			s.logger.Warn("remove expired job directory", slog.String("job_id", j.id), "error", err)
+		}
+		s.logger.Debug("purged expired job", slog.String("job_id", key.(string)))
+		return true
+	})
 }
 
 // --- Middleware ----------------------------------------------------------
@@ -525,168 +512,11 @@ func (s *server) handleReadyz(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) handleCreateJob(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		w.Header().Set("Allow", "POST")
-		respondError(w, r, http.StatusMethodNotAllowed, "method not allowed", nil)
-		return
-	}
-	if !s.ready.Load() {
-		respondError(w, r, http.StatusServiceUnavailable, "server is shutting down", nil)
-		return
-	}
-
-	r.Body = http.MaxBytesReader(w, r.Body, s.maxUploadBytes+512<<10) // small slack for the rest of the form
-	if err := r.ParseMultipartForm(32 << 20); err != nil {
-		respondError(w, r, http.StatusRequestEntityTooLarge, "upload too large or malformed multipart body", err)
-		return
-	}
-	file, header, err := r.FormFile("audio")
-	if err != nil {
-		respondError(w, r, http.StatusBadRequest, "missing audio field", err)
-		return
-	}
-	defer file.Close()
-	body, err := io.ReadAll(http.MaxBytesReader(w, file, s.maxUploadBytes))
-	if err != nil {
-		respondError(w, r, http.StatusRequestEntityTooLarge, "audio body exceeds limit", err)
-		return
-	}
-
-	opts := s.buildOptions(r)
-	wfl, err := workflow.New(s.apiKey, opts...)
-	if err != nil {
-		respondError(w, r, http.StatusBadRequest, "invalid configuration", err)
-		return
-	}
-	if s.parakeet != "" {
-		if sidecar, sErr := agents.ParakeetFromDeps(wfl.Deps.Transcription, s.parakeet); sErr == nil && sidecar != nil {
-			wfl.WithParakeet(sidecar)
-		}
-	}
-	if s.skillsReg != nil {
-		wfl.WithSkills(s.skillsReg)
-	}
-
-	id := newRandomID(12)
-	// Capture every request-derived value before launching the detached
-	// goroutine: r/header must not be touched after this handler returns.
-	requestID := obs.RequestID(r.Context())
-	filename := header.Filename
-	customPrompt := r.FormValue("custom_prompt")
-	userCtx := buildUserContext(r)
-
-	j := &job{id: id, createdAt: time.Now()}
-	jobCtx, cancel := context.WithCancel(context.Background())
-	jobCtx = obs.WithLogger(jobCtx, s.logger.With(
-		slog.String("request_id", requestID),
-		slog.String("job_id", id),
-	))
-	j.cancel = cancel
-	s.jobs.Store(id, j)
-	s.registerJob(id, cancel)
-
-	s.jobWG.Add(1)
-	go func() {
-		defer s.jobWG.Done()
-		defer j.close()
-		defer s.unregisterJob(id)
-		defer cancel()
-		// Recover from any panic in the pipeline so a single bad job cannot
-		// crash the whole server. Registered last so it runs first on unwind,
-		// pushing the error event before the job is marked done.
-		defer func() {
-			if rec := recover(); rec != nil {
-				obs.LoggerFrom(jobCtx).Error("job goroutine panicked",
-					"panic", rec,
-					"stack", string(debug.Stack()))
-				j.push("error-event", map[string]any{
-					"message":    "internal error",
-					"request_id": requestID,
-				})
-			}
-		}()
-
-		// Concurrency gate: block until a slot opens, or until the job context
-		// is canceled (graceful shutdown).
-		select {
-		case s.concurrency <- struct{}{}:
-			defer func() { <-s.concurrency }()
-			// If shutdown won the race for this slot, surface the clear message
-			// instead of a generic context-canceled error from Transcribe.
-			if jobCtx.Err() != nil {
-				j.push("error-event", map[string]any{"message": "server is shutting down"})
-				return
-			}
-		case <-jobCtx.Done():
-			j.push("error-event", map[string]any{"message": "server is shutting down"})
-			return
-		}
-
-		runCtx, runCancel := context.WithTimeout(jobCtx, 30*time.Minute)
-		defer runCancel()
-
-		progress := func(stage string, fraction float64) {
-			j.push("progress", map[string]any{"stage": stage, "fraction": fraction})
-		}
-		result, runErr := wfl.Transcribe(runCtx, workflow.TranscribeInput{
-			FileBytes:    body,
-			Filename:     filename,
-			CustomPrompt: customPrompt,
-			UserContext:  userCtx,
-			Progress:     progress,
-		})
-		if runErr != nil {
-			obs.LoggerFrom(jobCtx).Error("transcription failed", "error", runErr.Error())
-			// We surface a short message to the client; full detail stays in logs.
-			j.push("error-event", map[string]any{
-				"message":    publicErrorMessage(runErr),
-				"request_id": requestID,
-			})
-			return
-		}
-		srt, _ := workflow.ExportTranscript(result, "srt")
-		txt, _ := workflow.ExportTranscript(result, "txt")
-		j.push("result", map[string]any{
-			"result":         result,
-			"formatted_text": txt,
-			"srt":            srt,
-			"job_id":         id,
-		})
-	}()
-
-	respondJSON(w, http.StatusAccepted, map[string]any{"job_id": id})
+	s.createJobHTTP(w, r)
 }
 
 func (s *server) handleJob(w http.ResponseWriter, r *http.Request) {
-	path := strings.TrimPrefix(r.URL.Path, "/api/jobs/")
-	if path == "" {
-		http.NotFound(w, r)
-		return
-	}
-	parts := strings.SplitN(path, "/", 2)
-	id := parts[0]
-	if !isSafeID(id) {
-		http.NotFound(w, r)
-		return
-	}
-	jVal, ok := s.jobs.Load(id)
-	if !ok {
-		http.NotFound(w, r)
-		return
-	}
-	jb := jVal.(*job)
-	if len(parts) == 2 && parts[1] == "stream" {
-		s.streamJob(w, r, jb)
-		return
-	}
-	jb.mu.Lock()
-	events := append([]sseEvent(nil), jb.events...)
-	done := jb.done
-	jb.mu.Unlock()
-	respondJSON(w, http.StatusOK, map[string]any{
-		"done":   done,
-		"events": events,
-	})
+	s.routeJobHTTP(w, r)
 }
 
 func (s *server) streamJob(w http.ResponseWriter, r *http.Request, jb *job) {
@@ -706,14 +536,14 @@ func (s *server) streamJob(w http.ResponseWriter, r *http.Request, jb *job) {
 	fmt.Fprintf(w, ": ok\n\n")
 	flusher.Flush()
 
-	cursor := 0
+	cursor := parseEventCursor(r)
 	keepAlive := time.NewTicker(15 * time.Second)
 	defer keepAlive.Stop()
 	for {
 		events, wait, done := jb.snapshot(cursor)
 		for _, evt := range events {
-			fmt.Fprintf(w, "event: %s\ndata: %s\n\n", evt.Name, evt.Data)
-			cursor++
+			fmt.Fprintf(w, "id: %d\nevent: %s\ndata: %s\n\n", evt.ID, evt.Name, evt.Data)
+			cursor = evt.ID
 		}
 		flusher.Flush()
 		if done {
@@ -752,22 +582,37 @@ func (s *server) unregisterJob(id string) {
 // --- Form parsing helpers -----------------------------------------------
 
 func (s *server) buildOptions(r *http.Request) []config.TranscriptionOption {
+	values := map[string]string{}
+	for _, key := range []string{
+		"model_name", "judge_model_name", "candidate_strategy", "service_tier",
+		"transcription_thinking_level", "judge_thinking_level", "use_judge_pipeline",
+		"auto_format", "remove_fillers", "chunk_strategy", "chunk_duration_ms",
+		"chunk_overlap_ms", "chunk_concurrency", "skill_router", "agentic_mode",
+	} {
+		if value := r.FormValue(key); value != "" {
+			values[key] = value
+		}
+	}
+	return s.buildOptionsFromValues(values)
+}
+
+func (s *server) buildOptionsFromValues(values map[string]string) []config.TranscriptionOption {
 	opts := []config.TranscriptionOption{}
 	add := func(o config.TranscriptionOption) { opts = append(opts, o) }
-	if v := r.FormValue("model_name"); v != "" {
+	if v := values["model_name"]; v != "" {
 		add(config.WithModelName(v))
 	}
-	if v := r.FormValue("judge_model_name"); v != "" {
+	if v := values["judge_model_name"]; v != "" {
 		add(config.WithJudgeModelName(v))
 	}
-	if v := r.FormValue("candidate_strategy"); v != "" {
+	if v := values["candidate_strategy"]; v != "" {
 		add(config.WithCandidateStrategy(v))
 	}
-	if v := r.FormValue("service_tier"); v != "" {
+	if v := values["service_tier"]; v != "" {
 		add(config.WithServiceTier(v))
 	}
-	tLevel := r.FormValue("transcription_thinking_level")
-	jLevel := r.FormValue("judge_thinking_level")
+	tLevel := values["transcription_thinking_level"]
+	jLevel := values["judge_thinking_level"]
 	if tLevel != "" || jLevel != "" {
 		if tLevel == "" {
 			tLevel = "high"
@@ -777,29 +622,29 @@ func (s *server) buildOptions(r *http.Request) []config.TranscriptionOption {
 		}
 		add(config.WithThinkingLevels(tLevel, jLevel))
 	}
-	if v := r.FormValue("use_judge_pipeline"); v != "" {
+	if v := values["use_judge_pipeline"]; v != "" {
 		add(config.WithUseJudgePipeline(parseBool(v, true)))
 	}
-	if v := r.FormValue("auto_format"); v != "" {
+	if v := values["auto_format"]; v != "" {
 		add(config.WithAutoFormat(parseBool(v, true)))
 	}
-	if v := r.FormValue("remove_fillers"); v != "" {
+	if v := values["remove_fillers"]; v != "" {
 		add(config.WithRemoveFillers(parseBool(v, false)))
 	}
-	if v := r.FormValue("chunk_strategy"); v != "" {
+	if v := values["chunk_strategy"]; v != "" {
 		add(config.WithChunkStrategy(v))
 	}
-	if v := r.FormValue("chunk_duration_ms"); v != "" {
+	if v := values["chunk_duration_ms"]; v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
 			add(config.WithChunkDurationMS(n))
 		}
 	}
-	if v := r.FormValue("chunk_overlap_ms"); v != "" {
+	if v := values["chunk_overlap_ms"]; v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
 			add(config.WithChunkOverlapMS(n))
 		}
 	}
-	if v := r.FormValue("chunk_concurrency"); v != "" {
+	if v := values["chunk_concurrency"]; v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
 			add(config.WithChunkConcurrency(n))
 		}
@@ -808,37 +653,51 @@ func (s *server) buildOptions(r *http.Request) []config.TranscriptionOption {
 		add(config.WithTempDir(s.tempDir))
 	}
 	routerOn := s.skillRouter
-	if v := r.FormValue("skill_router"); v != "" {
+	if v := values["skill_router"]; v != "" {
 		routerOn = parseBool(v, s.skillRouter)
 	}
 	add(config.WithUseSkillRouter(routerOn))
+	if v := values["agentic_mode"]; v != "" {
+		add(config.WithAgenticMode(parseBool(v, true)))
+	}
 	return opts
 }
 
 func buildUserContext(r *http.Request) *models.TranscriptContext {
+	values := map[string]string{}
+	for _, key := range []string{"topic", "custom_instructions", "language_hints", "expected_format", "speakers", "technical_terms", "keywords"} {
+		if value := r.FormValue(key); value != "" {
+			values[key] = value
+		}
+	}
+	return buildUserContextFromValues(values)
+}
+
+func buildUserContextFromValues(values map[string]string) *models.TranscriptContext {
 	ctx := models.TranscriptContext{}
-	if v := r.FormValue("topic"); v != "" {
+	if v := values["topic"]; v != "" {
 		ctx.Topic = v
 	}
-	if v := r.FormValue("custom_instructions"); v != "" {
+	if v := values["custom_instructions"]; v != "" {
 		ctx.CustomInstructions = v
 	}
-	if v := r.FormValue("language_hints"); v != "" {
+	if v := values["language_hints"]; v != "" {
 		ctx.LanguageHints = v
 	}
-	if v := r.FormValue("expected_format"); v != "" {
+	if v := values["expected_format"]; v != "" {
 		ctx.ExpectedFormat = v
 	}
-	if v := r.FormValue("speakers"); v != "" {
+	if v := values["speakers"]; v != "" {
 		ctx.SpeakerNames = splitLines(v)
 	}
-	if v := r.FormValue("technical_terms"); v != "" {
+	if v := values["technical_terms"]; v != "" {
 		ctx.TechnicalTerms = splitCSV(v)
 	}
-	if v := r.FormValue("keywords"); v != "" {
+	if v := values["keywords"]; v != "" {
 		ctx.Keywords = splitCSV(v)
 	}
-	if len(ctx.SpeakerNames) == 0 && ctx.Topic == "" && ctx.CustomInstructions == "" && len(ctx.TechnicalTerms) == 0 {
+	if len(ctx.SpeakerNames) == 0 && ctx.Topic == "" && ctx.CustomInstructions == "" &&
+		len(ctx.TechnicalTerms) == 0 && ctx.LanguageHints == "" && ctx.ExpectedFormat == "" && len(ctx.Keywords) == 0 {
 		return nil
 	}
 	return &ctx
@@ -883,6 +742,32 @@ func newRandomID(n int) string {
 	b := make([]byte, n)
 	_, _ = rand.Read(b)
 	return hex.EncodeToString(b)
+}
+
+func mustTempJobDir() string {
+	dir, err := os.MkdirTemp("", "exacttranscriber-jobs-")
+	if err != nil {
+		panic(err)
+	}
+	return dir
+}
+
+func (s *server) tryAdmit() bool {
+	s.admissionMu.Lock()
+	defer s.admissionMu.Unlock()
+	if s.admitted >= s.maxConcurrency+s.maxQueued {
+		return false
+	}
+	s.admitted++
+	return true
+}
+
+func (s *server) releaseAdmission() {
+	s.admissionMu.Lock()
+	if s.admitted > 0 {
+		s.admitted--
+	}
+	s.admissionMu.Unlock()
 }
 
 // isSafeID guards path segments and inbound request ids.
@@ -937,13 +822,10 @@ func publicErrorMessage(err error) string {
 	if err == nil {
 		return "unknown error"
 	}
-	msg := err.Error()
-	// Strip any newlines and cap length.
-	msg = strings.ReplaceAll(msg, "\n", " ")
-	if len(msg) > 240 {
-		msg = msg[:240] + "..."
+	if errors.Is(err, context.DeadlineExceeded) {
+		return "transcription timed out"
 	}
-	return msg
+	return "transcription failed; see server logs using the request id"
 }
 
 // clientIP returns a best-effort client address for access logging ONLY. When

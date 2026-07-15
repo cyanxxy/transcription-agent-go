@@ -29,6 +29,14 @@ func TestChunkPlanCount(t *testing.T) {
 	}
 }
 
+func TestPlanAdaptiveChunksRejectsExcessiveCount(t *testing.T) {
+	total := (MaxPlannedChunks + 1) * 10000
+	_, err := PlanAdaptiveChunks(total, ChunkPlanOptions{DurationMS: 10000, Strategy: ChunkStrategyFixed})
+	if err == nil {
+		t.Fatal("expected excessive chunk plan to be rejected")
+	}
+}
+
 func TestPlanAdaptiveChunksPrefersSilenceNearTargetBoundary(t *testing.T) {
 	chunks, err := PlanAdaptiveChunks(300000, ChunkPlanOptions{
 		DurationMS:   120000,

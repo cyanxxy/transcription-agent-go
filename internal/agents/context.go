@@ -50,6 +50,9 @@ func BuildContextPromptWithSkills(ctx models.TranscriptContext, reg *skills.Regi
 	if strings.TrimSpace(ctx.LanguageHints) != "" {
 		parts = append(parts, "LANGUAGE/ACCENT INFO: "+ctx.LanguageHints)
 	}
+	if len(ctx.Keywords) > 0 {
+		parts = append(parts, "KEYWORDS TO VERIFY: "+strings.Join(ctx.Keywords, ", "))
+	}
 	formatKey := strings.ToLower(strings.TrimSpace(ctx.ExpectedFormat))
 	if body, ok := reg.FormatBody(formatKey); ok {
 		// A format skill body already carries the "do not change document type"

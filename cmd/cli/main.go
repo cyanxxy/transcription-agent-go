@@ -66,7 +66,7 @@ func run() error {
 		input              = flag.String("i", "", "Audio file path (required)")
 		output             = flag.String("o", "", "Output file path (default stdout)")
 		format             = flag.String("format", "txt", "Output format: txt, srt, json")
-		model              = flag.String("model", "gemini-3-flash-preview", "Primary Gemini model")
+		model              = flag.String("model", "gemini-3.5-flash", "Primary Gemini model")
 		judgeModel         = flag.String("judge-model", "gemini-3.1-pro-preview", "Judge Gemini model")
 		strategy           = flag.String("strategy", "dual_gemini", "Candidate strategy")
 		serviceTier        = flag.String("service-tier", "", "Gemini service tier: standard, flex, priority")
@@ -75,9 +75,12 @@ func run() error {
 		topic              = flag.String("topic", "", "Optional topic")
 		speakers           = flag.String("speakers", "", "Optional speakers (comma-separated)")
 		terms              = flag.String("terms", "", "Optional technical terms (comma-separated)")
+		keywords           = flag.String("keywords", "", "Optional verification keywords (comma-separated)")
+		languageHints      = flag.String("language-hints", "", "Optional language or accent hints")
 		customInstructions = flag.String("instructions", "", "Optional custom instructions")
 		expectedFormat     = flag.String("expected-format", "", "Optional expected format: meeting, interview, lecture, podcast, legal, medical, technical")
 		useJudge           = flag.Bool("judge", true, "Enable judge pipeline")
+		agenticMode        = flag.Bool("agentic", true, "Enable adaptive evidence planning and global review routing")
 		autoFormat         = flag.Bool("auto-format", true, "Enable auto-formatting")
 		removeFillers      = flag.Bool("remove-fillers", false, "Remove filler words")
 		parakeet           = flag.String("parakeet-cmd", os.Getenv("TRANSCRIBER_PARAKEET_CMD"), "Optional Parakeet sidecar command")
@@ -85,6 +88,7 @@ func run() error {
 		chunkDuration      = flag.Int("chunk-duration-ms", 120000, "Chunk duration (ms)")
 		chunkOverlap       = flag.Int("chunk-overlap-ms", 5000, "Chunk overlap (ms)")
 		chunkConcurrency   = flag.Int("chunk-concurrency", 3, "Maximum chunk transcription/judge workers")
+		maxFileSizeMB      = flag.Int("max-file-size-mb", 200, "Maximum input audio size in MiB")
 		skillsDir          = flag.String("skills-dir", envDefault("SKILLS_DIR", ".skills"), "Directory of skill packs (SKILL.md folders)")
 		skillRouter        = flag.Bool("skill-router", false, "Let the model auto-select a format skill when no expected-format is given")
 		showVersion        = flag.Bool("version", false, "Print version and exit")
@@ -110,11 +114,6 @@ func run() error {
 	logger := obs.NewLogger(logCfg)
 	obs.Install(logger)
 
-	data, err := os.ReadFile(*input)
-	if err != nil {
-		return fmt.Errorf("read audio: %w", err)
-	}
-
 	opts := []config.TranscriptionOption{
 		config.WithModelName(*model),
 		config.WithJudgeModelName(*judgeModel),
@@ -122,18 +121,29 @@ func run() error {
 		config.WithServiceTier(*serviceTier),
 		config.WithThinkingLevels(*thinking, *judgeThinking),
 		config.WithUseJudgePipeline(*useJudge),
+		config.WithAgenticMode(*agenticMode),
 		config.WithAutoFormat(*autoFormat),
 		config.WithRemoveFillers(*removeFillers),
 		config.WithChunkStrategy(*chunkStrategy),
 		config.WithChunkDurationMS(*chunkDuration),
 		config.WithChunkOverlapMS(*chunkOverlap),
 		config.WithChunkConcurrency(*chunkConcurrency),
+		config.WithMaxFileSizeMB(*maxFileSizeMB),
 		config.WithUseSkillRouter(*skillRouter),
 	}
 
 	wfl, err := workflow.New(*apiKey, opts...)
 	if err != nil {
 		return err
+	}
+	defer wfl.Deps.Cleanup()
+	info, err := os.Stat(*input)
+	if err != nil {
+		return fmt.Errorf("stat audio: %w", err)
+	}
+	limitMB := wfl.Deps.Transcription.MaxFileSizeMB
+	if info.Size() > int64(limitMB)<<20 {
+		return fmt.Errorf("audio exceeds the %d MiB CLI limit", limitMB)
 	}
 	if *parakeet != "" {
 		if sidecar, _ := agents.ParakeetFromDeps(wfl.Deps.Transcription, *parakeet); sidecar != nil {
@@ -151,6 +161,7 @@ func run() error {
 		Topic:              *topic,
 		CustomInstructions: *customInstructions,
 		ExpectedFormat:     *expectedFormat,
+		LanguageHints:      *languageHints,
 	}
 	if *speakers != "" {
 		for _, s := range strings.Split(*speakers, ",") {
@@ -166,8 +177,15 @@ func run() error {
 			}
 		}
 	}
+	if *keywords != "" {
+		for _, s := range strings.Split(*keywords, ",") {
+			if t := strings.TrimSpace(s); t != "" {
+				userCtx.Keywords = append(userCtx.Keywords, t)
+			}
+		}
+	}
 	if userCtx.Topic == "" && userCtx.CustomInstructions == "" && userCtx.ExpectedFormat == "" &&
-		len(userCtx.SpeakerNames) == 0 && len(userCtx.TechnicalTerms) == 0 {
+		userCtx.LanguageHints == "" && len(userCtx.SpeakerNames) == 0 && len(userCtx.TechnicalTerms) == 0 && len(userCtx.Keywords) == 0 {
 		userCtx = nil
 	}
 
@@ -180,7 +198,7 @@ func run() error {
 	}
 
 	result, err := wfl.Transcribe(ctx, workflow.TranscribeInput{
-		FileBytes:   data,
+		FilePath:    *input,
 		Filename:    *input,
 		Progress:    progress,
 		UserContext: userCtx,

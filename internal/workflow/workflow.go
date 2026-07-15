@@ -1,4 +1,4 @@
-// Package workflow is the candidate fan-out / judge fan-in orchestrator.
+// Package workflow implements the adaptive candidate, judge, and review runtime.
 package workflow
 
 import (
@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -19,6 +20,7 @@ import (
 	"github.com/cyanxxy/transcription-agent-go/internal/config"
 	"github.com/cyanxxy/transcription-agent-go/internal/gemini"
 	"github.com/cyanxxy/transcription-agent-go/internal/models"
+	"github.com/cyanxxy/transcription-agent-go/internal/obs"
 	"github.com/cyanxxy/transcription-agent-go/internal/skills"
 )
 
@@ -79,16 +81,18 @@ func (w *Workflow) activeSkills(deps *config.TranscriptionDeps) *skills.Registry
 // TranscribeInput describes a single end-to-end transcription run.
 type TranscribeInput struct {
 	FileBytes    []byte
+	FilePath     string
 	Filename     string
 	CustomPrompt string
 	UserContext  *models.TranscriptContext
 	Progress     ProgressFn
+	RunFinished  func(*models.AgentRun)
 }
 
 // Transcribe runs the full pipeline and returns the final TranscriptResult.
 func (w *Workflow) Transcribe(ctx context.Context, in TranscribeInput) (*models.TranscriptResult, error) {
-	if in.FileBytes == nil {
-		return nil, errors.New("file bytes are required")
+	if (in.FileBytes == nil) == (strings.TrimSpace(in.FilePath) == "") {
+		return nil, errors.New("provide exactly one of file bytes or file path")
 	}
 	if in.Filename == "" {
 		return nil, errors.New("filename is required")
@@ -111,10 +115,19 @@ func (w *Workflow) Transcribe(ctx context.Context, in TranscribeInput) (*models.
 	if in.Progress != nil {
 		in.Progress("Validating audio file...", 0.1)
 	}
-	tempPath, err := writeUpload(runDeps.TempDir, in.Filename, in.FileBytes)
-	if err != nil {
-		w.setStatus(models.StatusError, in.Filename)
-		return nil, err
+	tempPath := strings.TrimSpace(in.FilePath)
+	if tempPath == "" {
+		tempPath, err = writeUpload(runDeps.TempDir, in.Filename, in.FileBytes)
+		if err != nil {
+			w.setStatus(models.StatusError, in.Filename)
+			return nil, err
+		}
+	} else {
+		tempPath, err = stageInputPath(runDeps.TempDir, tempPath, in.Filename)
+		if err != nil {
+			w.setStatus(models.StatusError, in.Filename)
+			return nil, err
+		}
 	}
 	if err := audio.Validate(ctx, tempPath, in.Filename, runDeps.MaxFileSizeMB); err != nil {
 		w.setStatus(models.StatusError, in.Filename)
@@ -129,6 +142,10 @@ func (w *Workflow) Transcribe(ctx context.Context, in TranscribeInput) (*models.
 		w.setStatus(models.StatusError, in.Filename)
 		return nil, err
 	}
+	if probe.DurationMS > 34200000 {
+		w.setStatus(models.StatusError, in.Filename)
+		return nil, errors.New("audio exceeds Gemini's 9.5 hour per-prompt limit")
+	}
 	needsChunking := probe.DurationMS > runDeps.ChunkDurationMS
 	chunkCount := 1
 	if needsChunking {
@@ -137,6 +154,26 @@ func (w *Workflow) Transcribe(ctx context.Context, in TranscribeInput) (*models.
 	metadata := audio.Metadata(probe, in.Filename, needsChunking, chunkCount, runDeps.ChunkStrategy)
 
 	reg := w.activeSkills(runDeps)
+	specs := resolveCandidateSpecs(runDeps, reg)
+	recorder := newRunRecorder(runDeps, specs, chunkCount)
+	recorder.start()
+	ctx = withRunRecorder(ctx, recorder)
+	ctx, runCancel := context.WithTimeout(ctx, time.Duration(recorder.run.Budget.MaxWallTimeSeconds)*time.Second)
+	defer runCancel()
+	ctx = gemini.WithInteractionObserver(ctx, recorder.observeInteraction)
+	runFinalized := false
+	defer func() {
+		if runFinalized {
+			return
+		}
+		status := models.AgentRunFailed
+		if errors.Is(ctx.Err(), context.Canceled) || errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			status = models.AgentRunCanceled
+		}
+		if in.RunFinished != nil {
+			in.RunFinished(recorder.finish(nil, nil, nil, status))
+		}
+	}()
 
 	// Optional model-driven skill router: when enabled and the user supplied no
 	// explicit format, ask the model to pick a format skill from the request.
@@ -235,6 +272,11 @@ func (w *Workflow) Transcribe(ctx context.Context, in TranscribeInput) (*models.
 	if runDeps.UseJudgePipeline {
 		judgeModelUsed = runDeps.JudgeModelName
 	}
+	agentRun := recorder.finish(finalSegments, candidates, selectedCandidateIDs, models.AgentRunCompleted)
+	runFinalized = true
+	if in.RunFinished != nil {
+		in.RunFinished(agentRun)
+	}
 	result := &models.TranscriptResult{
 		Segments:                  finalSegments,
 		Metadata:                  metadata,
@@ -252,6 +294,7 @@ func (w *Workflow) Transcribe(ctx context.Context, in TranscribeInput) (*models.
 		JudgeSelectedCandidateIDs: dedupePreservingOrder(selectedCandidateIDs),
 		JudgeNotes:                judgeNotes,
 		JudgeToolUsage:            judgeToolUsage,
+		AgentRun:                  agentRun,
 	}
 
 	if in.Progress != nil {
@@ -296,6 +339,8 @@ type judgedUnit struct {
 	judgeNotes           []string
 	judgeToolUsage       []models.JudgeToolUsage
 	containsGapMarker    bool
+	decisionMethod       string
+	rejudgeCount         int
 }
 
 type judgeChunkResult struct {
@@ -447,6 +492,91 @@ func (w *Workflow) runJudgePipeline(
 	if err != nil {
 		return nil, models.TranscriptQuality{}, false, nil, nil, nil, nil, nil, false, err
 	}
+	recorder := recorderFromContext(ctx)
+	spanRuns, err := buildSpanRuns(unitResults, units)
+	if err != nil {
+		return nil, models.TranscriptQuality{}, false, nil, nil, nil, nil, nil, false, err
+	}
+	if metadata.NeedsChunking && deps.AgenticMode && deps.AgentGlobalReview {
+		var review *models.GlobalReviewDecision
+		var reviewErr error
+		if recorder == nil || recorder.consumeGlobalReview() {
+			review, reviewErr = agents.NewGlobalReviewAgent(w.Deps, w.Client).Run(ctx, spanRuns)
+		} else {
+			review = &models.GlobalReviewDecision{Verdict: "review_required", Reasons: []string{"Global-review budget exhausted."}, Method: "fallback_budget_exhausted"}
+		}
+		if reviewErr != nil {
+			return nil, models.TranscriptQuality{}, false, nil, nil, nil, nil, nil, false, reviewErr
+		}
+		if recorder != nil {
+			recorder.setGlobalReview(review)
+			recorder.recordStep("global_review_router", models.AgentStepCompleted, review.Verdict, strings.Join(review.Reasons, " "), review.RejudgeSpanIDs, nil)
+		}
+		judgeToolUsage = mergeJudgeToolUsage(judgeToolUsage, review.ToolUsage)
+		if review.Verdict == "rejudge" {
+			unresolved := make([]string, 0)
+			for _, spanID := range review.RejudgeSpanIDs {
+				index := spanIndex(spanID, len(unitResults))
+				if index < 0 {
+					unresolved = append(unresolved, spanID+" is not a known span")
+					continue
+				}
+				if recorder != nil && !recorder.consumeRejudge() {
+					reason := "Global reviewer requested " + spanID + " but the rejudge budget was exhausted."
+					judgeNotes = append(judgeNotes, reason)
+					unresolved = append(unresolved, reason)
+					continue
+				}
+				valid := validCandidatesForSpan(unitResults[index].result.candidates, units[index])
+				if len(valid) == 0 {
+					reason := spanID + " has no valid candidates for the requested rejudge."
+					judgeNotes = append(judgeNotes, reason)
+					unresolved = append(unresolved, reason)
+					continue
+				}
+				decision, rejudgeErr := agents.NewJudgeAgent(w.Deps, w.Client).WithSkills(w.activeSkills(deps)).Run(ctx, agents.JudgeInput{
+					Candidates: valid, ContextPrompt: customPrompt, SpeakerNames: speakerNames,
+					ChunkLabel: unitResults[index].chunkLabel + " final bounded rejudge",
+				})
+				if rejudgeErr != nil {
+					if errors.Is(rejudgeErr, context.Canceled) || errors.Is(rejudgeErr, context.DeadlineExceeded) {
+						return nil, models.TranscriptQuality{}, false, nil, nil, nil, nil, nil, false, rejudgeErr
+					}
+					reason := spanID + " rejudge failed: " + rejudgeErr.Error()
+					judgeNotes = append(judgeNotes, reason)
+					unresolved = append(unresolved, reason)
+					continue
+				}
+				if err := validateSegmentsForChunk(decision.Segments, units[index]); err != nil {
+					reason := spanID + " rejudge rejected: " + err.Error()
+					judgeNotes = append(judgeNotes, reason)
+					unresolved = append(unresolved, reason)
+					continue
+				}
+				unitResults[index].result.finalSegments = decision.Segments
+				unitResults[index].result.selectedCandidateIDs = decision.SelectedCandidateIDs
+				unitResults[index].result.judgeNotes = append(unitResults[index].result.judgeNotes, "Global review rejudge: "+strings.Join(decision.ProcessingNotes, " "))
+				unitResults[index].result.judgeToolUsage = mergeJudgeToolUsage(unitResults[index].result.judgeToolUsage, decision.ToolUsage)
+				unitResults[index].result.decisionMethod = decision.DecisionMethod
+				unitResults[index].result.rejudgeCount = 1
+			}
+			if len(unresolved) > 0 {
+				review.Verdict = "review_required"
+				review.Method = "model_with_unresolved_rejudge"
+				review.Reasons = dedupePreservingOrder(append(review.Reasons, unresolved...))
+				if recorder != nil {
+					recorder.setGlobalReview(review)
+				}
+			}
+			spanRuns, err = buildSpanRuns(unitResults, units)
+			if err != nil {
+				return nil, models.TranscriptQuality{}, false, nil, nil, nil, nil, nil, false, err
+			}
+		}
+	}
+	if recorder != nil {
+		recorder.setSpanRuns(spanRuns)
+	}
 
 	judgedChunks := make([][]models.TranscriptSegment, 0, len(unitResults))
 	candidateBuckets := make(map[string]*candidateBucket)
@@ -507,8 +637,16 @@ func (w *Workflow) runJudgePipeline(
 	if len(speakerNames) > 0 && len(finalSegments) > 0 {
 		finalSegments = agents.MapSpeakersToContext(finalSegments, speakerNames)
 	}
+	if recorder != nil {
+		// Freeze source evidence before timestamp alignment or output cleanup can
+		// change the final representation.
+		recorder.setProvenance(finalSegments, spanRuns)
+	}
 
-	finalSegments, timestampsCorrected, timestampNotes := w.reviewTimestamps(ctx, audioPath, metadata, finalSegments)
+	finalSegments, timestampsCorrected, timestampNotes, err := w.reviewTimestamps(ctx, audioPath, metadata, finalSegments)
+	if err != nil {
+		return nil, models.TranscriptQuality{}, false, nil, nil, nil, nil, nil, false, err
+	}
 	judgeNotes = append(judgeNotes, timestampNotes...)
 
 	finalSegments, cleanupApplied = w.applyOutputCleanup(deps, finalSegments)
@@ -536,7 +674,7 @@ func (w *Workflow) runJudgedUnits(
 	if len(units) == 0 {
 		return nil, nil
 	}
-	if !metadata.NeedsChunking || deps.ChunkConcurrency <= 1 || len(units) == 1 {
+	if !metadata.NeedsChunking || deps.AgenticMode || deps.PreserveContext || deps.ChunkConcurrency <= 1 || len(units) == 1 {
 		results := make([]judgeChunkResult, 0, len(units))
 		previousContext := ""
 		for index, unit := range units {
@@ -572,6 +710,167 @@ func (w *Workflow) runJudgedUnits(
 			}
 		},
 	)
+}
+
+func buildSpanRuns(results []judgeChunkResult, units []audio.Chunk) ([]models.SpanRun, error) {
+	if len(results) != len(units) {
+		return nil, fmt.Errorf("build span runs: %d judge results for %d audio spans", len(results), len(units))
+	}
+	spans := make([]models.SpanRun, 0, len(results))
+	for index, item := range results {
+		unit := units[index]
+		spanID := fmt.Sprintf("span_%04d", index)
+		attempts := make([]models.CandidateAttempt, 0, len(item.result.candidates))
+		for _, candidate := range item.result.candidates {
+			status := "completed"
+			if len(candidate.Segments) == 0 {
+				status = "failed"
+			}
+			attempts = append(attempts, models.CandidateAttempt{
+				AttemptID:   spanID + ":" + candidate.CandidateID + ":1",
+				CandidateID: candidate.CandidateID,
+				Attempt:     1, Kind: candidate.Kind, ModelName: candidate.ModelName,
+				Status: status, Segments: append([]models.TranscriptSegment(nil), candidate.Segments...),
+				Notes: append([]string(nil), candidate.Notes...),
+			})
+		}
+		evaluation := evaluateSpanCandidates(item.result.candidates, unit)
+		finalState := "judged"
+		if item.result.containsGapMarker {
+			finalState = "degraded"
+		}
+		state := "planned"
+		transitions := make([]models.StateTransition, 0, 4)
+		appendTransition := func(to, reason string) error {
+			from := state
+			next, err := reduceSpanState(state, spanStateEvent{To: to, Reason: reason})
+			if err != nil {
+				return err
+			}
+			state = next
+			transitions = append(transitions, models.StateTransition{From: from, To: to, Reason: reason, CreatedAt: time.Now().UTC()})
+			return nil
+		}
+		if err := appendTransition("primary_complete", "primary candidate attempt finished"); err != nil {
+			return nil, fmt.Errorf("build %s: %w", spanID, err)
+		}
+		if len(attempts) > 1 {
+			if err := appendTransition("evidence_complete", strings.Join(evaluation.Reasons, " ")); err != nil {
+				return nil, fmt.Errorf("build %s: %w", spanID, err)
+			}
+		}
+		if err := appendTransition(finalState, item.result.decisionMethod); err != nil {
+			return nil, fmt.Errorf("build %s: %w", spanID, err)
+		}
+		if item.result.rejudgeCount > 0 && state == "judged" {
+			if err := appendTransition("rejudged", "global review requested one bounded rejudge"); err != nil {
+				return nil, fmt.Errorf("build %s: %w", spanID, err)
+			}
+		}
+		spans = append(spans, models.SpanRun{
+			SpanID: spanID, Index: index,
+			StartSeconds: float64(unit.StartMS) / 1000, EndSeconds: float64(unit.EndMS) / 1000,
+			State: state, Attempts: attempts, Evaluation: evaluation,
+			Judge: models.JudgeExecution{
+				Method:               item.result.decisionMethod,
+				SelectedCandidateIDs: append([]string(nil), item.result.selectedCandidateIDs...),
+				Notes:                append([]string(nil), item.result.judgeNotes...), RejudgeCount: item.result.rejudgeCount,
+			},
+			Segments:    append([]models.TranscriptSegment(nil), item.result.finalSegments...),
+			Transitions: transitions,
+		})
+	}
+	return spans, nil
+}
+
+func evaluateSpanCandidates(candidates []models.TranscriptCandidate, unit audio.Chunk) models.SpanEvaluation {
+	evaluation := models.SpanEvaluation{TimestampScore: 100}
+	valid := validCandidatesForSpan(candidates, unit)
+	if len(valid) == 0 {
+		evaluation.Severity = 1
+		evaluation.NeedsEvidence = true
+		evaluation.Reasons = []string{"No valid candidate completed for this span."}
+		return evaluation
+	}
+	if valid[0].QualityScore != nil {
+		evaluation.QualityScore = *valid[0].QualityScore
+	}
+	relative := relativeSegments(valid[0].Segments, float64(unit.StartMS)/1000)
+	timestamps := agents.AnalyzeTimestampQuality(relative, float64(unit.DurationMS)/1000)
+	evaluation.TimestampScore = timestamps.AlignmentScore
+	if evaluation.QualityScore < 78 {
+		evaluation.Reasons = append(evaluation.Reasons, "Primary quality score is below the evidence threshold.")
+	}
+	if timestamps.Recommendation != "skip" {
+		evaluation.Reasons = append(evaluation.Reasons, timestamps.Reason)
+	}
+	if len(valid) > 1 {
+		evaluation.Disagreement = 1 - wordSimilarity(candidateFullText(valid[0]), candidateFullText(valid[1]))
+		if evaluation.Disagreement > 0.18 {
+			evaluation.Reasons = append(evaluation.Reasons, "Independent candidates materially disagree.")
+		}
+	}
+	qualitySeverity := max(0.0, (78-evaluation.QualityScore)/78)
+	timestampSeverity := max(0.0, float64(85-evaluation.TimestampScore)/85)
+	evaluation.Severity = max(qualitySeverity, timestampSeverity, evaluation.Disagreement)
+	evaluation.NeedsEvidence = evaluation.Severity > 0
+	evaluation.Reasons = dedupePreservingOrder(evaluation.Reasons)
+	return evaluation
+}
+
+func spanIndex(spanID string, count int) int {
+	for index := 0; index < count; index++ {
+		if spanID == fmt.Sprintf("span_%04d", index) {
+			return index
+		}
+	}
+	return -1
+}
+
+func validCandidatesForSpan(candidates []models.TranscriptCandidate, unit audio.Chunk) []models.TranscriptCandidate {
+	valid := make([]models.TranscriptCandidate, 0, len(candidates))
+	for _, candidate := range candidates {
+		if len(candidate.Segments) == 0 {
+			continue
+		}
+		if err := validateSegmentsForChunk(candidate.Segments, unit); err == nil {
+			valid = append(valid, candidate)
+		}
+	}
+	return valid
+}
+
+func bestValidCandidate(candidates []models.TranscriptCandidate) models.TranscriptCandidate {
+	best := candidates[0]
+	for _, candidate := range candidates[1:] {
+		if candidate.QualityScore == nil {
+			continue
+		}
+		if best.QualityScore == nil || *candidate.QualityScore > *best.QualityScore {
+			best = candidate
+		}
+	}
+	return best
+}
+
+func validateSegmentsForChunk(segments []models.TranscriptSegment, unit audio.Chunk) error {
+	start := float64(unit.StartMS) / 1000
+	end := float64(unit.EndMS)/1000 + 5
+	previous := -1.0
+	for index, segment := range segments {
+		if err := segment.Validate(); err != nil {
+			return fmt.Errorf("segment %d: %w", index, err)
+		}
+		seconds, _ := segment.TimestampSeconds()
+		if seconds < start || seconds > end {
+			return fmt.Errorf("segment %d timestamp %.0fs is outside span %.0f-%.0fs", index, seconds, start, end)
+		}
+		if seconds < previous {
+			return fmt.Errorf("segment %d timestamp is not monotonic", index)
+		}
+		previous = seconds
+	}
+	return nil
 }
 
 func (w *Workflow) runJudgedUnit(
@@ -617,13 +916,17 @@ func (w *Workflow) runUnitWithJudge(
 	chunkLabel string,
 	audioDuration float64,
 ) (judgedUnit, error) {
-	candidates := w.generateCandidates(ctx, deps, audioPath, chunkInfo, customPrompt, previousContext, speakerNames, audioDuration)
-	valid := make([]models.TranscriptCandidate, 0, len(candidates))
-	for _, c := range candidates {
-		if len(c.Segments) > 0 {
-			valid = append(valid, c)
-		}
+	candidates, err := w.generateCandidates(ctx, deps, audioPath, chunkInfo, customPrompt, previousContext, speakerNames, audioDuration)
+	if err != nil {
+		return judgedUnit{}, err
 	}
+	unit := audio.Chunk{StartMS: 0, EndMS: int(audioDuration * 1000), DurationMS: int(audioDuration * 1000)}
+	if chunkInfo != nil {
+		unit.StartMS = chunkInfo.StartMS
+		unit.EndMS = chunkInfo.EndMS
+		unit.DurationMS = chunkInfo.DurationMS
+	}
+	valid := validCandidatesForSpan(candidates, unit)
 	if len(valid) == 0 {
 		notes := []string{}
 		for _, c := range candidates {
@@ -636,9 +939,22 @@ func (w *Workflow) runUnitWithJudge(
 			candidates:        candidates,
 			judgeNotes:        notes,
 			containsGapMarker: true,
+			decisionMethod:    "degraded_no_valid_candidate",
 		}, nil
 	}
 
+	recorder := recorderFromContext(ctx)
+	if recorder != nil && !recorder.consumeJudge() {
+		fallback := bestValidCandidate(valid)
+		recorder.recordStep("judge", models.AgentStepSkipped, "use_primary", "judge-call budget exhausted", []string{fallback.CandidateID}, nil)
+		return judgedUnit{
+			finalSegments:        fallback.Segments,
+			candidates:           candidates,
+			selectedCandidateIDs: []string{fallback.CandidateID},
+			judgeNotes:           []string{"Judge skipped because the agent judge-call budget was exhausted."},
+			decisionMethod:       "fallback_budget_exhausted",
+		}, nil
+	}
 	judgeAgent := agents.NewJudgeAgent(w.Deps, w.Client).WithSkills(w.activeSkills(deps))
 	decision, err := judgeAgent.Run(ctx, agents.JudgeInput{
 		Candidates:    valid,
@@ -649,20 +965,37 @@ func (w *Workflow) runUnitWithJudge(
 	if err != nil {
 		return judgedUnit{}, err
 	}
-	judgeNotes := append([]string{}, decision.ProcessingNotes...)
-	if len(decision.SelectedCandidateIDs) > 0 {
-		judgeNotes = append(judgeNotes, "Judge selected: "+strings.Join(decision.SelectedCandidateIDs, ", "))
-	}
 	final := decision.Segments
+	selectedCandidateIDs := append([]string(nil), decision.SelectedCandidateIDs...)
+	processingNotes := append([]string(nil), decision.ProcessingNotes...)
+	decisionMethod := decision.DecisionMethod
 	if len(final) == 0 {
-		final = valid[0].Segments
+		fallback := bestValidCandidate(valid)
+		final = fallback.Segments
+		selectedCandidateIDs = []string{fallback.CandidateID}
+		processingNotes = append(processingNotes, "Judge returned no segments; used the best valid candidate.")
+		decisionMethod = "fallback_empty_judge_output"
+	} else if err := validateSegmentsForChunk(final, unit); err != nil {
+		fallback := bestValidCandidate(valid)
+		final = fallback.Segments
+		selectedCandidateIDs = []string{fallback.CandidateID}
+		processingNotes = append(processingNotes, "Judge output rejected by span validation: "+err.Error()+"; used "+fallback.CandidateID+".")
+		decisionMethod = "fallback_out_of_span_judge_output"
+	}
+	if recorder != nil {
+		recorder.recordStep("judge", models.AgentStepCompleted, "adjudicate_candidates", strings.Join(processingNotes, " "), selectedCandidateIDs, nil)
+	}
+	judgeNotes := append([]string{}, processingNotes...)
+	if len(selectedCandidateIDs) > 0 {
+		judgeNotes = append(judgeNotes, "Judge selected: "+strings.Join(selectedCandidateIDs, ", "))
 	}
 	return judgedUnit{
 		finalSegments:        final,
 		candidates:           candidates,
-		selectedCandidateIDs: append([]string{}, decision.SelectedCandidateIDs...),
+		selectedCandidateIDs: selectedCandidateIDs,
 		judgeNotes:           judgeNotes,
 		judgeToolUsage:       append([]models.JudgeToolUsage(nil), decision.ToolUsage...),
+		decisionMethod:       decisionMethod,
 	}, nil
 }
 
@@ -674,12 +1007,29 @@ func (w *Workflow) generateCandidates(
 	customPrompt, previousContext string,
 	speakerNames []string,
 	audioDuration float64,
-) []models.TranscriptCandidate {
-	specs := deps.ResolveCandidateSpecs()
-	if reg := w.activeSkills(deps); reg != nil {
-		if plan, ok := reg.StrategyPlan(deps.CandidateStrategy, deps.ModelName, deps.ParakeetModel); ok {
-			specs = deps.ResolveCandidateSpecsWith(plan)
-		}
+) ([]models.TranscriptCandidate, error) {
+	specs := resolveCandidateSpecs(deps, w.activeSkills(deps))
+	if len(specs) == 0 {
+		return nil, nil
+	}
+	if err := validateCandidateSpecs(specs); err != nil {
+		return nil, err
+	}
+	sharedFile, err := w.uploadSharedCandidateAudio(ctx, specs, audioPath)
+	if err != nil {
+		return nil, err
+	}
+	if sharedFile != nil {
+		defer func() {
+			cleanupCtx, cancel := obs.DetachWithTimeout(ctx, 10*time.Second)
+			defer cancel()
+			if err := w.Client.DeleteFile(cleanupCtx, sharedFile.Name); err != nil {
+				obs.LoggerFrom(ctx).Warn("failed to delete shared candidate upload", "file", sharedFile.Name, "error", err)
+			}
+		}()
+	}
+	if deps.AgenticMode {
+		return w.generateAdaptiveCandidates(ctx, deps, specs, audioPath, sharedFile, chunkInfo, customPrompt, previousContext, speakerNames, audioDuration)
 	}
 	candidates := make([]models.TranscriptCandidate, len(specs))
 	var wg sync.WaitGroup
@@ -687,11 +1037,182 @@ func (w *Workflow) generateCandidates(
 		wg.Add(1)
 		go func(i int, spec config.CandidateSpec) {
 			defer wg.Done()
-			candidates[i] = w.runCandidateSpec(ctx, deps, spec, audioPath, chunkInfo, customPrompt, previousContext, speakerNames, audioDuration)
+			candidates[i] = w.runCandidateSpec(ctx, deps, spec, audioPath, sharedFile, chunkInfo, customPrompt, previousContext, speakerNames, audioDuration)
 		}(i, spec)
 	}
 	wg.Wait()
-	return candidates
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return candidates, nil
+}
+
+func validateCandidateSpecs(specs []config.CandidateSpec) error {
+	seen := make(map[string]struct{}, len(specs))
+	for index, spec := range specs {
+		if strings.TrimSpace(spec.CandidateID) == "" {
+			return fmt.Errorf("candidate spec %d has no candidate id", index)
+		}
+		if _, ok := seen[spec.CandidateID]; ok {
+			return fmt.Errorf("duplicate candidate id %q", spec.CandidateID)
+		}
+		seen[spec.CandidateID] = struct{}{}
+		switch spec.Kind {
+		case "gemini":
+			if strings.TrimSpace(spec.ModelName) == "" {
+				return fmt.Errorf("gemini candidate %q has no model", spec.CandidateID)
+			}
+		case "parakeet":
+		default:
+			return fmt.Errorf("candidate %q has unknown kind %q", spec.CandidateID, spec.Kind)
+		}
+	}
+	return nil
+}
+
+func (w *Workflow) uploadSharedCandidateAudio(ctx context.Context, specs []config.CandidateSpec, audioPath string) (*gemini.FileInfo, error) {
+	for _, spec := range specs {
+		if spec.Kind == "gemini" {
+			file, err := w.Client.UploadFile(ctx, audioPath)
+			if err != nil {
+				return nil, fmt.Errorf("upload shared candidate audio: %w", err)
+			}
+			return file, nil
+		}
+	}
+	return nil, nil
+}
+
+func resolveCandidateSpecs(deps *config.TranscriptionDeps, reg *skills.Registry) []config.CandidateSpec {
+	specs := deps.ResolveCandidateSpecs()
+	if reg != nil {
+		if plan, ok := reg.StrategyPlan(deps.CandidateStrategy, deps.ModelName, deps.ParakeetModel); ok {
+			specs = deps.ResolveCandidateSpecsWith(plan)
+		}
+	}
+	return specs
+}
+
+func (w *Workflow) generateAdaptiveCandidates(
+	ctx context.Context,
+	deps *config.TranscriptionDeps,
+	specs []config.CandidateSpec,
+	audioPath string,
+	sharedFile *gemini.FileInfo,
+	chunkInfo *agents.ChunkInfo,
+	customPrompt, previousContext string,
+	speakerNames []string,
+	audioDuration float64,
+) ([]models.TranscriptCandidate, error) {
+	recorder := recorderFromContext(ctx)
+	run := func(spec config.CandidateSpec, kind string) (models.TranscriptCandidate, bool) {
+		if recorder != nil && !recorder.consumeCandidate() {
+			recorder.recordStep(kind, models.AgentStepSkipped, "budget_exhausted", "candidate-run budget exhausted", []string{spec.CandidateID}, nil)
+			return models.TranscriptCandidate{}, false
+		}
+		candidate := w.runCandidateSpec(ctx, deps, spec, audioPath, sharedFile, chunkInfo, customPrompt, previousContext, speakerNames, audioDuration)
+		status := models.AgentStepCompleted
+		if len(candidate.Segments) == 0 {
+			status = models.AgentStepFailed
+		}
+		if recorder != nil {
+			metadata := map[string]any{"model": spec.ModelName, "segment_count": len(candidate.Segments)}
+			if candidate.QualityScore != nil {
+				metadata["quality_score"] = *candidate.QualityScore
+			}
+			recorder.recordStep(kind, status, "generate_candidate", strings.Join(candidate.Notes, " "), []string{spec.CandidateID}, metadata)
+		}
+		return candidate, true
+	}
+
+	primary, ok := run(specs[0], "candidate")
+	if !ok {
+		return nil, errors.New("agent candidate-run budget exhausted before primary transcription")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	candidates := []models.TranscriptCandidate{primary}
+	spanStart := 0.0
+	if chunkInfo != nil {
+		spanStart = float64(chunkInfo.StartMS) / 1000
+	}
+	reason := candidateEscalationReason(primary, deps.AgentEscalationScore, audioDuration, spanStart)
+	if len(specs) == 1 || reason == "" {
+		decision := "accept_primary"
+		if len(specs) > 1 && reason == "" {
+			decision = "accept_single_source"
+		}
+		if recorder != nil {
+			recorder.plannerStep(decision, "primary evidence passed deterministic acceptance gates", []string{primary.CandidateID}, nil)
+		}
+		return candidates, nil
+	}
+	if recorder != nil {
+		if !recorder.plannerStep("gather_independent_candidate", reason, []string{primary.CandidateID, specs[1].CandidateID}, nil) {
+			recorder.recordStep("candidate_escalation", models.AgentStepSkipped, "budget_exhausted", "planner-turn budget exhausted", []string{specs[1].CandidateID}, nil)
+			return candidates, nil
+		}
+	}
+	for _, spec := range specs[1:] {
+		if recorder != nil && !recorder.consumeSpanEscalation() {
+			recorder.recordStep("candidate_escalation", models.AgentStepSkipped, "budget_exhausted", "span-escalation budget exhausted", []string{spec.CandidateID}, nil)
+			break
+		}
+		candidate, ran := run(spec, "candidate_escalation")
+		if !ran {
+			break
+		}
+		candidates = append(candidates, candidate)
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if len(candidates) >= 2 && !candidatesDisagree(candidates) {
+			break
+		}
+	}
+
+	if candidatesDisagree(candidates) && deps.AgentMaxCandidateRuns > len(specs) {
+		escalation := config.CandidateSpec{
+			CandidateID: strings.ReplaceAll(deps.JudgeModelName, "-", "_") + "_evidence",
+			Label:       config.FormatGeminiModelLabel(deps.JudgeModelName) + " Evidence",
+			Kind:        "gemini",
+			ModelName:   deps.JudgeModelName,
+		}
+		if !candidateIDExists(candidates, escalation.CandidateID) {
+			if recorder != nil {
+				if !recorder.plannerStep("escalate_disagreement", "independent candidates materially disagree", candidateIDs(candidates), nil) {
+					recorder.recordStep("evidence_escalation", models.AgentStepSkipped, "budget_exhausted", "planner-turn budget exhausted", []string{escalation.CandidateID}, nil)
+					return candidates, nil
+				}
+			}
+			if recorder != nil && !recorder.consumeSpanEscalation() {
+				recorder.recordStep("evidence_escalation", models.AgentStepSkipped, "budget_exhausted", "span-escalation budget exhausted", []string{escalation.CandidateID}, nil)
+				return candidates, ctx.Err()
+			}
+			if candidate, ran := run(escalation, "evidence_escalation"); ran {
+				candidates = append(candidates, candidate)
+			}
+		}
+	}
+	return candidates, ctx.Err()
+}
+
+func candidateIDExists(candidates []models.TranscriptCandidate, id string) bool {
+	for _, candidate := range candidates {
+		if candidate.CandidateID == id {
+			return true
+		}
+	}
+	return false
+}
+
+func candidateIDs(candidates []models.TranscriptCandidate) []string {
+	ids := make([]string, 0, len(candidates))
+	for _, candidate := range candidates {
+		ids = append(ids, candidate.CandidateID)
+	}
+	return ids
 }
 
 func (w *Workflow) runCandidateSpec(
@@ -699,11 +1220,15 @@ func (w *Workflow) runCandidateSpec(
 	deps *config.TranscriptionDeps,
 	spec config.CandidateSpec,
 	audioPath string,
+	sharedFile *gemini.FileInfo,
 	chunkInfo *agents.ChunkInfo,
 	customPrompt, previousContext string,
 	speakerNames []string,
 	audioDuration float64,
 ) models.TranscriptCandidate {
+	if err := ctx.Err(); err != nil {
+		return models.TranscriptCandidate{CandidateID: spec.CandidateID, Label: spec.Label, Kind: models.CandidateKind(spec.Kind), ModelName: spec.ModelName, Notes: []string{err.Error()}}
+	}
 	notes := []string{}
 	var segments []models.TranscriptSegment
 
@@ -712,11 +1237,13 @@ func (w *Workflow) runCandidateSpec(
 		candidateDeps := deps.WithModel(spec.ModelName)
 		agent := agents.NewTranscriptionAgent(candidateDeps, w.Client)
 		segs, err := agent.Run(ctx, agents.TranscribeInput{
-			AudioPath:       audioPath,
-			CustomPrompt:    customPrompt,
-			ChunkInfo:       chunkInfo,
-			PreviousContext: previousContext,
-			SpeakerNames:    speakerNames,
+			AudioPath:            audioPath,
+			CustomPrompt:         customPrompt,
+			ChunkInfo:            chunkInfo,
+			PreviousContext:      previousContext,
+			SpeakerNames:         speakerNames,
+			UploadedFile:         sharedFile,
+			AudioDurationSeconds: audioDuration,
 		})
 		if err != nil {
 			notes = append(notes, fmt.Sprintf("%s failed: %v", spec.Label, err))
@@ -746,7 +1273,11 @@ func (w *Workflow) runCandidateSpec(
 
 	var qualityScore *float64
 	if len(segments) > 0 {
-		q := agents.BuildQuality(w.Deps.Quality, segments, audioDuration, nil)
+		qualitySegments := segments
+		if chunkInfo != nil && chunkInfo.StartMS > 0 {
+			qualitySegments = relativeSegments(segments, float64(chunkInfo.StartMS)/1000)
+		}
+		q := agents.BuildQuality(w.Deps.Quality, qualitySegments, audioDuration, nil)
 		score := q.OverallScore
 		qualityScore = &score
 	}
@@ -760,6 +1291,18 @@ func (w *Workflow) runCandidateSpec(
 		QualityScore: qualityScore,
 		Notes:        notes,
 	}
+}
+
+func relativeSegments(segments []models.TranscriptSegment, offset float64) []models.TranscriptSegment {
+	out := make([]models.TranscriptSegment, len(segments))
+	for i, segment := range segments {
+		out[i] = segment
+		seconds, err := segment.TimestampSeconds()
+		if err == nil {
+			out[i].Timestamp = models.FormatTimestamp(seconds - offset)
+		}
+	}
+	return out
 }
 
 func (w *Workflow) mergeCandidateBuckets(
@@ -797,30 +1340,55 @@ func (w *Workflow) reviewTimestamps(
 	audioPath string,
 	metadata models.AudioMetadata,
 	segs []models.TranscriptSegment,
-) ([]models.TranscriptSegment, bool, []string) {
+) ([]models.TranscriptSegment, bool, []string, error) {
 	if len(segs) == 0 {
-		return segs, false, nil
+		return segs, false, nil, nil
 	}
 	analysis := agents.AnalyzeTimestampQuality(segs, metadata.Duration)
 	notes := []string{"Timestamp review: " + analysis.Reason}
 	if analysis.Recommendation != "fix" {
-		return segs, false, notes
+		return segs, false, notes, nil
 	}
 	if w.Parakeet == nil {
 		notes = append(notes, "Skipped Parakeet alignment because no sidecar is configured.")
-		return segs, false, notes
+		return segs, false, notes, nil
 	}
 	corrected, err := w.Parakeet.Align(ctx, audioPath, segs)
 	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return segs, false, notes, ctxErr
+		}
 		notes = append(notes, fmt.Sprintf("Parakeet alignment failed: %v", err))
-		return segs, false, notes
+		return segs, false, notes, nil
+	}
+	if err := validateSegmentsForAudio(corrected, metadata.Duration); err != nil {
+		notes = append(notes, "Rejected invalid Parakeet alignment: "+err.Error())
+		return segs, false, notes, nil
 	}
 	if segmentsEqual(segs, corrected) {
 		notes = append(notes, "Parakeet alignment ran but did not change timestamps.")
-		return segs, false, notes
+		return segs, false, notes, nil
 	}
 	notes = append(notes, "Applied Parakeet alignment after judging.")
-	return corrected, true, notes
+	return corrected, true, notes, nil
+}
+
+func validateSegmentsForAudio(segs []models.TranscriptSegment, duration float64) error {
+	previous := -1.0
+	for i, segment := range segs {
+		if err := segment.Validate(); err != nil {
+			return fmt.Errorf("segment %d: %w", i, err)
+		}
+		seconds, _ := segment.TimestampSeconds()
+		if seconds < previous {
+			return fmt.Errorf("segment %d timestamp is not monotonic", i)
+		}
+		if duration > 0 && seconds > duration+5 {
+			return fmt.Errorf("segment %d timestamp %.0fs exceeds audio duration %.0fs", i, seconds, duration)
+		}
+		previous = seconds
+	}
+	return nil
 }
 
 func (w *Workflow) applyOutputCleanup(deps *config.TranscriptionDeps, segs []models.TranscriptSegment) ([]models.TranscriptSegment, bool) {
@@ -871,9 +1439,10 @@ func (w *Workflow) runDirectPipeline(
 		}
 		agent := agents.NewTranscriptionAgent(deps, w.Client)
 		segs, err := agent.Run(ctx, agents.TranscribeInput{
-			AudioPath:    audioPath,
-			CustomPrompt: customPrompt,
-			SpeakerNames: speakerNames,
+			AudioPath:            audioPath,
+			CustomPrompt:         customPrompt,
+			SpeakerNames:         speakerNames,
+			AudioDurationSeconds: metadata.Duration,
 		})
 		if err != nil {
 			return nil, nil, err
@@ -899,11 +1468,12 @@ func (w *Workflow) runDirectPipeline(
 		}
 		agent := agents.NewTranscriptionAgent(deps, w.Client)
 		segs, err := agent.Run(ctx, agents.TranscribeInput{
-			AudioPath:       chunk.Path,
-			CustomPrompt:    customPrompt,
-			ChunkInfo:       &agents.ChunkInfo{Index: chunk.Index, StartMS: chunk.StartMS, EndMS: chunk.EndMS, DurationMS: chunk.DurationMS},
-			PreviousContext: previous,
-			SpeakerNames:    speakerNames,
+			AudioPath:            chunk.Path,
+			CustomPrompt:         customPrompt,
+			ChunkInfo:            &agents.ChunkInfo{Index: chunk.Index, StartMS: chunk.StartMS, EndMS: chunk.EndMS, DurationMS: chunk.DurationMS},
+			PreviousContext:      previous,
+			SpeakerNames:         speakerNames,
+			AudioDurationSeconds: float64(chunk.DurationMS) / 1000,
 		})
 		if err != nil {
 			return nil, nil, err
@@ -1085,6 +1655,54 @@ func writeUpload(dir, filename string, data []byte) (string, error) {
 		return "", fmt.Errorf("write upload: %w", err)
 	}
 	return out, nil
+}
+
+// stageInputPath gives durable file-path inputs the original extension used
+// for MIME detection. The server intentionally persists bytes as audio.bin;
+// this private run-scoped alias avoids duplicating the file in the common case.
+func stageInputPath(dir, sourcePath, filename string) (string, error) {
+	desiredExt := strings.ToLower(filepath.Ext(filename))
+	if desiredExt == "" || strings.EqualFold(filepath.Ext(sourcePath), desiredExt) {
+		return sourcePath, nil
+	}
+	destination := filepath.Join(dir, "input"+desiredExt)
+	if err := os.Link(sourcePath, destination); err == nil {
+		return destination, nil
+	}
+	absoluteSource, err := filepath.Abs(sourcePath)
+	if err == nil {
+		if err := os.Symlink(absoluteSource, destination); err == nil {
+			return destination, nil
+		}
+	}
+
+	source, err := os.Open(sourcePath)
+	if err != nil {
+		return "", fmt.Errorf("open file-path input: %w", err)
+	}
+	defer source.Close()
+	target, err := os.OpenFile(destination, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		return "", fmt.Errorf("stage file-path input: %w", err)
+	}
+	committed := false
+	defer func() {
+		_ = target.Close()
+		if !committed {
+			_ = os.Remove(destination)
+		}
+	}()
+	if _, err := io.Copy(target, source); err != nil {
+		return "", fmt.Errorf("copy file-path input: %w", err)
+	}
+	if err := target.Sync(); err != nil {
+		return "", fmt.Errorf("sync file-path input: %w", err)
+	}
+	if err := target.Close(); err != nil {
+		return "", fmt.Errorf("close file-path input: %w", err)
+	}
+	committed = true
+	return destination, nil
 }
 
 var sanitizeRE = regexp.MustCompile(`[^a-zA-Z0-9._-]`)

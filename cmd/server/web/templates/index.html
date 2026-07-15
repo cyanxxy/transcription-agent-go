@@ -14,13 +14,13 @@
         <p class="eyebrow">ExactTranscriber</p>
         <h1>Transcription Studio</h1>
         <p class="subtitle">
-          Candidate fan-out, judge fan-in, and timestamp-aware review for long-form audio.
+          Adaptive evidence, bounded judging, and reviewable provenance for long-form audio.
         </p>
       </div>
       <div class="hero-status" aria-label="Pipeline defaults">
-        <span><b></b>Judge pipeline</span>
-        <span>Dual Gemini default</span>
-        <span>SSE progress stream</span>
+        <span><b></b>Agent runtime</span>
+        <span>Durable jobs</span>
+        <span>Reviewable evidence</span>
       </div>
     </header>
 
@@ -39,13 +39,17 @@
 
         <fieldset class="grid">
           <legend>Pipeline controls</legend>
+          <label class="full">
+            <span>Server access token</span>
+            <input id="auth-token" type="password" autocomplete="current-password" placeholder="Optional when server bearer auth is enabled" />
+          </label>
           <label>
             <span>Primary model</span>
             <select name="model_name">
+              <option value="gemini-3.5-flash" selected>Gemini 3.5 Flash</option>
               <option value="gemini-3-flash-preview">Gemini 3 Flash</option>
               <option value="gemini-3.1-flash-lite">Gemini 3.1 Flash-Lite</option>
-              <option value="gemini-3.1-pro-preview" selected>Gemini 3.1 Pro</option>
-              <option value="gemini-3.5-flash">Gemini 3.5 Flash</option>
+              <option value="gemini-3.1-pro-preview">Gemini 3.1 Pro</option>
             </select>
           </label>
           <label>
@@ -107,6 +111,10 @@
             <span>Enable judge pipeline</span>
           </label>
           <label class="toggle">
+            <input type="checkbox" name="agentic_mode" checked />
+            <span>Adaptive agent mode</span>
+          </label>
+          <label class="toggle">
             <input type="checkbox" name="auto_format" checked />
             <span>Auto-format transcript</span>
           </label>
@@ -134,6 +142,27 @@
             <span>Custom instructions</span>
             <textarea name="custom_instructions" rows="2"></textarea>
           </label>
+          <label>
+            <span>Language hints</span>
+            <input name="language_hints" type="text" placeholder="e.g. Dutch and English" />
+          </label>
+          <label>
+            <span>Expected format</span>
+            <select name="expected_format">
+              <option value="">Transcript</option>
+              <option value="meeting">Meeting</option>
+              <option value="interview">Interview</option>
+              <option value="lecture">Lecture</option>
+              <option value="podcast">Podcast</option>
+              <option value="legal">Legal</option>
+              <option value="medical">Medical</option>
+              <option value="technical">Technical</option>
+            </select>
+          </label>
+          <label class="full">
+            <span>Keywords (comma-separated)</span>
+            <input name="keywords" type="text" placeholder="names or phrases that need verification" />
+          </label>
         </fieldset>
 
         <button type="submit" class="primary" id="submit-btn">
@@ -151,8 +180,17 @@
       <div class="progress" role="progressbar" aria-labelledby="progress-label" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
         <div class="progress-bar" id="progress-bar"></div>
       </div>
-      <p class="progress-label" id="progress-label" aria-live="polite">Initializing...</p>
+      <div class="run-status-row">
+        <div>
+          <p class="progress-label" id="progress-label" aria-live="polite">Initializing...</p>
+          <p class="job-reference" id="job-reference" hidden></p>
+        </div>
+        <span class="status-badge" id="connection-state" data-state="pending">Preparing</span>
+      </div>
       <pre class="log" id="log" aria-live="polite"></pre>
+      <div class="actions">
+        <button type="button" class="ghost" id="cancel-job" hidden>Cancel job</button>
+      </div>
     </section>
 
     <section class="glass-panel" id="result-card" hidden>
@@ -167,12 +205,32 @@
         <button data-tab="json" class="tab" id="tab-button-json" role="tab" aria-selected="false" aria-controls="tab-json">JSON</button>
         <button data-tab="judge" class="tab" id="tab-button-judge" role="tab" aria-selected="false" aria-controls="tab-judge">Judge notes</button>
         <button data-tab="quality" class="tab" id="tab-button-quality" role="tab" aria-selected="false" aria-controls="tab-quality">Quality</button>
+        <button data-tab="evidence" class="tab" id="tab-button-evidence" role="tab" aria-selected="false" aria-controls="tab-evidence">Evidence</button>
       </div>
       <pre class="output" id="tab-formatted" role="tabpanel" aria-labelledby="tab-button-formatted"></pre>
       <pre class="output" id="tab-srt" role="tabpanel" aria-labelledby="tab-button-srt" hidden></pre>
       <pre class="output" id="tab-json" role="tabpanel" aria-labelledby="tab-button-json" hidden></pre>
       <pre class="output" id="tab-judge" role="tabpanel" aria-labelledby="tab-button-judge" hidden></pre>
       <pre class="output" id="tab-quality" role="tabpanel" aria-labelledby="tab-button-quality" hidden></pre>
+      <pre class="output" id="tab-evidence" role="tabpanel" aria-labelledby="tab-button-evidence" hidden></pre>
+      <section class="review-panel" id="review-panel" aria-labelledby="review-title" hidden>
+        <div class="review-header">
+          <div>
+            <p class="eyebrow">Decision required</p>
+            <h3 id="review-title">Human review</h3>
+          </div>
+          <p class="review-deadline" id="review-deadline" hidden></p>
+        </div>
+        <p class="review-reasons" id="review-reasons"></p>
+        <label class="review-note" for="review-note">
+          <span>Review note (optional)</span>
+          <textarea id="review-note" rows="2" maxlength="2000" placeholder="Record what you checked or why the transcript is rejected."></textarea>
+        </label>
+        <div class="actions" id="review-actions">
+          <button type="button" class="primary" id="accept-review">Accept transcript</button>
+          <button type="button" class="ghost" id="reject-review">Reject transcript</button>
+        </div>
+      </section>
       <div class="actions">
         <button class="ghost" id="download-txt">Download .txt</button>
         <button class="ghost" id="download-srt">Download .srt</button>

@@ -68,13 +68,14 @@ func toolAllowed(allowed []string, name string) bool {
 	return false
 }
 
-func judgeTranscriptTools(allowed []string) []gemini.Tool {
+func judgeTranscriptTools(allowed []string) []gemini.InteractionTool {
 	candidateIDParam := map[string]any{
 		"type":        "string",
 		"description": "Candidate ID from the judge prompt.",
 	}
-	all := []gemini.FunctionDeclaration{
+	all := []gemini.InteractionTool{
 		{
+			Type:        "function",
 			Name:        "quality_metrics",
 			Description: "Return readability, punctuation, vocabulary, speaker consistency, timestamp coverage, and warning metrics for one transcript candidate.",
 			Parameters: map[string]any{
@@ -84,6 +85,7 @@ func judgeTranscriptTools(allowed []string) []gemini.Tool {
 			},
 		},
 		{
+			Type:        "function",
 			Name:        "timestamp_analysis",
 			Description: "Analyze whether one transcript candidate has trustworthy timestamps, monotonic ordering, and reasonable coverage.",
 			Parameters: map[string]any{
@@ -93,6 +95,7 @@ func judgeTranscriptTools(allowed []string) []gemini.Tool {
 			},
 		},
 		{
+			Type:        "function",
 			Name:        "candidate_diff",
 			Description: "Compare two transcript candidates using transcript-side text, speaker, and timestamp differences.",
 			Parameters: map[string]any{
@@ -105,6 +108,7 @@ func judgeTranscriptTools(allowed []string) []gemini.Tool {
 			},
 		},
 		{
+			Type:        "function",
 			Name:        "boundary_analysis",
 			Description: "Find adjacent duplicate lines, non-monotonic timestamps, large timestamp gaps, and speaker-label churn in one candidate.",
 			Parameters: map[string]any{
@@ -115,15 +119,15 @@ func judgeTranscriptTools(allowed []string) []gemini.Tool {
 		},
 	}
 	if len(allowed) == 0 {
-		return []gemini.Tool{{FunctionDeclarations: all}}
+		return all
 	}
-	filtered := make([]gemini.FunctionDeclaration, 0, len(all))
+	filtered := make([]gemini.InteractionTool, 0, len(all))
 	for _, d := range all {
 		if toolAllowed(allowed, d.Name) {
 			filtered = append(filtered, d)
 		}
 	}
-	return []gemini.Tool{{FunctionDeclarations: filtered}}
+	return filtered
 }
 
 func buildJudgeToolExecutors(qualityDeps config.QualityDeps, candidates []models.TranscriptCandidate, allowed []string) map[string]gemini.ToolExecutor {
