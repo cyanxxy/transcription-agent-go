@@ -123,7 +123,7 @@ func (s *server) executeJob(workerID int, jb *job) {
 			if canceled, cancelErr := finalizeCanceledJob(jb, false, "job canceled during shutdown"); canceled || cancelErr != nil {
 				return
 			}
-			requeued, requeueErr := jb.transitionFrom(jobRunning, jobQueued, "")
+			requeued, requeueErr := jb.transitionFrom(jobRunning, jobQueued)
 			if requeueErr != nil {
 				obs.LoggerFrom(jobCtx).Error("persist interrupted job for restart", "error", requeueErr)
 			}
@@ -198,7 +198,7 @@ func (s *server) transcribePersistedJob(ctx context.Context, jb *job, progress w
 	if err != nil {
 		return nil, err
 	}
-	defer wfl.Deps.Cleanup()
+	defer func() { _ = wfl.Deps.Cleanup() }()
 	if strings.TrimSpace(s.parakeet) != "" {
 		if sidecar, sidecarErr := agents.ParakeetFromDeps(wfl.Deps.Transcription, s.parakeet); sidecarErr == nil {
 			wfl.WithParakeet(sidecar)

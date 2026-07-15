@@ -136,7 +136,7 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	defer wfl.Deps.Cleanup()
+	defer func() { _ = wfl.Deps.Cleanup() }()
 	info, err := os.Stat(*input)
 	if err != nil {
 		return fmt.Errorf("stat audio: %w", err)

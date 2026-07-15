@@ -310,7 +310,7 @@ func (c *Client) CreateInteraction(ctx context.Context, req *InteractionRequest)
 	}
 	var interaction Interaction
 	if err := json.Unmarshal(responseBody, &interaction); err != nil {
-		return nil, fmt.Errorf("decode interaction response: %w (body=%s)", err, snippetScrubbed(responseBody, 512, c.apiKey))
+		return nil, fmt.Errorf("decode interaction response: %w (body=%s)", err, snippetScrubbed(responseBody, c.apiKey))
 	}
 	totalTokens := 0
 	if interaction.Usage != nil {
@@ -450,7 +450,7 @@ func validateInteractionStatus(interaction *Interaction) error {
 		if len(interaction.FunctionCalls()) > 0 {
 			return errors.New("completed interaction unexpectedly returned function calls")
 		}
-	case "failed", "cancelled", "incomplete", "budget_exceeded":
+	case "failed", "cancelled", "incomplete", "budget_exceeded": //nolint:misspell // Gemini may return the British spelling.
 		return fmt.Errorf("interaction ended with status %s", interaction.Status)
 	case "in_progress":
 		return errors.New("synchronous interaction unexpectedly remained in_progress")

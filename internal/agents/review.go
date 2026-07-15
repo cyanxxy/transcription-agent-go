@@ -110,6 +110,7 @@ func (a *GlobalReviewAgent) Run(ctx context.Context, spans []models.SpanRun) (*m
 		Reasons        []string `json:"reasons"`
 	}
 	if err := json.Unmarshal([]byte(strings.TrimSpace(stripCodeFences(interaction.Text()))), &output); err != nil {
+		//nolint:nilerr // Invalid model output deliberately requires human review.
 		return &models.GlobalReviewDecision{
 			Verdict: "review_required", Reasons: []string{"Global review output was invalid."},
 			Method: "fallback_unparseable_output", ToolUsage: tracker.usage(),
@@ -120,6 +121,7 @@ func (a *GlobalReviewAgent) Run(ctx context.Context, spans []models.SpanRun) (*m
 		Reasons: output.Reasons, Method: "model", ToolUsage: tracker.usage(),
 	}
 	if err := validateGlobalReviewDecision(decision, byID); err != nil {
+		//nolint:nilerr // Invalid model decisions deliberately require human review.
 		return &models.GlobalReviewDecision{
 			Verdict: "review_required", Reasons: []string{err.Error()},
 			Method: "fallback_invalid_decision", ToolUsage: tracker.usage(),

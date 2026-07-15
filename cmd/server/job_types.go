@@ -146,13 +146,13 @@ func (j *job) transition(status jobStatus, reviewNote string) error {
 	return err
 }
 
-func (j *job) transitionFrom(expected, status jobStatus, reviewNote string) (bool, error) {
+func (j *job) transitionFrom(expected, status jobStatus) (bool, error) {
 	j.mu.Lock()
 	if j.status != expected {
 		j.mu.Unlock()
 		return false, nil
 	}
-	listeners, err := j.transitionLocked(status, reviewNote, time.Now().UTC())
+	listeners, err := j.transitionLocked(status, "", time.Now().UTC())
 	j.mu.Unlock()
 	closeJobListeners(listeners)
 	return err == nil, err

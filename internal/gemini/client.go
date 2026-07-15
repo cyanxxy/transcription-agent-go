@@ -248,7 +248,7 @@ func (c *Client) finishResumableUpload(ctx context.Context, uploadURL, path stri
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("finalize upload returned %d: %s", resp.StatusCode, snippetScrubbed(body, 512, c.apiKey))
+		return nil, fmt.Errorf("finalize upload returned %d: %s", resp.StatusCode, snippetScrubbed(body, c.apiKey))
 	}
 	var out fileUploadResponse
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
@@ -623,7 +623,7 @@ func (c *Client) GenerateContent(ctx context.Context, model string, req *Generat
 	}
 	var out GenerateResponse
 	if err := json.Unmarshal(body, &out); err != nil {
-		return nil, fmt.Errorf("decode response: %w (body=%s)", err, snippetScrubbed(body, 512, c.apiKey))
+		return nil, fmt.Errorf("decode response: %w (body=%s)", err, snippetScrubbed(body, c.apiKey))
 	}
 	if err := observeModelCall(ctx, ModelCallObservation{Phase: "after_response", Operation: operation, Usage: out.UsageMetadata}); err != nil {
 		return nil, err
@@ -717,7 +717,7 @@ func (c *Client) doWithRetry(ctx context.Context, op string, build func() (*http
 		apiErr := &APIError{
 			StatusCode: resp.StatusCode,
 			Operation:  op,
-			Body:       snippetScrubbed(body, 512, c.apiKey),
+			Body:       snippetScrubbed(body, c.apiKey),
 			RetryAfter: parseRetryAfter(resp.Header.Get("Retry-After")),
 		}
 		lastErr = apiErr
@@ -813,10 +813,11 @@ func parseRetryAfter(v string) time.Duration {
 	return 0
 }
 
-func snippetScrubbed(b []byte, n int, apiKey string) string {
+func snippetScrubbed(b []byte, apiKey string) string {
+	const maxSnippetBytes = 512
 	s := string(b)
-	if len(s) > n {
-		s = s[:n] + "..."
+	if len(s) > maxSnippetBytes {
+		s = s[:maxSnippetBytes] + "..."
 	}
 	return scrubString(s, apiKey)
 }

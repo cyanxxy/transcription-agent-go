@@ -40,7 +40,7 @@ restarts do not erase queued work.
 - [Configuration](#configuration)
 - [CLI](#cli)
 - [Agent Skills](#agent-skills)
-- [Production hardening](#production-hardening)
+- [Production safeguards](#production-safeguards)
 - [Docker](#docker)
 - [Deployment checklist](#deployment-checklist)
 - [Testing](#testing)
@@ -252,9 +252,11 @@ directory the pipeline uses its built-in guidance, strategy resolution, and full
 judge-tool set. Authoring a skill is a `SKILL.md` edit (read at startup, no
 recompile), and `GET /skills` lists what's loaded.
 
-## Production hardening
+## Production safeguards
 
-Built to deploy as-is. What it ships with:
+The service includes the following application-level safeguards. Production
+readiness still depends on completing the deployment checklist for the target
+environment.
 
 - **Structured JSON logs** (`log/slog`) that redact any attribute whose key
   looks like an API key or authorization header. Honors `LOG_LEVEL` and

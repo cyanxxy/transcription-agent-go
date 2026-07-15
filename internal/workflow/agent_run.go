@@ -514,7 +514,6 @@ func buildRunEvidence(final []models.TranscriptSegment, candidates []models.Tran
 		status := "adjudicated"
 		if disputed {
 			notes = append(notes, "Candidate wording differs around this timestamp.")
-			status = "adjudicated"
 			if !intersectsSelected(sources, selectedSet) {
 				status = "review_required"
 				reviewReasons = append(reviewReasons, fmt.Sprintf("Segment %d remains disputed.", index))

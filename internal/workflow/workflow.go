@@ -1363,7 +1363,7 @@ func (w *Workflow) reviewTimestamps(
 	}
 	if err := validateSegmentsForAudio(corrected, metadata.Duration); err != nil {
 		notes = append(notes, "Rejected invalid Parakeet alignment: "+err.Error())
-		return segs, false, notes, nil
+		return segs, false, notes, nil //nolint:nilerr // Invalid optional alignment is rejected without failing transcription.
 	}
 	if segmentsEqual(segs, corrected) {
 		notes = append(notes, "Parakeet alignment ran but did not change timestamps.")

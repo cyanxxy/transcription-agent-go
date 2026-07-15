@@ -297,10 +297,10 @@ func TestJobTransitionMatrixRejectsUnsafeLifecycleChanges(t *testing.T) {
 	if err := jb.transition(jobSucceeded, ""); err == nil {
 		t.Fatal("queued job transitioned directly to succeeded")
 	}
-	if changed, err := jb.transitionFrom(jobQueued, jobRunning, ""); err != nil || !changed {
+	if changed, err := jb.transitionFrom(jobQueued, jobRunning); err != nil || !changed {
 		t.Fatalf("queued -> running failed: changed=%v err=%v", changed, err)
 	}
-	if changed, err := jb.transitionFrom(jobRunning, jobCancelRequested, ""); err != nil || !changed {
+	if changed, err := jb.transitionFrom(jobRunning, jobCancelRequested); err != nil || !changed {
 		t.Fatalf("running -> cancel_requested failed: changed=%v err=%v", changed, err)
 	}
 	if err := jb.transition(jobSucceeded, ""); err == nil {
@@ -386,13 +386,13 @@ func TestLateCancelCannotBeOverwrittenBySuccess(t *testing.T) {
 
 func TestShutdownDoesNotRequeueAcceptedCancel(t *testing.T) {
 	jb := &job{id: "shutdown-cancel", status: jobRunning}
-	if changed, err := jb.transitionFrom(jobRunning, jobCancelRequested, ""); err != nil || !changed {
+	if changed, err := jb.transitionFrom(jobRunning, jobCancelRequested); err != nil || !changed {
 		t.Fatalf("request cancel: changed=%v err=%v", changed, err)
 	}
 	if canceled, err := finalizeCanceledJob(jb, false, "job canceled during shutdown"); err != nil || !canceled {
 		t.Fatalf("finalize cancel: canceled=%v err=%v", canceled, err)
 	}
-	if requeued, err := jb.transitionFrom(jobRunning, jobQueued, ""); err != nil || requeued {
+	if requeued, err := jb.transitionFrom(jobRunning, jobQueued); err != nil || requeued {
 		t.Fatalf("canceled job was requeued: changed=%v err=%v", requeued, err)
 	}
 }
