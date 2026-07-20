@@ -13,6 +13,8 @@ import (
 
 var sentenceEndRE = regexp.MustCompile(`[.!?]+`)
 
+const maxKnownIncompleteScore = 59.0
+
 // QualityMetrics is the rich return shape used by CalculateQualityMetrics.
 type QualityMetrics struct {
 	Readability        float64
@@ -101,11 +103,12 @@ func CalculateQualityMetrics(deps config.QualityDeps, segs []models.TranscriptSe
 // CalculateOverallScore computes the weighted score used in the UI.
 func CalculateOverallScore(deps config.QualityDeps, metrics QualityMetrics) float64 {
 	mapping := map[string]float64{
-		"readability":      metrics.Readability,
-		"vocabulary":       metrics.VocabularyRichness,
-		"sentence_variety": metrics.SentenceVariety,
-		"punctuation":      math.Max(0, 100-metrics.PunctuationDensity*100),
-		"consistency":      metrics.SpeakerConsistency,
+		"readability":        metrics.Readability,
+		"vocabulary":         metrics.VocabularyRichness,
+		"sentence_variety":   metrics.SentenceVariety,
+		"punctuation":        math.Max(0, 100-metrics.PunctuationDensity*100),
+		"consistency":        metrics.SpeakerConsistency,
+		"timestamp_coverage": metrics.TimestampCoverage,
 	}
 	var score, totalWeight float64
 	for key, value := range mapping {
@@ -134,6 +137,15 @@ func BuildQuality(deps config.QualityDeps, segs []models.TranscriptSegment, audi
 	score := CalculateOverallScore(deps, metrics)
 	warnings := append([]string(nil), metrics.Warnings...)
 	warnings = append(warnings, extraWarnings...)
+	issues := []map[string]interface{}{}
+	if gapCount := knownTranscriptGapCount(segs); gapCount > 0 {
+		message := fmt.Sprintf("Transcript contains %d explicitly untranscribed span(s)", gapCount)
+		warnings = append(warnings, message+".")
+		issues = append(issues, map[string]interface{}{
+			"type": "error", "code": "incomplete_transcript", "message": message,
+		})
+		score = math.Min(score, maxKnownIncompleteScore)
+	}
 	return models.TranscriptQuality{
 		OverallScore:       score,
 		Readability:        metrics.Readability,
@@ -142,9 +154,21 @@ func BuildQuality(deps config.QualityDeps, segs []models.TranscriptSegment, audi
 		VocabularyRichness: metrics.VocabularyRichness,
 		TimestampCoverage:  metrics.TimestampCoverage,
 		SpeakerConsistency: metrics.SpeakerConsistency,
-		Issues:             []map[string]interface{}{},
+		Issues:             issues,
 		Warnings:           warnings,
 	}
+}
+
+func knownTranscriptGapCount(segs []models.TranscriptSegment) int {
+	count := 0
+	for _, seg := range segs {
+		speaker := strings.TrimSpace(strings.ToLower(seg.Speaker))
+		text := strings.TrimSpace(strings.ToLower(seg.Text))
+		if speaker == "untranscribed" || strings.HasPrefix(text, "[no transcript produced for ") {
+			count++
+		}
+	}
+	return count
 }
 
 func calculateTimestampCoverage(segs []models.TranscriptSegment, audioDuration float64) float64 {
@@ -168,8 +192,30 @@ func calculateTimestampCoverage(segs []models.TranscriptSegment, audioDuration f
 		return 100
 	}
 	last := parsed[len(parsed)-1]
-	coverage := clamp(last/audioDuration*100, 0, 100)
+	// Segment timestamps mark starts, not ends. Estimate the final segment's
+	// duration from the typical positive interval so a complete transcript is
+	// not penalized solely because its last segment starts before the audio ends.
+	estimatedEnd := last + medianPositiveInterval(parsed)
+	coverage := clamp(estimatedEnd/audioDuration*100, 0, 100)
 	return math.Min(coverage, validRatio)
+}
+
+func medianPositiveInterval(timestamps []float64) float64 {
+	intervals := make([]float64, 0, len(timestamps)-1)
+	for i := 1; i < len(timestamps); i++ {
+		if delta := timestamps[i] - timestamps[i-1]; delta > 0 {
+			intervals = append(intervals, delta)
+		}
+	}
+	if len(intervals) == 0 {
+		return 0
+	}
+	sort.Float64s(intervals)
+	mid := len(intervals) / 2
+	if len(intervals)%2 == 1 {
+		return intervals[mid]
+	}
+	return (intervals[mid-1] + intervals[mid]) / 2
 }
 
 func calculateSpeakerConsistency(segs []models.TranscriptSegment) float64 {

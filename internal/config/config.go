@@ -13,13 +13,11 @@ import (
 var SupportedGeminiModels = map[string]struct{}{
 	"gemini-3-flash-preview": {},
 	"gemini-3.1-flash-lite":  {},
-	"gemini-3.1-pro-preview": {},
 	"gemini-3.5-flash":       {},
 }
 
 // GeminiModelAliases redirects deprecated model names to their current ones.
 var GeminiModelAliases = map[string]string{
-	"gemini-3-pro-preview":          "gemini-3.1-pro-preview",
 	"gemini-3.1-flash-lite-preview": "gemini-3.1-flash-lite",
 }
 
@@ -27,7 +25,6 @@ var GeminiModelAliases = map[string]string{
 var GeminiModelLabels = map[string]string{
 	"gemini-3-flash-preview": "Gemini 3 Flash",
 	"gemini-3.1-flash-lite":  "Gemini 3.1 Flash-Lite",
-	"gemini-3.1-pro-preview": "Gemini 3.1 Pro",
 	"gemini-3.5-flash":       "Gemini 3.5 Flash",
 }
 
@@ -35,13 +32,7 @@ var GeminiModelLabels = map[string]string{
 var GeminiModelThinkingLevels = map[string]map[string]struct{}{
 	"gemini-3-flash-preview": {"minimal": {}, "low": {}, "medium": {}, "high": {}},
 	"gemini-3.1-flash-lite":  {"minimal": {}, "low": {}, "medium": {}, "high": {}},
-	"gemini-3.1-pro-preview": {"low": {}, "medium": {}, "high": {}},
 	"gemini-3.5-flash":       {"minimal": {}, "low": {}, "medium": {}, "high": {}},
-}
-
-// LegacyProThinkingLevels coerces legacy values to currently allowed ones.
-var LegacyProThinkingLevels = map[string]string{
-	"minimal": "low",
 }
 
 // SupportedCandidateStrategies is the allow-list of candidate plans.
@@ -90,8 +81,6 @@ func ResolveDualGeminiSecondaryModel(primary string) string {
 	case "gemini-3-flash-preview":
 		return "gemini-3.1-flash-lite"
 	case "gemini-3.1-flash-lite":
-		return "gemini-3.5-flash"
-	case "gemini-3.1-pro-preview":
 		return "gemini-3.5-flash"
 	case "gemini-3.5-flash":
 		return "gemini-3.1-flash-lite"
@@ -148,7 +137,7 @@ func NewTranscriptionDeps(apiKey string, opts ...TranscriptionOption) (*Transcri
 	d := &TranscriptionDeps{
 		APIKey:                     apiKey,
 		ModelName:                  "gemini-3.5-flash",
-		JudgeModelName:             "gemini-3.1-pro-preview",
+		JudgeModelName:             "gemini-3.5-flash",
 		CandidateStrategy:          "dual_gemini",
 		MaxFileSizeMB:              200,
 		ChunkDurationMS:            120000,
@@ -275,11 +264,6 @@ func sortedKeys[V any](m map[string]V) string {
 }
 
 func validateThinkingLevel(field, model, level string) (string, error) {
-	if model == "gemini-3.1-pro-preview" {
-		if normalized, ok := LegacyProThinkingLevels[level]; ok {
-			level = normalized
-		}
-	}
 	allowed, ok := GeminiModelThinkingLevels[model]
 	if !ok {
 		return "", fmt.Errorf("unsupported model for %s: %s", field, model)
@@ -502,11 +486,12 @@ func DefaultQualityDeps() QualityDeps {
 		DetectConsistency:     true,
 		DetectFormatting:      true,
 		Weights: map[string]float64{
-			"readability":      0.3,
-			"vocabulary":       0.2,
-			"sentence_variety": 0.2,
-			"punctuation":      0.15,
-			"consistency":      0.15,
+			"readability":        0.25,
+			"vocabulary":         0.15,
+			"sentence_variety":   0.15,
+			"punctuation":        0.10,
+			"consistency":        0.10,
+			"timestamp_coverage": 0.25,
 		},
 	}
 }

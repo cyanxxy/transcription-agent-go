@@ -12,14 +12,14 @@ import (
 	"time"
 )
 
-func TestCreateInteractionUsesRevisionAndParsesTypedSteps(t *testing.T) {
+func TestCreateInteractionUsesStableAPIAndParsesTypedSteps(t *testing.T) {
 	store := false
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost || r.URL.Path != "/v1beta/interactions" {
+		if r.Method != http.MethodPost || r.URL.Path != "/v1/interactions" {
 			t.Errorf("request = %s %s", r.Method, r.URL.Path)
 		}
-		if got := r.Header.Get("Api-Revision"); got != interactionsAPIRevision {
-			t.Errorf("Api-Revision = %q, want %q", got, interactionsAPIRevision)
+		if got := r.Header.Get("Api-Revision"); got != "" {
+			t.Errorf("stable Interactions request sent obsolete Api-Revision %q", got)
 		}
 		if got := r.Header.Get("X-Goog-Api-Key"); got != "test-key" {
 			t.Errorf("API key header = %q", got)
@@ -28,14 +28,18 @@ func TestCreateInteractionUsesRevisionAndParsesTypedSteps(t *testing.T) {
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			t.Fatal(err)
 		}
-		if body["store"] != false || body["service_tier"] != "flex" {
+		if body["store"] != false {
 			t.Errorf("unexpected request body: %#v", body)
+		}
+		if _, exists := body["service_tier"]; exists {
+			t.Errorf("stable standard request should omit service_tier: %#v", body)
 		}
 		responseFormat := body["response_format"].(map[string]any)
 		if responseFormat["mime_type"] != "application/json" {
 			t.Errorf("response format = %#v", responseFormat)
 		}
 		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("X-Gemini-Service-Tier", "standard")
 		json.NewEncoder(w).Encode(map[string]any{
 			"id":     "interaction_1",
 			"model":  "gemini-3.5-flash",
@@ -54,7 +58,7 @@ func TestCreateInteractionUsesRevisionAndParsesTypedSteps(t *testing.T) {
 		Model:       "gemini-3.5-flash",
 		Input:       "judge",
 		Store:       &store,
-		ServiceTier: "flex",
+		ServiceTier: "standard",
 		ResponseFormat: &InteractionResponseFormat{
 			Type:     "text",
 			MIMEType: "application/json",
@@ -69,6 +73,63 @@ func TestCreateInteractionUsesRevisionAndParsesTypedSteps(t *testing.T) {
 	}
 	if interaction.Usage == nil || interaction.Usage.TotalTokens != 14 {
 		t.Fatalf("usage not parsed: %#v", interaction.Usage)
+	}
+	if interaction.ServiceTier != "standard" {
+		t.Fatalf("response service tier = %q, want standard", interaction.ServiceTier)
+	}
+}
+
+func TestCreateInteractionRoutesPreviewInferenceTiersToBeta(t *testing.T) {
+	for _, tier := range []string{"flex", "priority"} {
+		t.Run(tier, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != "/v1beta/interactions" {
+					t.Errorf("%s request path = %q, want preview tier endpoint", tier, r.URL.Path)
+				}
+				var body map[string]any
+				if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+					t.Fatal(err)
+				}
+				if body["service_tier"] != tier {
+					t.Errorf("service_tier = %#v, want %q", body["service_tier"], tier)
+				}
+				_ = json.NewEncoder(w).Encode(map[string]any{"id": "tiered", "status": "completed"})
+			}))
+			defer srv.Close()
+			_, err := NewClient("key").WithEndpoint(srv.URL).CreateInteraction(context.Background(), &InteractionRequest{
+				Model: "gemini-3.5-flash", Input: "x", ServiceTier: tier,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestCreateInteractionRoutesPreviewModelsToBeta(t *testing.T) {
+	for _, model := range []string{"gemini-3-flash-preview", "models/gemini-3-flash-preview"} {
+		t.Run(model, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != "/v1beta/interactions" {
+					t.Errorf("preview model request path = %q, want /v1beta/interactions", r.URL.Path)
+				}
+				var body map[string]any
+				if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+					t.Fatal(err)
+				}
+				if _, exists := body["service_tier"]; exists {
+					t.Errorf("standard service tier should be omitted: %#v", body)
+				}
+				_ = json.NewEncoder(w).Encode(map[string]any{"id": "preview", "status": "completed"})
+			}))
+			defer srv.Close()
+			_, err := NewClient("key").WithEndpoint(srv.URL).CreateInteraction(context.Background(), &InteractionRequest{
+				Model: model, Input: "x", ServiceTier: "standard",
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+		})
 	}
 }
 
@@ -93,12 +154,28 @@ func TestCreateInteractionRetriesTransientResponse(t *testing.T) {
 	}))
 	defer srv.Close()
 
+	var logicalRequests, wireAttempts, failedAttempts, responses int
+	failedAttemptMayHaveConsumed := true
+	ctx := WithInteractionObserver(context.Background(), func(observation InteractionObservation) error {
+		switch observation.Phase {
+		case "before_request":
+			logicalRequests++
+		case "before_attempt":
+			wireAttempts++
+		case "attempt_failed":
+			failedAttempts++
+			failedAttemptMayHaveConsumed = observation.FailureMayHaveConsumedTokens
+		case "after_response":
+			responses++
+		}
+		return nil
+	})
 	client := NewClient("key").WithEndpoint(srv.URL).WithRetry(RetryConfig{
 		MaxAttempts: 2,
 		BaseDelay:   time.Nanosecond,
 		MaxDelay:    time.Nanosecond,
 	})
-	interaction, err := client.CreateInteraction(context.Background(), &InteractionRequest{
+	interaction, err := client.CreateInteraction(ctx, &InteractionRequest{
 		Model: "gemini-3.5-flash", Input: "hello",
 	})
 	if err != nil {
@@ -106,6 +183,73 @@ func TestCreateInteractionRetriesTransientResponse(t *testing.T) {
 	}
 	if attempts.Load() != 2 || interaction.ID != "retried" {
 		t.Fatalf("attempts=%d interaction=%#v", attempts.Load(), interaction)
+	}
+	if logicalRequests != 1 || wireAttempts != 2 || failedAttempts != 1 || responses != 1 {
+		t.Fatalf("observer logical=%d attempts=%d failed=%d responses=%d", logicalRequests, wireAttempts, failedAttempts, responses)
+	}
+	if failedAttemptMayHaveConsumed {
+		t.Fatal("503 capacity failure was treated as token-consuming")
+	}
+}
+
+func TestCreateInteractionReservesEntireRequestEnvelope(t *testing.T) {
+	store := false
+	req := &InteractionRequest{
+		Model: "gemini-3.5-flash", Input: "x", Store: &store,
+		SystemInstruction:    strings.Repeat("system", 20),
+		Tools:                []InteractionTool{{Type: "function", Name: "inspect", Parameters: map[string]any{"type": "object"}}},
+		GenerationConfig:     &InteractionGenerationConfig{MaxOutputTokens: 123},
+		ResponseFormat:       &InteractionResponseFormat{Type: "text", MIMEType: "application/json", Schema: map[string]any{"type": "object"}},
+		EstimatedInputTokens: 77,
+	}
+	body, err := json.Marshal(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantReservation := len(body) + 123 + 77
+	reserved := 0
+	ctx := WithInteractionObserver(context.Background(), func(observation InteractionObservation) error {
+		if observation.Phase == "before_request" {
+			reserved = observation.ReservedTokens
+		}
+		return nil
+	})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": "one", "status": "completed"})
+	}))
+	defer srv.Close()
+	if _, err := NewClient("key").WithEndpoint(srv.URL).CreateInteraction(ctx, req); err != nil {
+		t.Fatal(err)
+	}
+	if reserved != wantReservation {
+		t.Fatalf("reserved tokens = %d, want full request envelope %d", reserved, wantReservation)
+	}
+}
+
+func TestCreateInteractionMarksMalformedSuccessAsPossiblyConsumed(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":`))
+	}))
+	defer srv.Close()
+
+	failed := false
+	mayHaveConsumed := false
+	ctx := WithInteractionObserver(context.Background(), func(observation InteractionObservation) error {
+		if observation.Phase == "request_failed" {
+			failed = true
+			mayHaveConsumed = observation.FailureMayHaveConsumedTokens
+		}
+		return nil
+	})
+	_, err := NewClient("key").WithEndpoint(srv.URL).CreateInteraction(ctx, &InteractionRequest{
+		Model: "gemini-3.5-flash", Input: "hello",
+	})
+	if err == nil {
+		t.Fatal("malformed successful response was accepted")
+	}
+	if !failed || !mayHaveConsumed {
+		t.Fatalf("malformed 2xx accounting failed=%v mayHaveConsumed=%v", failed, mayHaveConsumed)
 	}
 }
 

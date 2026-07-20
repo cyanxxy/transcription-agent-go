@@ -55,7 +55,7 @@ var transcriptResponseSchema = map[string]any{
 				"properties": map[string]any{
 					"timestamp": map[string]any{
 						"type":        "string",
-						"description": "Timestamp formatted as [HH:MM:SS]",
+						"description": "Timestamp in canonical [HH:MM:SS] form",
 					},
 					"speaker": map[string]any{
 						"type":        "string",
@@ -68,6 +68,8 @@ var transcriptResponseSchema = map[string]any{
 					"confidence": map[string]any{
 						"type":        "number",
 						"description": "Optional float between 0 and 1 indicating model confidence",
+						"minimum":     0,
+						"maximum":     1,
 					},
 				},
 				"required": []string{"timestamp", "speaker", "text"},
@@ -145,10 +147,7 @@ func (a *TranscriptionAgent) Run(ctx context.Context, in TranscribeInput) ([]mod
 	}
 
 	prompt := BuildTranscriptionPrompt(in.CustomPrompt, in.PreviousContext, in.ChunkInfo, in.SpeakerNames)
-	mimeType := file.MIMEType
-	if mimeType == "" {
-		mimeType = guessMIMEFromPath(in.AudioPath)
-	}
+	mimeType := interactionAudioMIME(in.AudioPath, file.MIMEType)
 	store := false
 	req := &gemini.InteractionRequest{
 		Model: a.Deps.ModelName,
@@ -249,6 +248,11 @@ func validateAndCleanSegments(in []models.TranscriptSegment) ([]models.Transcrip
 		seg.Timestamp = models.NormalizeTimestamp(strings.TrimSpace(seg.Timestamp))
 		seg.Speaker = strings.TrimSpace(seg.Speaker)
 		seg.Text = strings.TrimSpace(seg.Text)
+		// Confidence is optional metadata. An out-of-contract estimate should
+		// not discard an otherwise valid transcript segment.
+		if seg.Confidence != nil && (*seg.Confidence < 0 || *seg.Confidence > 1) {
+			seg.Confidence = nil
+		}
 		if err := seg.Validate(); err != nil {
 			return nil, fmt.Errorf("segment %d: %w", i, err)
 		}
@@ -286,13 +290,26 @@ func guessMIMEFromPath(path string) string {
 	case ".wav":
 		return "audio/wav"
 	case ".m4a":
-		return "audio/mp4"
+		return "audio/m4a"
 	case ".ogg":
 		return "audio/ogg"
 	case ".flac":
 		return "audio/flac"
 	}
 	return "audio/wav"
+}
+
+func interactionAudioMIME(path, uploadedMIME string) string {
+	// Some upload services classify an M4A container as generic MP4. The
+	// Interactions API has a distinct audio/m4a content type, so prefer the
+	// known source extension for this otherwise ambiguous case.
+	if strings.EqualFold(filepath.Ext(path), ".m4a") {
+		return "audio/m4a"
+	}
+	if mimeType := strings.TrimSpace(uploadedMIME); mimeType != "" {
+		return mimeType
+	}
+	return guessMIMEFromPath(path)
 }
 
 // MergeChunks merges per-chunk transcripts dropping duplicated overlap segments.

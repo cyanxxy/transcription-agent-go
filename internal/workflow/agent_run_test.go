@@ -1,7 +1,13 @@
 package workflow
 
 import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/cyanxxy/transcription-agent-go/internal/config"
 	"github.com/cyanxxy/transcription-agent-go/internal/gemini"
@@ -96,11 +102,135 @@ func TestInteractionTokenReservationsAreAtomicAndReconciled(t *testing.T) {
 	}
 	if err := recorder.observeInteraction(gemini.InteractionObservation{
 		Phase: "request_failed", RequestID: "three", ReservedTokens: 50,
+		FailureMayHaveConsumedTokens: true,
 	}); err != nil {
 		t.Fatal(err)
 	}
 	if recorder.run.Budget.TotalTokensUsed != 70 {
 		t.Fatalf("failed request did not charge its reservation: %#v", recorder.run.Budget)
+	}
+}
+
+func TestKnownUnconsumedInteractionFailureReleasesReservation(t *testing.T) {
+	recorder := &runRecorder{run: models.AgentRun{Budget: models.AgentBudget{
+		MaxInteractionRequests: 1, MaxTotalTokens: 100,
+	}}}
+	if err := recorder.observeInteraction(gemini.InteractionObservation{
+		Phase: "before_request", RequestID: "one", ReservedTokens: 60,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := recorder.observeInteraction(gemini.InteractionObservation{
+		Phase: "request_failed", RequestID: "one", ReservedTokens: 60,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if recorder.tokensReserved != 0 || recorder.run.Budget.TotalTokensUsed != 0 {
+		t.Fatalf("known unconsumed failure was charged: reserved=%d budget=%#v", recorder.tokensReserved, recorder.run.Budget)
+	}
+}
+
+func TestAmbiguousFailedAttemptIsChargedWithoutConsumingLogicalRequest(t *testing.T) {
+	recorder := &runRecorder{run: models.AgentRun{Budget: models.AgentBudget{
+		MaxInteractionRequests: 1, MaxTotalTokens: 150,
+	}}}
+	if err := recorder.observeInteraction(gemini.InteractionObservation{
+		Phase: "before_request", RequestID: "one", ReservedTokens: 60,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := recorder.observeInteraction(gemini.InteractionObservation{Phase: "before_attempt", RequestID: "one"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := recorder.observeInteraction(gemini.InteractionObservation{
+		Phase: "attempt_failed", RequestID: "one", ReservedTokens: 60,
+		FailureMayHaveConsumedTokens: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := recorder.observeInteraction(gemini.InteractionObservation{Phase: "before_attempt", RequestID: "one"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := recorder.observeInteraction(gemini.InteractionObservation{
+		Phase: "after_response", RequestID: "one", Usage: &gemini.InteractionUsage{TotalTokens: 20},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	budget := recorder.run.Budget
+	if budget.InteractionRequestsUsed != 1 || budget.InteractionAttemptsUsed != 2 || budget.TotalTokensUsed != 80 {
+		t.Fatalf("unexpected retry accounting: %#v", budget)
+	}
+}
+
+func TestCapacityRetryFitsOneLogicalInteractionBudget(t *testing.T) {
+	var attempts atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if attempts.Add(1) == 1 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"id": "retried", "status": "completed",
+			"usage": map[string]any{"total_input_tokens": 6, "total_output_tokens": 4, "total_tokens": 10},
+		})
+	}))
+	defer srv.Close()
+
+	recorder := &runRecorder{run: models.AgentRun{Budget: models.AgentBudget{
+		MaxInteractionRequests: 1, MaxTotalTokens: 10_000,
+	}}}
+	ctx := gemini.WithInteractionObserver(context.Background(), recorder.observeInteraction)
+	client := gemini.NewClient("key").WithEndpoint(srv.URL).WithRetry(gemini.RetryConfig{
+		MaxAttempts: 2, BaseDelay: time.Nanosecond, MaxDelay: time.Nanosecond,
+	})
+	if _, err := client.CreateInteraction(ctx, &gemini.InteractionRequest{
+		Model: "gemini-3.5-flash", Input: "hello", ServiceTier: "flex",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	budget := recorder.run.Budget
+	if attempts.Load() != 2 || budget.InteractionRequestsUsed != 1 || budget.InteractionAttemptsUsed != 2 || budget.TotalTokensUsed != 10 {
+		t.Fatalf("capacity retry accounting attempts=%d budget=%#v", attempts.Load(), budget)
+	}
+}
+
+func TestInteractionMissingUsageChargesReservation(t *testing.T) {
+	recorder := &runRecorder{run: models.AgentRun{Budget: models.AgentBudget{
+		MaxInteractionRequests: 1, MaxTotalTokens: 100,
+	}}}
+	if err := recorder.observeInteraction(gemini.InteractionObservation{
+		Phase: "before_request", RequestID: "one", ReservedTokens: 60,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := recorder.observeInteraction(gemini.InteractionObservation{
+		Phase: "after_response", RequestID: "one", ReservedTokens: 60,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if recorder.tokensReserved != 0 || recorder.run.Budget.TotalTokensUsed != 60 {
+		t.Fatalf("missing usage did not charge reservation: reserved=%d budget=%#v", recorder.tokensReserved, recorder.run.Budget)
+	}
+}
+
+func TestInteractionActualUsageCannotSilentlyExceedBudget(t *testing.T) {
+	recorder := &runRecorder{run: models.AgentRun{Budget: models.AgentBudget{
+		MaxInteractionRequests: 1, MaxTotalTokens: 100,
+	}}}
+	if err := recorder.observeInteraction(gemini.InteractionObservation{
+		Phase: "before_request", RequestID: "one", ReservedTokens: 80,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	err := recorder.observeInteraction(gemini.InteractionObservation{
+		Phase: "after_response", RequestID: "one", Usage: &gemini.InteractionUsage{TotalTokens: 110},
+	})
+	if err == nil {
+		t.Fatal("actual usage above the hard envelope was accepted")
+	}
+	if recorder.tokensReserved != 0 || recorder.run.Budget.TotalTokensUsed != 110 {
+		t.Fatalf("actual usage was not recorded before rejection: reserved=%d budget=%#v", recorder.tokensReserved, recorder.run.Budget)
 	}
 }
 

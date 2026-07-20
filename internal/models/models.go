@@ -86,16 +86,21 @@ type TranscriptSegment struct {
 // (which emits 3+ digit hours past 99:59:59) without failing re-validation.
 var timestampRE = regexp.MustCompile(`^\[(\d{2,}):(\d{2}):(\d{2})\]$`)
 
-// looseTimestampRE matches a loosely formatted [H:M:S] timestamp with 1-2 digit
-// fields, used by NormalizeTimestamp to recover models that omit zero-padding.
-var looseTimestampRE = regexp.MustCompile(`^\[(\d{1,2}):(\d{1,2}):(\d{1,2})\]$`)
+// Loose timestamp patterns recover model output that omits brackets and/or
+// zero-padding. Separate expressions avoid accepting mismatched brackets.
+var (
+	looseBracketedTimestampRE   = regexp.MustCompile(`^\[(\d+):(\d{1,2}):(\d{1,2})\]$`)
+	looseUnbracketedTimestampRE = regexp.MustCompile(`^(\d+):(\d{1,2}):(\d{1,2})$`)
+)
 
-// NormalizeTimestamp zero-pads a loosely formatted [H:M:S] timestamp to the
-// canonical [HH:MM:SS] form. It returns the input unchanged if it does not match
-// the loose shape, leaving out-of-range minutes/seconds for Validate to reject.
+// NormalizeTimestamp canonicalizes bracketed or unbracketed H:M:S model output
+// to [HH:MM:SS]. It leaves other shapes and out-of-range fields for Validate.
 func NormalizeTimestamp(ts string) string {
 	ts = strings.TrimSpace(ts)
-	m := looseTimestampRE.FindStringSubmatch(ts)
+	m := looseBracketedTimestampRE.FindStringSubmatch(ts)
+	if m == nil {
+		m = looseUnbracketedTimestampRE.FindStringSubmatch(ts)
+	}
 	if m == nil {
 		return ts
 	}
@@ -273,6 +278,7 @@ type AgentBudget struct {
 	SpanEscalationsUsed     int   `json:"span_escalations_used"`
 	MaxInteractionRequests  int   `json:"max_interaction_requests"`
 	InteractionRequestsUsed int   `json:"interaction_requests_used"`
+	InteractionAttemptsUsed int   `json:"interaction_attempts_used"`
 	MaxToolCalls            int   `json:"max_tool_calls"`
 	ToolCallsUsed           int   `json:"tool_calls_used"`
 	InputTokensUsed         int   `json:"input_tokens_used"`

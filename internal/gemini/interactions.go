@@ -15,9 +15,8 @@ import (
 	"github.com/cyanxxy/transcription-agent-go/internal/obs"
 )
 
-const interactionsAPIRevision = "2026-05-20"
-
-// InteractionRequest is the REST body for POST /v1beta/interactions.
+// InteractionRequest is the REST body for POST /v1/interactions. Preview-only
+// inference tiers are routed through v1beta until they appear in the v1 schema.
 // Store is a pointer because omitting it selects the API default (true).
 type InteractionRequest struct {
 	Model                 string                       `json:"model"`
@@ -32,7 +31,8 @@ type InteractionRequest struct {
 	ServiceTier           string                       `json:"service_tier,omitempty"`
 	Labels                map[string]string            `json:"labels,omitempty"`
 	// EstimatedInputTokens covers non-JSON inputs such as a Files API audio
-	// object. The client also reserves one token per serialized input byte.
+	// object. The client also conservatively reserves one token per serialized
+	// request byte so interaction-scoped instructions, tools, and schemas count.
 	EstimatedInputTokens int `json:"-"`
 }
 
@@ -151,6 +151,7 @@ type Interaction struct {
 	ID                    string            `json:"id"`
 	Model                 string            `json:"model,omitempty"`
 	Status                string            `json:"status"`
+	ServiceTier           string            `json:"service_tier,omitempty"`
 	PreviousInteractionID string            `json:"previous_interaction_id,omitempty"`
 	Steps                 []InteractionStep `json:"steps,omitempty"`
 	Usage                 *InteractionUsage `json:"usage,omitempty"`
@@ -213,12 +214,13 @@ type InteractionLoopLimits struct {
 // InteractionObservation exposes logical request, response-usage, and tool
 // batch boundaries so orchestration code can reserve hard budgets before I/O.
 type InteractionObservation struct {
-	Phase          string
-	RequestID      string
-	InteractionID  string
-	Usage          *InteractionUsage
-	ToolCallCount  int
-	ReservedTokens int
+	Phase                        string
+	RequestID                    string
+	InteractionID                string
+	Usage                        *InteractionUsage
+	ToolCallCount                int
+	ReservedTokens               int
+	FailureMayHaveConsumedTokens bool
 }
 
 // InteractionObserver can reject work before the next API request or tool
@@ -255,24 +257,46 @@ func (l InteractionLoopLimits) withDefaults() InteractionLoopLimits {
 
 var interactionRequestSequence atomic.Uint64
 
+var stableV1InteractionModels = map[string]struct{}{
+	"gemini-2.5-flash-image": {},
+	"gemini-2.5-flash-lite":  {},
+	"gemini-3.1-flash-image": {},
+	"gemini-3.1-flash-lite":  {},
+	"gemini-3.5-flash":       {},
+}
+
+func interactionAPIVersion(model, serviceTier string) string {
+	if serviceTier == "flex" || serviceTier == "priority" {
+		return interactionsTierAPIVersion
+	}
+	model = strings.TrimPrefix(strings.TrimSpace(model), "models/")
+	if _, stable := stableV1InteractionModels[model]; stable {
+		return interactionsAPIVersion
+	}
+	return interactionsTierAPIVersion
+}
+
 // CreateInteraction performs one synchronous Interactions API request.
 func (c *Client) CreateInteraction(ctx context.Context, req *InteractionRequest) (*Interaction, error) {
 	if err := validateInteractionRequest(req); err != nil {
 		return nil, err
 	}
-	body, err := json.Marshal(req)
+	wireRequest := *req
+	version := interactionAPIVersion(wireRequest.Model, wireRequest.ServiceTier)
+	if wireRequest.ServiceTier == "standard" {
+		// Standard is the default on both API versions. Omit the beta-only field
+		// even when a preview model requires the v1beta endpoint.
+		wireRequest.ServiceTier = ""
+	}
+	body, err := json.Marshal(&wireRequest)
 	if err != nil {
 		return nil, fmt.Errorf("marshal interaction request: %w", err)
-	}
-	input, err := json.Marshal(req.Input)
-	if err != nil {
-		return nil, fmt.Errorf("marshal interaction input for budget estimate: %w", err)
 	}
 	maxOutputTokens := 0
 	if req.GenerationConfig != nil {
 		maxOutputTokens = req.GenerationConfig.MaxOutputTokens
 	}
-	reservedTokens := len(input) + max(0, req.EstimatedInputTokens) + max(0, maxOutputTokens)
+	reservedTokens := len(body) + max(0, req.EstimatedInputTokens) + max(0, maxOutputTokens)
 	requestID := fmt.Sprintf("ireq_%d", interactionRequestSequence.Add(1))
 	if err := observeInteraction(ctx, InteractionObservation{
 		Phase: "before_request", RequestID: requestID, ReservedTokens: reservedTokens,
@@ -280,30 +304,46 @@ func (c *Client) CreateInteraction(ctx context.Context, req *InteractionRequest)
 		return nil, err
 	}
 	reservationActive := true
+	chargeReservationOnFailure := false
 	defer func() {
 		if reservationActive {
 			_ = observeInteraction(ctx, InteractionObservation{
 				Phase: "request_failed", RequestID: requestID, ReservedTokens: reservedTokens,
+				FailureMayHaveConsumedTokens: chargeReservationOnFailure,
 			})
 		}
 	}()
-	endpoint := fmt.Sprintf("%s/%s/interactions", c.endpoint, apiVersion)
+	endpoint := fmt.Sprintf("%s/%s/interactions", c.endpoint, version)
 	build := func() (*http.Request, error) {
 		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
 		if err != nil {
 			return nil, err
 		}
 		httpReq.Header.Set("Content-Type", "application/json")
-		httpReq.Header.Set("Api-Revision", interactionsAPIRevision)
 		c.attachAuth(httpReq)
 		return httpReq, nil
 	}
 
-	resp, err := c.doWithRetry(ctx, "interactions.create", build)
+	attemptObserver := func(phase string, attempt int, failure error) error {
+		switch phase {
+		case "before_attempt":
+			return observeInteraction(ctx, InteractionObservation{
+				Phase: "before_attempt", RequestID: requestID,
+			})
+		case "attempt_failed":
+			return observeInteraction(ctx, InteractionObservation{
+				Phase: "attempt_failed", RequestID: requestID, ReservedTokens: reservedTokens,
+				FailureMayHaveConsumedTokens: retryFailureMayHaveConsumedTokens(failure),
+			})
+		}
+		return nil
+	}
+	resp, err := c.doWithRetryObserved(ctx, "interactions.create", build, attemptObserver)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
+	chargeReservationOnFailure = true
 	responseBody, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("read interaction response: %w", err)
@@ -311,6 +351,9 @@ func (c *Client) CreateInteraction(ctx context.Context, req *InteractionRequest)
 	var interaction Interaction
 	if err := json.Unmarshal(responseBody, &interaction); err != nil {
 		return nil, fmt.Errorf("decode interaction response: %w (body=%s)", err, snippetScrubbed(responseBody, c.apiKey))
+	}
+	if tier := strings.TrimSpace(resp.Header.Get("X-Gemini-Service-Tier")); tier != "" {
+		interaction.ServiceTier = tier
 	}
 	totalTokens := 0
 	if interaction.Usage != nil {
@@ -323,10 +366,19 @@ func (c *Client) CreateInteraction(ctx context.Context, req *InteractionRequest)
 		"status", interaction.Status,
 		"step_count", len(interaction.Steps),
 		"total_tokens", totalTokens,
+		"service_tier", interaction.ServiceTier,
 	)
+	if req.ServiceTier == "priority" && interaction.ServiceTier == "standard" {
+		obs.LoggerFrom(ctx).Warn("gemini priority interaction was downgraded to standard",
+			"component", "gemini",
+			"operation", "interactions.create",
+			"interaction_id", interaction.ID,
+		)
+	}
 	reservationActive = false
 	if err := observeInteraction(ctx, InteractionObservation{
-		Phase: "after_response", RequestID: requestID, InteractionID: interaction.ID, Usage: interaction.Usage,
+		Phase: "after_response", RequestID: requestID, InteractionID: interaction.ID,
+		Usage: interaction.Usage, ReservedTokens: reservedTokens,
 	}); err != nil {
 		return nil, err
 	}
@@ -342,6 +394,11 @@ func validateInteractionRequest(req *InteractionRequest) error {
 	}
 	if req.Input == nil {
 		return errors.New("interaction input is required")
+	}
+	switch req.ServiceTier {
+	case "", "standard", "flex", "priority":
+	default:
+		return fmt.Errorf("unsupported interaction service_tier %q", req.ServiceTier)
 	}
 	if req.Store != nil && !*req.Store {
 		if req.PreviousInteractionID != "" {

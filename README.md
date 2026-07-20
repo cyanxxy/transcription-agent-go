@@ -184,9 +184,9 @@ chunk plan (`metadata.chunks`) with boundary type and confidence.
 | —                    | `LOG_LEVEL`                | `info`              | `debug` / `info` / `warn` / `error` |
 | —                    | `LOG_FORMAT`               | `json`              | `json` or `text` |
 
-**Models** (`--model`, `--judge-model`): `gemini-3.5-flash` (primary default),
-`gemini-3.1-flash-lite`, `gemini-3.1-pro-preview` (judge default), and the
-compatibility model `gemini-3-flash-preview`.
+**Models** (`--model`, `--judge-model`): `gemini-3.5-flash` (primary and judge
+default), `gemini-3.1-flash-lite`, and the preview compatibility model
+`gemini-3-flash-preview`.
 **Strategies** (`--strategy`): `single_gemini`, `dual_gemini`,
 `gemini_plus_parakeet`.
 **Service tiers** (`--service-tier`): `standard`, `flex`, `priority`.

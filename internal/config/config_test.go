@@ -10,8 +10,6 @@ func TestNormalizeGeminiModelName(t *testing.T) {
 	cases := map[string]string{
 		"gemini-3-flash-preview":            "gemini-3-flash-preview",
 		"google-gla:gemini-3-flash-preview": "gemini-3-flash-preview",
-		"gemini-3-pro-preview":              "gemini-3.1-pro-preview", // alias
-		"google-gla:gemini-3-pro-preview":   "gemini-3.1-pro-preview",
 		"gemini-3.1-flash-lite-preview":     "gemini-3.1-flash-lite",
 	}
 	for in, want := range cases {
@@ -109,7 +107,7 @@ func TestDefaultsUseCurrentGeminiModels(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer deps.Cleanup()
-	if deps.ModelName != "gemini-3.5-flash" || deps.JudgeModelName != "gemini-3.1-pro-preview" {
+	if deps.ModelName != "gemini-3.5-flash" || deps.JudgeModelName != "gemini-3.5-flash" {
 		t.Fatalf("unexpected model defaults: primary=%s judge=%s", deps.ModelName, deps.JudgeModelName)
 	}
 	specs := deps.ResolveCandidateSpecs()
@@ -296,7 +294,7 @@ func TestRejectsUnsupportedModel(t *testing.T) {
 
 func TestRejectsBadThinkingLevel(t *testing.T) {
 	_, err := NewTranscriptionDeps("test",
-		WithModelName("gemini-3.1-pro-preview"),
+		WithModelName("gemini-3.5-flash"),
 		WithThinkingLevels("minimum", "high"),
 	)
 	if err == nil {
@@ -304,19 +302,13 @@ func TestRejectsBadThinkingLevel(t *testing.T) {
 	}
 }
 
-func TestCoercesLegacyProThinking(t *testing.T) {
-	deps, err := NewTranscriptionDeps("test",
-		WithModelName("gemini-3.1-pro-preview"),
-		WithJudgeModelName("gemini-3.1-pro-preview"),
-		WithThinkingLevels("minimal", "minimal"),
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer deps.Cleanup()
-	if deps.TranscriptionThinkingLevel != "low" || deps.JudgeThinkingLevel != "low" {
-		t.Errorf("legacy minimal should coerce to low; got %s / %s",
-			deps.TranscriptionThinkingLevel, deps.JudgeThinkingLevel)
+func TestRejectsRemovedProPreviewModels(t *testing.T) {
+	for _, model := range []string{"gemini-3-pro-preview", "gemini-3.1-pro-preview"} {
+		t.Run(model, func(t *testing.T) {
+			if _, err := NewTranscriptionDeps("test", WithModelName(model)); err == nil {
+				t.Fatalf("removed model %q was accepted", model)
+			}
+		})
 	}
 }
 

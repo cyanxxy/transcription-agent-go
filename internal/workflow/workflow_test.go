@@ -224,7 +224,7 @@ func TestRunUnitWithJudgeRejectsOutOfSpanOutput(t *testing.T) {
 			"name": "files/chunk", "uri": "https://example.test/chunk", "state": "ACTIVE", "mimeType": "audio/wav",
 		})
 	})
-	mux.HandleFunc("/v1beta/interactions", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/v1/interactions", func(w http.ResponseWriter, r *http.Request) {
 		var body map[string]any
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			t.Error(err)
@@ -302,7 +302,7 @@ func TestDualGeminiCandidatesShareOneFilesUpload(t *testing.T) {
 			"name": "files/shared", "uri": "https://example.test/shared", "state": "ACTIVE", "mimeType": "audio/wav",
 		})
 	})
-	mux.HandleFunc("/v1beta/interactions", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/v1/interactions", func(w http.ResponseWriter, r *http.Request) {
 		var body map[string]any
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			t.Fatal(err)
@@ -498,7 +498,7 @@ func TestTranscribeEndToEndJudgePipeline(t *testing.T) {
 			"mimeType": "audio/wav",
 		})
 	})
-	mux.HandleFunc("/v1beta/interactions", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/v1/interactions", func(w http.ResponseWriter, r *http.Request) {
 		var body map[string]any
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			t.Fatal(err)
@@ -613,7 +613,7 @@ func TestTranscribeInjectsFormatSkill(t *testing.T) {
 			"name": "files/x", "uri": "https://api.example/files/x", "state": "ACTIVE", "mimeType": "audio/wav",
 		})
 	})
-	mux.HandleFunc("/v1beta/interactions", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/v1/interactions", func(w http.ResponseWriter, r *http.Request) {
 		b, _ := io.ReadAll(r.Body)
 		mu.Lock()
 		bodies = append(bodies, string(b))

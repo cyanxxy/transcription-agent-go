@@ -20,3 +20,6 @@ go.work.sum
 # Local secrets / env
 .env
 *.local
+
+# Runtime job storage (uploads, journals, and generated results)
+/data/

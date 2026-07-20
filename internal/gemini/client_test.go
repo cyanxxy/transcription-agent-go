@@ -644,3 +644,42 @@ func TestGuessMimeUsesDocumentedMP3Type(t *testing.T) {
 		t.Fatalf("guessMime(mp3) = %q, want audio/mp3", got)
 	}
 }
+
+func TestGuessMimeKeepsFilesM4AContainerType(t *testing.T) {
+	if got := guessMime("recording.m4a"); got != "audio/mp4" {
+		t.Fatalf("guessMime(m4a) = %q, want audio/mp4", got)
+	}
+}
+
+func TestDefaultClientLeavesResponseHeaderTimeoutToContext(t *testing.T) {
+	transport, ok := NewClient("key").http.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("default transport has type %T", NewClient("key").http.Transport)
+	}
+	if transport.ResponseHeaderTimeout != 0 {
+		t.Fatalf("ResponseHeaderTimeout = %v, want 0 so Flex can use caller deadline", transport.ResponseHeaderTimeout)
+	}
+}
+
+func TestRetryFailureTokenConsumptionClassification(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "rate limited", err: &APIError{StatusCode: http.StatusTooManyRequests}, want: false},
+		{name: "capacity unavailable", err: &APIError{StatusCode: http.StatusServiceUnavailable}, want: false},
+		{name: "bad request", err: &APIError{StatusCode: http.StatusBadRequest}, want: false},
+		{name: "internal error", err: &APIError{StatusCode: http.StatusInternalServerError}, want: true},
+		{name: "gateway timeout", err: &APIError{StatusCode: http.StatusGatewayTimeout}, want: true},
+		{name: "dns failure", err: &net.DNSError{Err: "not found", Name: "example.invalid"}, want: false},
+		{name: "lost response", err: io.ErrUnexpectedEOF, want: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := retryFailureMayHaveConsumedTokens(tt.err); got != tt.want {
+				t.Fatalf("retryFailureMayHaveConsumedTokens(%v) = %v, want %v", tt.err, got, tt.want)
+			}
+		})
+	}
+}

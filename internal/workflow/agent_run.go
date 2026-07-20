@@ -141,24 +141,38 @@ func (r *runRecorder) observeInteraction(observation gemini.InteractionObservati
 			r.tokenReservations[observation.RequestID] = observation.ReservedTokens
 			r.tokensReserved += observation.ReservedTokens
 		}
+	case "before_attempt":
+		r.run.Budget.InteractionAttemptsUsed++
+	case "attempt_failed":
+		if observation.FailureMayHaveConsumedTokens && observation.ReservedTokens > 0 {
+			r.run.Budget.TotalTokensUsed += observation.ReservedTokens
+			if r.run.Budget.TotalTokensUsed+r.tokensReserved > r.run.Budget.MaxTotalTokens {
+				return fmt.Errorf("agent token budget exhausted by an ambiguous failed interaction attempt")
+			}
+		}
 	case "before_tools":
 		if observation.ToolCallCount < 0 || r.run.Budget.ToolCallsUsed+observation.ToolCallCount > r.run.Budget.MaxToolCalls {
 			return fmt.Errorf("agent tool-call budget exhausted")
 		}
 		r.run.Budget.ToolCallsUsed += observation.ToolCallCount
 	case "after_response":
-		r.releaseTokenReservationLocked(observation.RequestID)
-		if observation.Usage != nil {
+		reserved := r.releaseTokenReservationLocked(observation.RequestID)
+		charged := reserved
+		if observation.Usage != nil && observation.Usage.TotalTokens > 0 {
 			r.run.Budget.InputTokensUsed += observation.Usage.TotalInputTokens
 			r.run.Budget.OutputTokensUsed += observation.Usage.TotalOutputTokens
 			r.run.Budget.ThoughtTokensUsed += observation.Usage.TotalThoughtTokens
-			r.run.Budget.TotalTokensUsed += observation.Usage.TotalTokens
+			charged = observation.Usage.TotalTokens
+		}
+		r.run.Budget.TotalTokensUsed += charged
+		if r.run.Budget.TotalTokensUsed > r.run.Budget.MaxTotalTokens {
+			return fmt.Errorf("agent token budget exhausted by actual interaction usage")
 		}
 	case "request_failed":
 		reserved := r.releaseTokenReservationLocked(observation.RequestID)
-		// The server may have consumed the request before the transport failed.
-		// Charge the full reservation so later work cannot overrun the envelope.
-		r.run.Budget.TotalTokensUsed += reserved
+		if observation.FailureMayHaveConsumedTokens {
+			r.run.Budget.TotalTokensUsed += reserved
+		}
 	}
 	return nil
 }

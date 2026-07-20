@@ -44,10 +44,13 @@ var judgeResponseSchema = map[string]any{
 			"items": map[string]any{
 				"type": "object",
 				"properties": map[string]any{
-					"timestamp":  map[string]any{"type": "string"},
+					"timestamp": map[string]any{
+						"type":        "string",
+						"description": "Timestamp in canonical [HH:MM:SS] form",
+					},
 					"speaker":    map[string]any{"type": "string"},
 					"text":       map[string]any{"type": "string"},
-					"confidence": map[string]any{"type": "number"},
+					"confidence": map[string]any{"type": "number", "minimum": 0, "maximum": 1},
 				},
 				"required": []string{"timestamp", "speaker", "text"},
 			},

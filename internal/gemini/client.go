@@ -38,8 +38,11 @@ import (
 )
 
 const (
-	defaultEndpoint = "https://generativelanguage.googleapis.com"
-	apiVersion      = "v1beta"
+	defaultEndpoint            = "https://generativelanguage.googleapis.com"
+	filesAPIVersion            = "v1beta"
+	generateContentAPIVersion  = "v1beta"
+	interactionsAPIVersion     = "v1"
+	interactionsTierAPIVersion = "v1beta"
 )
 
 // RetryConfig controls retry behavior. Zero values fall back to sensible
@@ -105,7 +108,6 @@ func NewClient(apiKey string) *Client {
 				IdleConnTimeout:       90 * time.Second,
 				TLSHandshakeTimeout:   10 * time.Second,
 				ExpectContinueTimeout: 1 * time.Second,
-				ResponseHeaderTimeout: 90 * time.Second,
 			},
 		},
 		retry: DefaultRetry,
@@ -189,7 +191,7 @@ func (c *Client) UploadFile(ctx context.Context, path string) (*FileInfo, error)
 }
 
 func (c *Client) startResumableUpload(ctx context.Context, size int64, mimeType, displayName string) (string, error) {
-	endpoint := fmt.Sprintf("%s/upload/%s/files", c.endpoint, apiVersion)
+	endpoint := fmt.Sprintf("%s/upload/%s/files", c.endpoint, filesAPIVersion)
 	body := map[string]any{
 		"file": map[string]any{"displayName": displayName},
 	}
@@ -283,7 +285,7 @@ func (c *Client) waitFileActive(ctx context.Context, name string) (*FileInfo, er
 
 // GetFile returns the current state of an uploaded file.
 func (c *Client) GetFile(ctx context.Context, name string) (*FileInfo, error) {
-	endpoint := fmt.Sprintf("%s/%s/%s", c.endpoint, apiVersion, name)
+	endpoint := fmt.Sprintf("%s/%s/%s", c.endpoint, filesAPIVersion, name)
 	build := func() (*http.Request, error) {
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 		if err != nil {
@@ -306,7 +308,7 @@ func (c *Client) GetFile(ctx context.Context, name string) (*FileInfo, error) {
 
 // DeleteFile removes an uploaded file. Best-effort; errors are returned.
 func (c *Client) DeleteFile(ctx context.Context, name string) error {
-	endpoint := fmt.Sprintf("%s/%s/%s", c.endpoint, apiVersion, name)
+	endpoint := fmt.Sprintf("%s/%s/%s", c.endpoint, filesAPIVersion, name)
 	build := func() (*http.Request, error) {
 		req, err := http.NewRequestWithContext(ctx, http.MethodDelete, endpoint, nil)
 		if err != nil {
@@ -597,7 +599,7 @@ func (c *Client) GenerateContent(ctx context.Context, model string, req *Generat
 	if err := observeModelCall(ctx, ModelCallObservation{Phase: "before_request", Operation: operation}); err != nil {
 		return nil, err
 	}
-	endpoint := fmt.Sprintf("%s/%s/models/%s:generateContent", c.endpoint, apiVersion, url.PathEscape(model))
+	endpoint := fmt.Sprintf("%s/%s/models/%s:generateContent", c.endpoint, generateContentAPIVersion, url.PathEscape(model))
 	bs, err := json.Marshal(req)
 	if err != nil {
 		return nil, fmt.Errorf("marshal request: %w", err)
@@ -685,6 +687,19 @@ func (c *Client) attachAuth(req *http.Request) {
 // errors. The build callback is invoked anew on each attempt so the request
 // body Reader can be re-created safely.
 func (c *Client) doWithRetry(ctx context.Context, op string, build func() (*http.Request, error)) (*http.Response, error) {
+	return c.doWithRetryObserved(ctx, op, build, nil)
+}
+
+// retryAttemptObserver runs immediately before each wire attempt and after an
+// unsuccessful attempt. failure is non-nil only for attempt_failed.
+type retryAttemptObserver func(phase string, attempt int, failure error) error
+
+func (c *Client) doWithRetryObserved(
+	ctx context.Context,
+	op string,
+	build func() (*http.Request, error),
+	observer retryAttemptObserver,
+) (*http.Response, error) {
 	logger := obs.LoggerFrom(ctx).With("component", "gemini", "operation", op)
 	var lastErr error
 	attempts := c.retry.MaxAttempts
@@ -696,9 +711,19 @@ func (c *Client) doWithRetry(ctx context.Context, op string, build func() (*http
 		if err != nil {
 			return nil, err
 		}
+		if observer != nil {
+			if err := observer("before_attempt", attempt, nil); err != nil {
+				return nil, err
+			}
+		}
 		resp, err := c.http.Do(req)
 		if err != nil {
 			lastErr = scrubError(err, c.apiKey)
+			if observer != nil {
+				if observeErr := observer("attempt_failed", attempt, err); observeErr != nil {
+					return nil, observeErr
+				}
+			}
 			if attempt == attempts || !isRetryableNetErr(err) || ctx.Err() != nil {
 				return nil, fmt.Errorf("%s: %w", op, lastErr)
 			}
@@ -721,6 +746,11 @@ func (c *Client) doWithRetry(ctx context.Context, op string, build func() (*http
 			RetryAfter: parseRetryAfter(resp.Header.Get("Retry-After")),
 		}
 		lastErr = apiErr
+		if observer != nil {
+			if observeErr := observer("attempt_failed", attempt, apiErr); observeErr != nil {
+				return nil, observeErr
+			}
+		}
 		if attempt == attempts || !apiErr.IsTransient() {
 			return nil, apiErr
 		}
@@ -742,6 +772,41 @@ func (c *Client) doWithRetry(ctx context.Context, op string, build func() (*http
 		}
 	}
 	return nil, lastErr
+}
+
+// retryFailureMayHaveConsumedTokens distinguishes failures known to happen
+// before inference from failures where the server may have completed work but
+// the response was lost. The latter must remain charged to preserve a hard cost
+// envelope across retries.
+func retryFailureMayHaveConsumedTokens(err error) bool {
+	if err == nil {
+		return false
+	}
+	var apiErr *APIError
+	if errors.As(err, &apiErr) {
+		switch apiErr.StatusCode {
+		case http.StatusTooManyRequests, http.StatusServiceUnavailable:
+			return false
+		case http.StatusRequestTimeout, http.StatusTooEarly,
+			http.StatusInternalServerError, http.StatusBadGateway,
+			http.StatusGatewayTimeout:
+			return true
+		default:
+			return false
+		}
+	}
+	var dnsErr *net.DNSError
+	if errors.As(err, &dnsErr) {
+		return false
+	}
+	var opErr *net.OpError
+	if errors.As(err, &opErr) && opErr.Op == "dial" {
+		return false
+	}
+	if strings.Contains(err.Error(), "connection refused") || strings.Contains(err.Error(), "no such host") {
+		return false
+	}
+	return true
 }
 
 func (c *Client) backoffDelay(attempt int) time.Duration {
@@ -850,6 +915,8 @@ func guessMime(path string) string {
 	case ".wav":
 		return "audio/wav"
 	case ".m4a":
+		// Files API accepts the MP4 container type; the Interactions request
+		// rewrites this to audio/m4a when it references the uploaded file.
 		return "audio/mp4"
 	case ".ogg":
 		return "audio/ogg"

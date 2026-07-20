@@ -28,6 +28,15 @@ func TestGuessMIMEFromPathUsesDocumentedMP3Type(t *testing.T) {
 	}
 }
 
+func TestM4AUsesInteractionsAudioType(t *testing.T) {
+	if got := guessMIMEFromPath("recording.m4a"); got != "audio/m4a" {
+		t.Fatalf("guessMIMEFromPath(m4a) = %q, want audio/m4a", got)
+	}
+	if got := interactionAudioMIME("recording.m4a", "audio/mp4"); got != "audio/m4a" {
+		t.Fatalf("interactionAudioMIME(m4a, audio/mp4) = %q, want audio/m4a", got)
+	}
+}
+
 func TestMergeChunksDropsOverlap(t *testing.T) {
 	left := []models.TranscriptSegment{
 		seg("[00:00:00]", "Speaker 1", "hello world"),
@@ -238,8 +247,8 @@ func TestJudgeAgentRunsToolLoopBeforeParsingDecision(t *testing.T) {
 		if r.URL.Path != "/v1beta/interactions" {
 			t.Errorf("judge path = %q", r.URL.Path)
 		}
-		if r.Header.Get("Api-Revision") != "2026-05-20" {
-			t.Errorf("missing Interactions API revision header")
+		if r.Header.Get("Api-Revision") != "" {
+			t.Errorf("judge sent obsolete Interactions API revision header")
 		}
 		w.Header().Set("Content-Type", "application/json")
 		if requests == 1 {
@@ -348,6 +357,27 @@ func TestQualityMetricsBasics(t *testing.T) {
 	}
 }
 
+func TestTimestampCoverageEstimatesFinalSegmentEnd(t *testing.T) {
+	segs := []models.TranscriptSegment{
+		seg("[00:00:00]", "Speaker 1", "Opening."),
+		seg("[00:01:00]", "Speaker 1", "A final segment that continues to the end."),
+	}
+	if got := calculateTimestampCoverage(segs, 120); got != 100 {
+		t.Fatalf("timestamp coverage = %.1f, want 100", got)
+	}
+}
+
+func TestTimestampCoverageStillDetectsMissingTail(t *testing.T) {
+	segs := []models.TranscriptSegment{
+		seg("[00:00:00]", "Speaker 1", "Opening."),
+		seg("[00:00:10]", "Speaker 1", "Middle."),
+		seg("[00:00:20]", "Speaker 1", "Premature ending."),
+	}
+	if got := calculateTimestampCoverage(segs, 120); got != 25 {
+		t.Fatalf("timestamp coverage = %.1f, want 25", got)
+	}
+}
+
 func TestAnalyzeTimestampQualityShortAudio(t *testing.T) {
 	segs := []models.TranscriptSegment{seg("[00:00:00]", "S", "a")}
 	got := AnalyzeTimestampQuality(segs, 10)
@@ -416,6 +446,35 @@ func TestParseSegmentsRejectsAnyInvalidSegment(t *testing.T) {
 		if _, err := parseSegments(raw); err == nil {
 			t.Fatalf("invalid model payload was accepted: %s", raw)
 		}
+	}
+}
+
+func TestParseSegmentsCanonicalizesGeminiTimestampAndDropsBadOptionalConfidence(t *testing.T) {
+	segments, err := parseSegments(`{"segments":[{"timestamp":"0:00:00","speaker":" Speaker 1 ","text":" Hello. ","confidence":1.2}]}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(segments) != 1 || segments[0].Timestamp != "[00:00:00]" {
+		t.Fatalf("timestamp was not canonicalized: %#v", segments)
+	}
+	if segments[0].Speaker != "Speaker 1" || segments[0].Text != "Hello." {
+		t.Fatalf("segment fields were not cleaned: %#v", segments[0])
+	}
+	if segments[0].Confidence != nil {
+		t.Fatalf("out-of-range optional confidence was retained: %#v", segments[0].Confidence)
+	}
+}
+
+func TestIncompleteTranscriptCannotReceiveGoodQualityScore(t *testing.T) {
+	quality := BuildQuality(config.DefaultQualityDeps(), []models.TranscriptSegment{
+		seg("[00:00:00]", "Speaker 1", "Opening statement."),
+		seg("[00:01:00]", "Untranscribed", "[no transcript produced for chunk 2 of 2]"),
+	}, 120, nil)
+	if quality.OverallScore > maxKnownIncompleteScore {
+		t.Fatalf("incomplete transcript score = %.2f, want <= %.2f", quality.OverallScore, maxKnownIncompleteScore)
+	}
+	if len(quality.Issues) != 1 || quality.Issues[0]["code"] != "incomplete_transcript" {
+		t.Fatalf("incomplete transcript issue missing: %#v", quality.Issues)
 	}
 }
 

@@ -103,7 +103,12 @@ func TestNormalizeTimestamp(t *testing.T) {
 		{"single digit hour", "[1:05:30]", "[01:05:30]"},
 		{"already canonical", "[01:05:30]", "[01:05:30]"},
 		{"all single digit", "[1:2:3]", "[01:02:03]"},
+		{"unbracketed canonical", "00:00:00", "[00:00:00]"},
+		{"unbracketed single digits", "1:2:3", "[01:02:03]"},
+		{"unbracketed long hours", "100:00:00", "[100:00:00]"},
 		{"long hours unchanged", "[100:00:00]", "[100:00:00]"},
+		{"mismatched opening bracket unchanged", "[00:00:00", "[00:00:00"},
+		{"mismatched closing bracket unchanged", "00:00:00]", "00:00:00]"},
 		{"garbage unchanged", "garbage", "garbage"},
 		{"two field form unchanged", "[00:00]", "[00:00]"},
 	}

@@ -67,7 +67,7 @@ func run() error {
 		output             = flag.String("o", "", "Output file path (default stdout)")
 		format             = flag.String("format", "txt", "Output format: txt, srt, json")
 		model              = flag.String("model", "gemini-3.5-flash", "Primary Gemini model")
-		judgeModel         = flag.String("judge-model", "gemini-3.1-pro-preview", "Judge Gemini model")
+		judgeModel         = flag.String("judge-model", "gemini-3.5-flash", "Judge Gemini model")
 		strategy           = flag.String("strategy", "dual_gemini", "Candidate strategy")
 		serviceTier        = flag.String("service-tier", "", "Gemini service tier: standard, flex, priority")
 		thinking           = flag.String("thinking", "high", "Transcription thinking level")
