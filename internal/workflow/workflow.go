@@ -89,6 +89,27 @@ type TranscribeInput struct {
 	RunFinished  func(*models.AgentRun)
 }
 
+// RunBudgetError reports a quota-safe preflight rejection. Its fields and
+// message contain only user-controlled run limits and derived token counts, so
+// server front-ends may return it without exposing paths or upstream details.
+type RunBudgetError struct {
+	MinimumTokens int64
+	CandidateRuns int
+	MaximumTokens int
+}
+
+func (e *RunBudgetError) Error() string {
+	if e == nil {
+		return "transcription run exceeds its token budget"
+	}
+	return fmt.Sprintf(
+		"audio requires at least %d Gemini input tokens for %d initial candidate(s), exceeding the configured agent token budget of %d; reduce the audio duration or candidate strategy, or increase agent_max_tokens",
+		e.MinimumTokens,
+		e.CandidateRuns,
+		e.MaximumTokens,
+	)
+}
+
 // Transcribe runs the full pipeline and returns the final TranscriptResult.
 func (w *Workflow) Transcribe(ctx context.Context, in TranscribeInput) (*models.TranscriptResult, error) {
 	if (in.FileBytes == nil) == (strings.TrimSpace(in.FilePath) == "") {
@@ -98,10 +119,13 @@ func (w *Workflow) Transcribe(ctx context.Context, in TranscribeInput) (*models.
 		return nil, errors.New("filename is required")
 	}
 	w.setStatus(models.StatusProcessing, in.Filename)
+	succeeded := false
 	defer func() {
-		if w.status() != models.StatusError {
+		if succeeded {
 			w.setStatus(models.StatusComplete, in.Filename)
+			return
 		}
+		w.setStatus(models.StatusError, in.Filename)
 	}()
 
 	runDeps, err := w.createRunDeps()
@@ -111,6 +135,9 @@ func (w *Workflow) Transcribe(ctx context.Context, in TranscribeInput) (*models.
 	defer func() {
 		_ = os.RemoveAll(runDeps.TempDir)
 	}()
+	if err := agents.ValidateSpeechCredentials(runDeps); err != nil {
+		return nil, err
+	}
 
 	if in.Progress != nil {
 		in.Progress("Validating audio file...", 0.1)
@@ -155,6 +182,12 @@ func (w *Workflow) Transcribe(ctx context.Context, in TranscribeInput) (*models.
 
 	reg := w.activeSkills(runDeps)
 	specs := resolveCandidateSpecs(runDeps, reg)
+	if err := validateCandidateSpecs(specs); err != nil {
+		return nil, err
+	}
+	if err := validateMinimumAudioTokenBudget(probe.DurationMS, chunkCount, runDeps, specs); err != nil {
+		return nil, err
+	}
 	recorder := newRunRecorder(runDeps, specs, chunkCount)
 	recorder.start()
 	ctx = withRunRecorder(ctx, recorder)
@@ -185,7 +218,11 @@ func (w *Workflow) Transcribe(ctx context.Context, in TranscribeInput) (*models.
 			cur = userCtx.ExpectedFormat
 		}
 		if strings.TrimSpace(cur) == "" {
-			router := skills.NewRouter(reg, w.Client, runDeps.ModelName)
+			routerModel := runDeps.ModelName
+			if routerModel == config.DefaultTranscriptionModel {
+				routerModel = runDeps.JudgeModelName
+			}
+			router := skills.NewRouter(reg, w.Client, routerModel)
 			if key, name, rerr := router.RouteFormat(ctx, routerHint(in, userCtx)); rerr == nil && key != "" {
 				c := models.TranscriptContext{}
 				if userCtx != nil {
@@ -247,10 +284,12 @@ func (w *Workflow) Transcribe(ctx context.Context, in TranscribeInput) (*models.
 			in.Progress("Formatting transcript...", 0.7)
 		}
 		finalSegments, resultEdited = w.applyOutputCleanup(runDeps, finalSegments)
-		if in.Progress != nil {
-			in.Progress("Analyzing quality...", 0.8)
+		if !config.IsDirectSpeechModel(runDeps.ModelName) {
+			if in.Progress != nil {
+				in.Progress("Analyzing quality...", 0.8)
+			}
+			quality = agents.BuildQuality(w.Deps.Quality, finalSegments, metadata.Duration, nil)
 		}
-		quality = agents.BuildQuality(w.Deps.Quality, finalSegments, metadata.Duration, nil)
 	}
 	if len(chunkMetadata) > 0 {
 		metadata.Chunks = chunkMetadata
@@ -264,7 +303,7 @@ func (w *Workflow) Transcribe(ctx context.Context, in TranscribeInput) (*models.
 		in.Progress("Finalizing...", 0.9)
 	}
 
-	candidateStrategy := "single_gemini"
+	candidateStrategy := runDeps.CandidateStrategy
 	if runDeps.UseJudgePipeline {
 		candidateStrategy = runDeps.CandidateStrategy
 	}
@@ -300,7 +339,60 @@ func (w *Workflow) Transcribe(ctx context.Context, in TranscribeInput) (*models.
 	if in.Progress != nil {
 		in.Progress("Complete!", 1.0)
 	}
+	succeeded = true
 	return result, nil
+}
+
+// validateMinimumAudioTokenBudget rejects work that cannot fit even the audio
+// input for its initial Gemini candidates. This check deliberately excludes
+// prompts, outputs, judging, retries, and escalations, so passing it does not
+// guarantee a run will use the entire remaining budget; failing it means the
+// configured run is impossible and should not spend any Gemini quota.
+func validateMinimumAudioTokenBudget(durationMS, chunkCount int, deps *config.TranscriptionDeps, specs []config.CandidateSpec) error {
+	if deps != nil && config.IsExternalSpeechModel(deps.ModelName) {
+		return nil
+	}
+	if deps == nil || durationMS <= 0 || deps.AgentMaxTokens <= 0 {
+		return nil
+	}
+	geminiRuns := 0
+	switch {
+	case !deps.UseJudgePipeline:
+		// The direct pipeline always invokes only the configured primary model.
+		geminiRuns = 1
+	case deps.AgenticMode:
+		// Adaptive mode guarantees only its primary candidate. Independent
+		// candidates are conditional evidence-gathering steps, so including
+		// them would reject runs that can complete without escalation.
+		if len(specs) > 0 && specs[0].Kind == "gemini" {
+			geminiRuns = 1
+		}
+	default:
+		for _, spec := range specs {
+			if spec.Kind == "gemini" {
+				geminiRuns++
+			}
+		}
+	}
+	if geminiRuns == 0 {
+		return nil
+	}
+	if chunkCount < 1 {
+		chunkCount = 1
+	}
+	// Each overlapping chunk re-sends its overlap to the model. Gemini's
+	// documented audio rate is 32 tokens per second.
+	audioMS := int64(durationMS) + int64(chunkCount-1)*int64(deps.ChunkOverlapMS)
+	perCandidate := (audioMS*32 + 999) / 1000
+	minimum := perCandidate * int64(geminiRuns)
+	if minimum <= int64(deps.AgentMaxTokens) {
+		return nil
+	}
+	return &RunBudgetError{
+		MinimumTokens: minimum,
+		CandidateRuns: geminiRuns,
+		MaximumTokens: deps.AgentMaxTokens,
+	}
 }
 
 func (w *Workflow) setStatus(s models.ProcessingStatus, filename string) {
@@ -329,7 +421,9 @@ func (w *Workflow) createRunDeps() (*config.TranscriptionDeps, error) {
 	if err != nil {
 		return nil, err
 	}
-	return w.Deps.Transcription.WithTempDir(runTemp), nil
+	deps := w.Deps.Transcription.WithTempDir(runTemp)
+	deps.ApplyModelCapabilities()
+	return deps, nil
 }
 
 type judgedUnit struct {
@@ -1062,7 +1156,14 @@ func validateCandidateSpecs(specs []config.CandidateSpec) error {
 			if strings.TrimSpace(spec.ModelName) == "" {
 				return fmt.Errorf("gemini candidate %q has no model", spec.CandidateID)
 			}
+			if _, ok := config.SupportedGeminiModels[spec.ModelName]; !ok {
+				return fmt.Errorf("gemini candidate %q uses unsupported model %q", spec.CandidateID, spec.ModelName)
+			}
 		case "parakeet":
+		case "speech":
+			if !config.IsExternalSpeechModel(spec.ModelName) {
+				return fmt.Errorf("unsupported speech model %q", spec.ModelName)
+			}
 		default:
 			return fmt.Errorf("candidate %q has unknown kind %q", spec.CandidateID, spec.Kind)
 		}
@@ -1460,6 +1561,31 @@ func (w *Workflow) runDirectPipeline(
 		return nil, nil, err
 	}
 	chunkMetadata := chunkMetadataFromChunks(chunks)
+	if config.IsDirectSpeechModel(deps.ModelName) {
+		// Silence-aware boundaries can produce a different count than the estimate.
+		if recorder := recorderFromContext(ctx); recorder != nil {
+			recorder.mu.Lock()
+			recorder.run.Budget.MaxCandidateRuns = len(chunks)
+			recorder.run.Budget.MaxInteractionRequests = len(chunks)
+			recorder.mu.Unlock()
+		}
+		all, err := parallelMapOrdered(ctx, chunks, deps.ChunkConcurrency,
+			func(ctx context.Context, _ int, chunk audio.Chunk) ([]models.TranscriptSegment, error) {
+				return agents.NewTranscriptionAgent(deps, w.Client).Run(ctx, agents.TranscribeInput{
+					AudioPath:            chunk.Path,
+					ChunkInfo:            &agents.ChunkInfo{Index: chunk.Index, StartMS: chunk.StartMS, EndMS: chunk.EndMS, DurationMS: chunk.DurationMS},
+					AudioDurationSeconds: float64(chunk.DurationMS) / 1000,
+				})
+			}, func(completed int) {
+				if progress != nil {
+					progress(fmt.Sprintf("Transcribed %d/%d chunks...", completed, len(chunks)), 0.3+0.4*float64(completed)/float64(len(chunks)))
+				}
+			})
+		if err != nil {
+			return nil, nil, err
+		}
+		return agents.MergeChunks(all), chunkMetadata, nil
+	}
 	all := make([][]models.TranscriptSegment, 0, len(chunks))
 	previous := ""
 	for i, chunk := range chunks {

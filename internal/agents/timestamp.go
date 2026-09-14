@@ -258,7 +258,10 @@ func (p *ParakeetSidecar) invoke(ctx context.Context, payload map[string]any) (*
 	if err != nil {
 		return nil, err
 	}
-	args := strings.Fields(p.Command)
+	args, err := parseCommandArgs(p.Command)
+	if err != nil {
+		return nil, fmt.Errorf("parse parakeet command: %w", err)
+	}
 	if len(args) == 0 {
 		return nil, ErrParakeetUnavailable
 	}
@@ -286,6 +289,103 @@ func (p *ParakeetSidecar) invoke(ctx context.Context, payload map[string]any) (*
 		return nil, fmt.Errorf("decode sidecar output: %w", err)
 	}
 	return &parsed, nil
+}
+
+// parseCommandArgs splits a sidecar command into an executable and arguments
+// without invoking a shell. It supports whitespace separation, single and
+// double quotes, backslash escaping, concatenated quoted/unquoted text, and
+// explicit empty arguments.
+func parseCommandArgs(command string) ([]string, error) {
+	const (
+		unquoted = iota
+		singleQuoted
+		doubleQuoted
+	)
+
+	var (
+		args         []string
+		current      strings.Builder
+		state        = unquoted
+		escaped      bool
+		tokenStarted bool
+	)
+
+	flush := func() {
+		if tokenStarted {
+			args = append(args, current.String())
+			current.Reset()
+			tokenStarted = false
+		}
+	}
+
+	for _, r := range command {
+		switch state {
+		case singleQuoted:
+			if r == '\'' {
+				state = unquoted
+			} else {
+				current.WriteRune(r)
+			}
+		case doubleQuoted:
+			if escaped {
+				switch r {
+				case '$', '`', '"', '\\':
+					current.WriteRune(r)
+				case '\n':
+					// A backslash-newline pair is a line continuation.
+				default:
+					// Within double quotes, POSIX shells preserve a backslash
+					// unless it escapes one of the special characters above.
+					current.WriteRune('\\')
+					current.WriteRune(r)
+				}
+				escaped = false
+				continue
+			}
+			switch r {
+			case '\\':
+				escaped = true
+			case '"':
+				state = unquoted
+			default:
+				current.WriteRune(r)
+			}
+		default:
+			if escaped {
+				current.WriteRune(r)
+				escaped = false
+				continue
+			}
+			switch r {
+			case '\\':
+				escaped = true
+				tokenStarted = true
+			case '\'':
+				state = singleQuoted
+				tokenStarted = true
+			case '"':
+				state = doubleQuoted
+				tokenStarted = true
+			case ' ', '\t', '\r', '\n':
+				flush()
+			default:
+				current.WriteRune(r)
+				tokenStarted = true
+			}
+		}
+	}
+
+	if escaped {
+		return nil, errors.New("trailing escape")
+	}
+	switch state {
+	case singleQuoted:
+		return nil, errors.New("unterminated single quote")
+	case doubleQuoted:
+		return nil, errors.New("unterminated double quote")
+	}
+	flush()
+	return args, nil
 }
 
 type limitedOutputBuffer struct {

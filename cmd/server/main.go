@@ -49,6 +49,7 @@ import (
 	"github.com/cyanxxy/transcription-agent-go/internal/models"
 	"github.com/cyanxxy/transcription-agent-go/internal/obs"
 	"github.com/cyanxxy/transcription-agent-go/internal/skills"
+	"github.com/cyanxxy/transcription-agent-go/internal/workflow"
 )
 
 //go:embed web/templates/index.html web/static
@@ -63,6 +64,8 @@ const (
 	defaultShutdownGrace        = 30 * time.Second
 	defaultMaxConcurrency       = 4
 	defaultMaxQueued            = 12
+	defaultAgentMaxTokens       = 1_000_000
+	defaultMaxRunTime           = 30 * time.Minute
 )
 
 type server struct {
@@ -74,6 +77,8 @@ type server struct {
 	maxUploadBytes int64
 	maxConcurrency int
 	maxQueued      int
+	agentMaxTokens int
+	maxRunTime     time.Duration
 	jobDir         string
 	shutdownGrace  time.Duration
 	logger         *slog.Logger
@@ -93,6 +98,8 @@ type server struct {
 	ready          atomic.Bool
 	skillsReg      *skills.Registry
 	skillRouter    bool
+	generateID     func(int) (string, error)
+	removeJobDir   func(string) error
 }
 
 func main() {
@@ -104,6 +111,8 @@ func main() {
 	maxUploadBytes := flag.Int64("max-upload-bytes", envInt64("MAX_UPLOAD_BYTES", defaultMaxUploadBytes), "Maximum upload size in bytes")
 	maxConcurrency := flag.Int("max-concurrency", envInt("MAX_CONCURRENCY", defaultMaxConcurrency), "Maximum concurrent transcription jobs")
 	maxQueued := flag.Int("max-queued", envInt("MAX_QUEUED", defaultMaxQueued), "Maximum accepted jobs waiting for a worker")
+	agentMaxTokens := flag.Int("agent-max-tokens", envInt("AGENT_MAX_TOKENS", defaultAgentMaxTokens), "Maximum total Gemini tokens per transcription run")
+	maxRunTime := flag.Duration("max-run-time", envDuration("MAX_RUN_TIME", defaultMaxRunTime), "Maximum wall-clock time per transcription run")
 	jobDir := flag.String("job-dir", envOr("JOB_DIR", "./data/jobs"), "Persistent job journal directory")
 	jobTTL := flag.Duration("job-ttl", envDuration("JOB_TTL", defaultJobTTL), "How long to retain completed jobs or wait for human review")
 	shutdownGrace := flag.Duration("shutdown-grace", envDuration("SHUTDOWN_GRACE", defaultShutdownGrace), "Graceful shutdown drain period")
@@ -120,8 +129,8 @@ func main() {
 	logger := obs.NewLogger(obs.DefaultConfig())
 	obs.Install(logger)
 
-	if strings.TrimSpace(*apiKey) == "" {
-		logger.Error("missing API key: pass --api-key or set GEMINI_API_KEY")
+	if strings.TrimSpace(*apiKey) == "" && strings.TrimSpace(os.Getenv("META_API_KEY")) == "" && strings.TrimSpace(os.Getenv("AZURE_SPEECH_KEY")) == "" {
+		logger.Error("missing credentials: set GEMINI_API_KEY, META_API_KEY, or AZURE_SPEECH_KEY and AZURE_SPEECH_ENDPOINT")
 		os.Exit(2)
 	}
 
@@ -134,6 +143,8 @@ func main() {
 		maxUploadBytes: *maxUploadBytes,
 		maxConcurrency: *maxConcurrency,
 		maxQueued:      *maxQueued,
+		agentMaxTokens: *agentMaxTokens,
+		maxRunTime:     *maxRunTime,
 		jobDir:         *jobDir,
 		shutdownGrace:  *shutdownGrace,
 		logger:         logger,
@@ -143,11 +154,15 @@ func main() {
 	}
 	s.ready.Store(true)
 	if s.maxConcurrency < 1 || s.maxConcurrency > 64 || s.maxQueued < 0 || s.maxQueued > 10000 ||
-		s.maxUploadBytes < 1 || s.jobTTL < time.Second || s.shutdownGrace < time.Second {
+		s.maxUploadBytes < 1 || s.agentMaxTokens < 10_000 || s.agentMaxTokens > 10_000_000 ||
+		s.maxRunTime < time.Minute || s.maxRunTime > 24*time.Hour ||
+		s.jobTTL < time.Second || s.shutdownGrace < time.Second {
 		logger.Error("invalid server limits",
 			"max_concurrency", s.maxConcurrency,
 			"max_queued", s.maxQueued,
 			"max_upload_bytes", s.maxUploadBytes,
+			"agent_max_tokens", s.agentMaxTokens,
+			"max_run_time", s.maxRunTime,
 			"job_ttl", s.jobTTL,
 			"shutdown_grace", s.shutdownGrace,
 		)
@@ -270,6 +285,8 @@ func newTestServer(apiKey string, maxConcurrency int) *server {
 		maxUploadBytes: defaultMaxUploadBytes,
 		maxConcurrency: maxConcurrency,
 		maxQueued:      defaultMaxQueued,
+		agentMaxTokens: defaultAgentMaxTokens,
+		maxRunTime:     defaultMaxRunTime,
 		jobDir:         mustTempJobDir(),
 		shutdownGrace:  defaultShutdownGrace,
 		logger:         logger,
@@ -329,8 +346,17 @@ func (s *server) cancelAllJobs() {
 func (s *server) janitor() {
 	ticker := time.NewTicker(s.jobTTL / 4)
 	defer ticker.Stop()
-	for range ticker.C {
-		s.purgeExpiredJobs(time.Now())
+	ctx := s.workerCtx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case now := <-ticker.C:
+			s.purgeExpiredJobs(now)
+		}
 	}
 }
 
@@ -346,6 +372,14 @@ func (s *server) purgeExpiredJobs(now time.Time) {
 		if !expired {
 			return true
 		}
+		removeJobDir := s.removeJobDir
+		if removeJobDir == nil {
+			removeJobDir = os.RemoveAll
+		}
+		if err := removeJobDir(j.dir); err != nil {
+			s.logger.Warn("remove expired job directory", slog.String("job_id", j.id), "error", err)
+			return true
+		}
 		s.jobs.Delete(key)
 		if j.request.Idempotency != "" {
 			s.idempotencyMu.Lock()
@@ -354,9 +388,6 @@ func (s *server) purgeExpiredJobs(now time.Time) {
 				delete(s.idempotency, j.request.Idempotency)
 			}
 			s.idempotencyMu.Unlock()
-		}
-		if err := os.RemoveAll(j.dir); err != nil {
-			s.logger.Warn("remove expired job directory", slog.String("job_id", j.id), "error", err)
 		}
 		s.logger.Debug("purged expired job", slog.String("job_id", key.(string)))
 		return true
@@ -371,7 +402,13 @@ func (s *server) withRequestID(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		id := strings.TrimSpace(r.Header.Get(requestIDHeader))
 		if id == "" || !isSafeID(id) {
-			id = newRandomID(12)
+			var err error
+			id, err = s.randomID(12)
+			if err != nil {
+				s.logger.Error("generate request id", "error", err)
+				respondError(w, r, http.StatusInternalServerError, "could not generate request id", err)
+				return
+			}
 		}
 		w.Header().Set(requestIDHeader, id)
 		ctx := obs.WithRequestID(r.Context(), id)
@@ -599,6 +636,16 @@ func (s *server) buildOptions(r *http.Request) []config.TranscriptionOption {
 func (s *server) buildOptionsFromValues(values map[string]string) []config.TranscriptionOption {
 	opts := []config.TranscriptionOption{}
 	add := func(o config.TranscriptionOption) { opts = append(opts, o) }
+	agentMaxTokens := s.agentMaxTokens
+	if agentMaxTokens == 0 {
+		agentMaxTokens = defaultAgentMaxTokens
+	}
+	maxRunTime := s.maxRunTime
+	if maxRunTime == 0 {
+		maxRunTime = defaultMaxRunTime
+	}
+	add(config.WithAgentMaxTokens(agentMaxTokens))
+	add(config.WithAgentMaxWallTimeSeconds(int(maxRunTime / time.Second)))
 	if v := values["model_name"]; v != "" {
 		add(config.WithModelName(v))
 	}
@@ -735,13 +782,22 @@ func parseBool(v string, def bool) bool {
 
 // --- Helpers ------------------------------------------------------------
 
-func newRandomID(n int) string {
+func newRandomID(n int) (string, error) {
 	if n <= 0 {
 		n = 12
 	}
 	b := make([]byte, n)
-	_, _ = rand.Read(b)
-	return hex.EncodeToString(b)
+	if _, err := rand.Read(b); err != nil {
+		return "", fmt.Errorf("read secure randomness: %w", err)
+	}
+	return hex.EncodeToString(b), nil
+}
+
+func (s *server) randomID(n int) (string, error) {
+	if s.generateID != nil {
+		return s.generateID(n)
+	}
+	return newRandomID(n)
 }
 
 func mustTempJobDir() string {
@@ -821,6 +877,10 @@ func respondError(w http.ResponseWriter, r *http.Request, status int, msg string
 func publicErrorMessage(err error) string {
 	if err == nil {
 		return "unknown error"
+	}
+	var budgetErr *workflow.RunBudgetError
+	if errors.As(err, &budgetErr) {
+		return budgetErr.Error()
 	}
 	if errors.Is(err, context.DeadlineExceeded) {
 		return "transcription timed out"

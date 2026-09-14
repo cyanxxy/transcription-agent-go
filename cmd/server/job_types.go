@@ -1,9 +1,12 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sync"
@@ -59,14 +62,16 @@ type jobRequest struct {
 }
 
 type persistedJob struct {
-	ID         string     `json:"id"`
-	Status     jobStatus  `json:"status"`
-	CreatedAt  time.Time  `json:"created_at"`
-	UpdatedAt  time.Time  `json:"updated_at"`
-	FinishedAt time.Time  `json:"finished_at,omitempty"`
-	Attempt    int        `json:"attempt"`
-	Request    jobRequest `json:"request"`
-	ReviewNote string     `json:"review_note,omitempty"`
+	ID                string     `json:"id"`
+	Status            jobStatus  `json:"status"`
+	CreatedAt         time.Time  `json:"created_at"`
+	UpdatedAt         time.Time  `json:"updated_at"`
+	FinishedAt        time.Time  `json:"finished_at,omitempty"`
+	Attempt           int        `json:"attempt"`
+	Request           jobRequest `json:"request"`
+	ReviewNote        string     `json:"review_note,omitempty"`
+	JournalVersion    int        `json:"journal_version,omitempty"`
+	JournalEventCount int        `json:"journal_event_count,omitempty"`
 }
 
 type sseEvent struct {
@@ -96,6 +101,8 @@ type job struct {
 	events    []sseEvent
 	done      bool
 	listeners []chan struct{}
+
+	syncSnapshotDirectory func(string) error
 }
 
 // idempotencyBinding coordinates retries for one client key. The binding is
@@ -114,27 +121,38 @@ func committedIdempotencyBinding(jobID string) *idempotencyBinding {
 }
 
 func (j *job) push(name string, data any) error {
-	bs, err := json.Marshal(data)
+	prepared, err := prepareJobEvents([]jobEvent{{name: name, data: data}})
 	if err != nil {
 		return err
 	}
-	if len(bs) > maxPersistedEventBytes {
-		return fmt.Errorf("event %q exceeds %d bytes", name, maxPersistedEventBytes)
-	}
 	j.mu.Lock()
-	event := sseEvent{ID: int64(len(j.events) + 1), Name: name, Data: string(bs)}
-	if err := j.appendEventLocked(event); err != nil {
+	previousUpdatedAt := j.updatedAt
+	previousEventCount := len(j.events)
+	events, checkpoint, err := j.appendPreparedEventsLocked(prepared)
+	if err != nil {
 		j.mu.Unlock()
 		return err
 	}
-	j.events = append(j.events, event)
+	j.events = append(j.events, events...)
 	j.updatedAt = time.Now().UTC()
+	if err := j.persistLocked(); err != nil {
+		if writeWasCommitted(err) {
+			listeners := j.listeners
+			j.listeners = nil
+			j.mu.Unlock()
+			closeJobListeners(listeners)
+			return err
+		}
+		j.events = j.events[:previousEventCount]
+		j.updatedAt = previousUpdatedAt
+		rollbackErr := j.rollbackEventJournalLocked(checkpoint)
+		j.mu.Unlock()
+		return errors.Join(err, rollbackErr)
+	}
 	listeners := j.listeners
 	j.listeners = nil
 	j.mu.Unlock()
-	for _, listener := range listeners {
-		close(listener)
-	}
+	closeJobListeners(listeners)
 	return nil
 }
 
@@ -155,7 +173,7 @@ func (j *job) transitionFrom(expected, status jobStatus) (bool, error) {
 	listeners, err := j.transitionLocked(status, "", time.Now().UTC())
 	j.mu.Unlock()
 	closeJobListeners(listeners)
-	return err == nil, err
+	return err == nil || writeWasCommitted(err), err
 }
 
 func (j *job) transitionWithEventsFrom(expected, status jobStatus, reviewNote string, at time.Time, inputs ...jobEvent) (bool, error) {
@@ -168,17 +186,10 @@ func (j *job) transitionWithEventsFrom(expected, status jobStatus, reviewNote st
 		j.mu.Unlock()
 		return false, nil
 	}
-	listeners, err := j.transitionLocked(status, reviewNote, at)
-	if err == nil {
-		err = j.appendPreparedEventsLocked(prepared)
-		if len(prepared) > 0 && !j.done {
-			listeners = append(listeners, j.listeners...)
-			j.listeners = nil
-		}
-	}
+	listeners, err := j.transitionWithPreparedEventsLocked(status, reviewNote, at, prepared)
 	j.mu.Unlock()
 	closeJobListeners(listeners)
-	return true, err
+	return err == nil || writeWasCommitted(err), err
 }
 
 func (j *job) transitionLocked(status jobStatus, reviewNote string, at time.Time) ([]chan struct{}, error) {
@@ -200,6 +211,14 @@ func (j *job) transitionLocked(status jobStatus, reviewNote string, at time.Time
 		j.finishedAt = time.Time{}
 	}
 	if err := j.persistLocked(); err != nil {
+		if writeWasCommitted(err) {
+			if !j.done {
+				return nil, err
+			}
+			listeners := j.listeners
+			j.listeners = nil
+			return listeners, err
+		}
 		j.status = previousStatus
 		j.reviewNote = previousReviewNote
 		j.updatedAt = previousUpdatedAt
@@ -208,6 +227,57 @@ func (j *job) transitionLocked(status jobStatus, reviewNote string, at time.Time
 		return nil, err
 	}
 	if !j.done {
+		return nil, nil
+	}
+	listeners := j.listeners
+	j.listeners = nil
+	return listeners, nil
+}
+
+func (j *job) transitionWithPreparedEventsLocked(status jobStatus, reviewNote string, at time.Time, prepared []sseEvent) ([]chan struct{}, error) {
+	if !validJobTransition(j.status, status) {
+		return nil, fmt.Errorf("illegal job transition %s -> %s", j.status, status)
+	}
+	previousStatus := j.status
+	previousReviewNote := j.reviewNote
+	previousUpdatedAt := j.updatedAt
+	previousFinishedAt := j.finishedAt
+	previousDone := j.done
+	previousEventCount := len(j.events)
+
+	events, checkpoint, err := j.appendPreparedEventsLocked(prepared)
+	if err != nil {
+		return nil, err
+	}
+	j.events = append(j.events, events...)
+	j.status = status
+	j.reviewNote = reviewNote
+	j.updatedAt = at
+	j.done = status.terminal()
+	if j.done {
+		j.finishedAt = at
+	} else {
+		j.finishedAt = time.Time{}
+	}
+	if err := j.persistLocked(); err != nil {
+		if writeWasCommitted(err) {
+			if len(prepared) == 0 && !j.done {
+				return nil, err
+			}
+			listeners := j.listeners
+			j.listeners = nil
+			return listeners, err
+		}
+		j.status = previousStatus
+		j.reviewNote = previousReviewNote
+		j.updatedAt = previousUpdatedAt
+		j.finishedAt = previousFinishedAt
+		j.done = previousDone
+		j.events = j.events[:previousEventCount]
+		rollbackErr := j.rollbackEventJournalLocked(checkpoint)
+		return nil, errors.Join(err, rollbackErr)
+	}
+	if len(prepared) == 0 && !j.done {
 		return nil, nil
 	}
 	listeners := j.listeners
@@ -230,15 +300,85 @@ func prepareJobEvents(inputs []jobEvent) ([]sseEvent, error) {
 	return prepared, nil
 }
 
-func (j *job) appendPreparedEventsLocked(prepared []sseEvent) error {
-	for _, event := range prepared {
-		event.ID = int64(len(j.events) + 1)
-		if err := j.appendEventLocked(event); err != nil {
-			return err
-		}
-		j.events = append(j.events, event)
+// appendPreparedEventsLocked writes an entire event batch before job.json is
+// advanced. The job snapshot's JournalEventCount is the commit point: recovery
+// truncates any event tail left by a crash before that atomic snapshot update.
+func (j *job) appendPreparedEventsLocked(prepared []sseEvent) ([]sseEvent, int64, error) {
+	events := make([]sseEvent, len(prepared))
+	for index, event := range prepared {
+		event.ID = int64(len(j.events) + index + 1)
+		events[index] = event
 	}
-	return nil
+	if len(events) == 0 || j.dir == "" {
+		return events, -1, nil
+	}
+
+	var payload bytes.Buffer
+	encoder := json.NewEncoder(&payload)
+	for _, event := range events {
+		if err := encoder.Encode(event); err != nil {
+			return nil, -1, err
+		}
+	}
+
+	path := filepath.Join(j.dir, "events.ndjson")
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, -1, err
+	}
+	info, err := file.Stat()
+	if err != nil {
+		_ = file.Close()
+		return nil, -1, err
+	}
+	if !info.Mode().IsRegular() {
+		_ = file.Close()
+		return nil, -1, fmt.Errorf("event journal is not a regular file")
+	}
+	checkpoint := info.Size()
+	if _, err := file.Seek(checkpoint, io.SeekStart); err != nil {
+		_ = file.Close()
+		return nil, -1, err
+	}
+	written, writeErr := file.Write(payload.Bytes())
+	if writeErr == nil && written != payload.Len() {
+		writeErr = io.ErrShortWrite
+	}
+	if writeErr == nil {
+		writeErr = file.Sync()
+	}
+	closeErr := file.Close()
+	if writeErr == nil {
+		writeErr = closeErr
+	}
+	if writeErr == nil && checkpoint == 0 {
+		// Only a create needs the directory entry made durable; appends to an
+		// existing journal leave it untouched, and this runs under j.mu on the
+		// progress-event hot path.
+		writeErr = syncDirectory(j.dir)
+	}
+	if writeErr != nil {
+		rollbackErr := j.rollbackEventJournalLocked(checkpoint)
+		return nil, -1, errors.Join(writeErr, rollbackErr)
+	}
+	return events, checkpoint, nil
+}
+
+func (j *job) rollbackEventJournalLocked(checkpoint int64) error {
+	if checkpoint < 0 || j.dir == "" {
+		return nil
+	}
+	path := filepath.Join(j.dir, "events.ndjson")
+	file, err := os.OpenFile(path, os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	truncateErr := file.Truncate(checkpoint)
+	if truncateErr == nil {
+		truncateErr = file.Sync()
+	}
+	closeErr := file.Close()
+	return errors.Join(truncateErr, closeErr)
 }
 
 func closeJobListeners(listeners []chan struct{}) {
@@ -269,13 +409,8 @@ func (j *job) startExecution(cancel context.CancelFunc) (int, jobStatus, error) 
 		j.mu.Unlock()
 		return 0, jobQueued, err
 	}
-	listeners, err := j.transitionLocked(jobRunning, "", at)
-	if err == nil {
-		err = j.appendPreparedEventsLocked(prepared)
-		listeners = append(listeners, j.listeners...)
-		j.listeners = nil
-	}
-	if err != nil && j.status != jobRunning {
+	listeners, err := j.transitionWithPreparedEventsLocked(jobRunning, "", at, prepared)
+	if err != nil && !writeWasCommitted(err) {
 		j.attempt = previousAttempt
 		j.cancel = previousCancel
 	}
@@ -303,13 +438,8 @@ func (j *job) requestCancel() (jobStatus, context.CancelFunc, bool, error) {
 		return status, nil, false, fmt.Errorf("job can no longer be canceled from %s", status)
 	}
 	cancel := j.cancel
-	listeners, transitionErr := j.transitionLocked(jobCancelRequested, "", at)
-	changed := transitionErr == nil
-	if transitionErr == nil {
-		transitionErr = j.appendPreparedEventsLocked(prepared)
-		listeners = append(listeners, j.listeners...)
-		j.listeners = nil
-	}
+	listeners, transitionErr := j.transitionWithPreparedEventsLocked(jobCancelRequested, "", at, prepared)
+	changed := transitionErr == nil || writeWasCommitted(transitionErr)
 	status = j.status
 	j.mu.Unlock()
 	closeJobListeners(listeners)
@@ -401,14 +531,16 @@ func (j *job) view() persistedJob {
 
 func (j *job) persistedLocked() persistedJob {
 	return persistedJob{
-		ID:         j.id,
-		Status:     j.status,
-		CreatedAt:  j.createdAt,
-		UpdatedAt:  j.updatedAt,
-		FinishedAt: j.finishedAt,
-		Attempt:    j.attempt,
-		Request:    j.request,
-		ReviewNote: j.reviewNote,
+		ID:                j.id,
+		Status:            j.status,
+		CreatedAt:         j.createdAt,
+		UpdatedAt:         j.updatedAt,
+		FinishedAt:        j.finishedAt,
+		Attempt:           j.attempt,
+		Request:           j.request,
+		ReviewNote:        j.reviewNote,
+		JournalVersion:    1,
+		JournalEventCount: len(j.events),
 	}
 }
 
@@ -416,25 +548,9 @@ func (j *job) persistLocked() error {
 	if j.dir == "" {
 		return nil
 	}
-	return writeJSONAtomic(filepath.Join(j.dir, "job.json"), j.persistedLocked(), 0o600)
-}
-
-func (j *job) appendEventLocked(event sseEvent) error {
-	if j.dir == "" {
-		return nil
+	path := filepath.Join(j.dir, "job.json")
+	if j.syncSnapshotDirectory != nil {
+		return writeJSONAtomicWithSync(path, j.persistedLocked(), 0o600, j.syncSnapshotDirectory)
 	}
-	file, err := os.OpenFile(filepath.Join(j.dir, "events.ndjson"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
-	if err != nil {
-		return err
-	}
-	encoder := json.NewEncoder(file)
-	if err := encoder.Encode(event); err != nil {
-		_ = file.Close()
-		return err
-	}
-	if err := file.Sync(); err != nil {
-		_ = file.Close()
-		return err
-	}
-	return file.Close()
+	return writeJSONAtomic(path, j.persistedLocked(), 0o600)
 }

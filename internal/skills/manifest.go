@@ -16,7 +16,7 @@ import (
 	"fmt"
 	"strings"
 
-	"gopkg.in/yaml.v3"
+	"go.yaml.in/yaml/v3"
 )
 
 // Manifest is the parsed YAML frontmatter of a SKILL.md file.

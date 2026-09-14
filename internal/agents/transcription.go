@@ -119,8 +119,20 @@ type ChunkInfo struct {
 // Run uploads the audio to Gemini, asks for structured segments, and adjusts
 // timestamps if the input was a chunk.
 func (a *TranscriptionAgent) Run(ctx context.Context, in TranscribeInput) ([]models.TranscriptSegment, error) {
+	if config.IsExternalSpeechModel(a.Deps.ModelName) {
+		return a.runExternalSpeech(ctx, in)
+	}
 	if in.AudioPath == "" {
 		return nil, fmt.Errorf("audio path is required")
+	}
+	if a.Deps.ModelName == config.DefaultTranscriptionModel {
+		duration := in.AudioDurationSeconds
+		if in.ChunkInfo != nil {
+			duration = max(duration, float64(in.ChunkInfo.DurationMS)/1000)
+		}
+		if duration > 1800 {
+			return nil, fmt.Errorf("gemini-3.5-transcribe supports at most 30 minutes with timestamps and diarization; reduce chunk duration")
+		}
 	}
 	logger := obs.LoggerFrom(ctx).With("component", "transcription", "model", a.Deps.ModelName)
 	file := in.UploadedFile
@@ -170,6 +182,18 @@ func (a *TranscriptionAgent) Run(ctx context.Context, in TranscribeInput) ([]mod
 		EstimatedInputTokens: int(math.Ceil(max(0, in.AudioDurationSeconds) * 32)),
 	}
 
+	if a.Deps.ModelName == config.DefaultTranscriptionModel {
+		req.Input = []gemini.InteractionContent{{Type: "audio", URI: file.URI, MIMEType: mimeType}}
+		req.SystemInstruction = ""
+		req.ResponseFormat = nil
+		req.ServiceTier = ""
+		req.GenerationConfig = &gemini.InteractionGenerationConfig{
+			TranscriptionConfig: &gemini.TranscriptionConfig{Mode: gemini.TranscriptionMode{
+				Type: "verbatim", DiarizationMode: "speaker", TimestampGranularities: []string{"word"},
+			}},
+		}
+	}
+
 	resp, err := a.Client.CreateInteraction(ctx, req)
 	if err != nil {
 		return nil, fmt.Errorf("create transcription interaction: %w", err)
@@ -177,7 +201,12 @@ func (a *TranscriptionAgent) Run(ctx context.Context, in TranscribeInput) ([]mod
 	if err := resp.ValidateStatus(); err != nil {
 		return nil, fmt.Errorf("transcription interaction: %w", err)
 	}
-	segments, err := parseSegments(resp.Text())
+	var segments []models.TranscriptSegment
+	if a.Deps.ModelName == config.DefaultTranscriptionModel {
+		segments, err = parseTranscribeSegments(resp)
+	} else {
+		segments, err = parseSegments(resp.Text())
+	}
 	if err != nil {
 		return nil, fmt.Errorf("parse transcript output: %w", err)
 	}

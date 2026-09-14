@@ -14,13 +14,13 @@
         <p class="eyebrow">ExactTranscriber</p>
         <h1>Transcription Studio</h1>
         <p class="subtitle">
-          Adaptive evidence, bounded judging, and reviewable provenance for long-form audio.
+          Turn audio into readable transcripts with speaker labels and timestamps.
         </p>
       </div>
       <div class="hero-status" aria-label="Pipeline defaults">
-        <span><b></b>Agent runtime</span>
+        <span><b></b>Gemini 3.5 Transcribe</span>
         <span>Durable jobs</span>
-        <span>Reviewable evidence</span>
+        <span>Speaker timestamps</span>
       </div>
     </header>
 
@@ -37,29 +37,29 @@
           <p class="hint" id="file-hint">Supported: mp3 &middot; wav &middot; m4a &middot; flac &middot; ogg</p>
         </div>
 
+        <p id="direct-mode-hint" class="hint">Direct transcription with speaker labels and timestamps. One transcription request per chunk.</p>
         <fieldset class="grid">
-          <legend>Pipeline controls</legend>
+          <legend>Transcription settings</legend>
           <label class="full">
             <span>Server access token</span>
             <input id="auth-token" type="password" autocomplete="current-password" placeholder="Optional when server bearer auth is enabled" />
           </label>
           <label>
-            <span>Primary model</span>
+            <span>Transcription model</span>
             <select name="model_name">
-              <option value="gemini-3.5-flash" selected>Gemini 3.5 Flash</option>
-              <option value="gemini-3-flash-preview">Gemini 3 Flash</option>
-              <option value="gemini-3.1-flash-lite">Gemini 3.1 Flash-Lite</option>
+              <option value="gemini-3.5-transcribe" selected>Gemini 3.5 Transcribe</option>
+              <option value="muse-voice-transcribe-1.0">Meta Muse Voice Transcribe</option>
+              <option value="MAI-Transcribe-2">Microsoft MAI-Transcribe-2</option>
+              <option value="gemini-3.8-flash">Gemini 3.8 Flash</option>
             </select>
           </label>
-          <label>
+          <label data-generative-only hidden>
             <span>Judge model</span>
             <select name="judge_model_name">
-              <option value="gemini-3-flash-preview">Gemini 3 Flash</option>
-              <option value="gemini-3.1-flash-lite">Gemini 3.1 Flash-Lite</option>
-              <option value="gemini-3.5-flash" selected>Gemini 3.5 Flash</option>
+              <option value="gemini-3.8-flash" selected>Gemini 3.8 Flash</option>
             </select>
           </label>
-          <label>
+          <label data-generative-only hidden>
             <span>Candidate strategy</span>
             <select name="candidate_strategy">
               <option value="single_gemini">Single Gemini</option>
@@ -67,7 +67,7 @@
               <option value="gemini_plus_parakeet">Gemini + Parakeet</option>
             </select>
           </label>
-          <label>
+          <label data-generative-only hidden>
             <span>Service tier</span>
             <select name="service_tier">
               <option value="standard" selected>Standard</option>
@@ -86,33 +86,31 @@
               <option value="fixed">Fixed windows</option>
             </select>
           </label>
-          <label>
-            <span>Thinking (transcription)</span>
+          <label data-generative-only hidden>
+            <span>Thinking (generative candidates only)</span>
             <select name="transcription_thinking_level">
-              <option value="minimal">minimal</option>
               <option value="low">low</option>
               <option value="medium">medium</option>
               <option value="high" selected>high</option>
             </select>
           </label>
-          <label>
+          <label data-generative-only hidden>
             <span>Thinking (judge)</span>
             <select name="judge_thinking_level">
-              <option value="minimal">minimal</option>
               <option value="low">low</option>
               <option value="medium">medium</option>
               <option value="high" selected>high</option>
             </select>
           </label>
-          <label class="toggle">
+          <label class="toggle" data-generative-only hidden>
             <input type="checkbox" name="use_judge_pipeline" checked />
             <span>Enable judge pipeline</span>
           </label>
-          <label class="toggle">
+          <label class="toggle" data-generative-only hidden>
             <input type="checkbox" name="agentic_mode" checked />
             <span>Adaptive agent mode</span>
           </label>
-          <label class="toggle">
+          <label class="toggle" data-generative-only hidden>
             <input type="checkbox" name="auto_format" checked />
             <span>Auto-format transcript</span>
           </label>
@@ -122,7 +120,7 @@
           </label>
         </fieldset>
 
-        <fieldset class="grid">
+        <fieldset class="grid" data-generative-only hidden>
           <legend>Context guidance</legend>
           <label class="full">
             <span>Topic</span>

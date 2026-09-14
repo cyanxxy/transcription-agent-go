@@ -1,7 +1,21 @@
 (() => {
   const $ = (id) => document.getElementById(id);
 
+  const isDirectSpeech = (model) => ['gemini-3.5-transcribe', 'muse-voice-transcribe-1.0', 'MAI-Transcribe-2'].includes(model);
   const form = $('upload-form');
+  const modelSelect = form.elements.namedItem('model_name');
+  function syncModelControls() {
+    const direct = isDirectSpeech(modelSelect.value);
+    document.querySelectorAll('[data-generative-only]').forEach((group) => {
+      group.hidden = direct;
+      group.querySelectorAll('input, select, textarea').forEach((input) => { input.disabled = direct; });
+    });
+    $('direct-mode-hint').hidden = !direct;
+    const setup = modelSelect.value === 'muse-voice-transcribe-1.0' ? ' Requires META_API_KEY on the server.' : modelSelect.value === 'MAI-Transcribe-2' ? ' Requires AZURE_SPEECH_KEY and AZURE_SPEECH_ENDPOINT on the server.' : '';
+    $('direct-mode-hint').textContent = 'Direct transcription with speaker labels and timestamps. One transcription request per chunk.' + setup;
+  }
+  modelSelect.addEventListener('change', syncModelControls);
+  syncModelControls();
   const submitBtn = $('submit-btn');
   const spinner = submitBtn.querySelector('.spinner');
   const label = submitBtn.querySelector('.label');
@@ -147,7 +161,7 @@
     }
   }
 
-  tabs.forEach((tab, index) => {
+  tabs.forEach((tab) => {
     tab.addEventListener('click', () => {
       activateTab(tab);
     });
@@ -155,12 +169,14 @@
       const keys = ['ArrowLeft', 'ArrowRight', 'Home', 'End'];
       if (!keys.includes(event.key)) return;
       event.preventDefault();
+      const visibleTabs = [...tabs].filter((item) => !item.hidden);
+      const index = visibleTabs.indexOf(tab);
       let nextIndex = index;
-      if (event.key === 'ArrowRight') nextIndex = (index + 1) % tabs.length;
-      if (event.key === 'ArrowLeft') nextIndex = (index - 1 + tabs.length) % tabs.length;
+      if (event.key === 'ArrowRight') nextIndex = (index + 1) % visibleTabs.length;
+      if (event.key === 'ArrowLeft') nextIndex = (index - 1 + visibleTabs.length) % visibleTabs.length;
       if (event.key === 'Home') nextIndex = 0;
-      if (event.key === 'End') nextIndex = tabs.length - 1;
-      activateTab(tabs[nextIndex], true);
+      if (event.key === 'End') nextIndex = visibleTabs.length - 1;
+      activateTab(visibleTabs[nextIndex], true);
     });
   });
 
@@ -509,6 +525,11 @@
 
   function renderResult(payload) {
     resultCard.hidden = false;
+    const direct = isDirectSpeech(payload.result.model_used);
+    tabs.forEach((tab) => {
+      if (['judge', 'quality', 'evidence'].includes(tab.dataset.tab)) tab.hidden = direct;
+    });
+    if (direct) document.querySelector('.tab[data-tab="formatted"]').click();
     panes.formatted.textContent = payload.formatted_text || '';
     panes.srt.textContent = payload.srt || '';
     panes.json.textContent = JSON.stringify(payload.result, null, 2);
@@ -523,12 +544,13 @@
     summaryEl.replaceChildren();
     const metadata = payload.result.metadata || {};
     const stats = [
-      ['Quality', `${(payload.result.quality.overall_score || 0).toFixed(1)} / 100`],
+
       ['Segments', String((payload.result.segments || []).length)],
       ['Duration', `${(metadata.duration || 0).toFixed(1)}s`],
       ['Processing', `${(payload.result.processing_time || 0).toFixed(2)}s`],
-      ['Strategy', payload.result.candidate_strategy || 'single_gemini'],
+      ['Model', payload.result.model_used || '—'],
     ];
+    if (!direct) stats.unshift(['Quality', `${(payload.result.quality.overall_score || 0).toFixed(1)} / 100`]);
     if (metadata.needs_chunking) {
       stats.push(['Chunks', String(metadata.chunk_count || (metadata.chunks || []).length || 0)]);
       stats.push(['Planner', metadata.chunk_strategy || 'fixed']);
@@ -536,7 +558,7 @@
     if (payload.result.judge_used) {
       stats.push(['Judge', payload.result.judge_model_used || '—']);
     }
-    if (payload.result.agent_run) {
+    if (!direct && payload.result.agent_run) {
       stats.push(['Run', payload.result.agent_run.status || 'unknown']);
       stats.push(['Agent steps', String((payload.result.agent_run.steps || []).length)]);
       stats.push(['Disputes', String((payload.result.agent_run.disputed_spans || []).length)]);

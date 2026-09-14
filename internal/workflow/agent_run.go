@@ -71,7 +71,7 @@ func newRunRecorder(deps *config.TranscriptionDeps, specs []config.CandidateSpec
 	if deps.AgentGlobalReview && unitCount > 1 {
 		judgeBudget++
 	}
-	return &runRecorder{run: models.AgentRun{
+	recorder := &runRecorder{run: models.AgentRun{
 		RunID:  newAgentRunID(),
 		Status: models.AgentRunPlanning,
 		Plan: models.AgentPlan{
@@ -90,12 +90,27 @@ func newRunRecorder(deps *config.TranscriptionDeps, specs []config.CandidateSpec
 			MaxInteractionRequests: deps.AgentMaxCandidateRuns*unitCount + judgeBudget*3 + 1,
 			MaxToolCalls:           judgeBudget * 8,
 			MaxGlobalReviews:       1,
-			MaxWallTimeSeconds:     1800,
+			MaxWallTimeSeconds:     deps.AgentMaxWallTimeSeconds,
 			MaxTotalTokens:         deps.AgentMaxTokens,
 		},
 		HumanReview: models.HumanReview{Status: "not_required"},
 		StartedAt:   time.Now().UTC(),
 	}}
+	if !deps.UseJudgePipeline {
+		recorder.run.Plan.Mode = "direct"
+		recorder.run.Plan.RequireGlobalReview = false
+		recorder.run.Budget.MaxCandidateRuns = unitCount
+		recorder.run.Budget.MaxJudgeCalls = 0
+		recorder.run.Budget.MaxPlannerTurns = 0
+		recorder.run.Budget.MaxSpanEscalations = 0
+		recorder.run.Budget.MaxInteractionRequests = unitCount
+		if deps.UseSkillRouter {
+			recorder.run.Budget.MaxInteractionRequests++
+		}
+		recorder.run.Budget.MaxToolCalls = 0
+		recorder.run.Budget.MaxGlobalReviews = 0
+	}
+	return recorder
 }
 
 func (r *runRecorder) consumeGlobalReview() bool {

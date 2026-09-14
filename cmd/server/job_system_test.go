@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"mime/multipart"
@@ -15,6 +16,9 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/cyanxxy/transcription-agent-go/internal/config"
+	"github.com/cyanxxy/transcription-agent-go/internal/workflow"
 )
 
 func TestJobJournalRoundTrip(t *testing.T) {
@@ -39,6 +43,240 @@ func TestJobJournalRoundTrip(t *testing.T) {
 	}
 	if loaded.status != jobSucceeded || !loaded.done || len(loaded.events) != 1 || loaded.events[0].ID != 1 {
 		t.Fatalf("journal did not round trip: %#v", loaded)
+	}
+}
+
+func TestTransitionWithEventsRollsBackWholeBatchWhenSnapshotFails(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "atomic")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	jb := &job{
+		id: "atomic", dir: dir, createdAt: now, updatedAt: now, status: jobRunning,
+		request: jobRequest{AudioFile: "audio.bin"},
+	}
+	if err := os.WriteFile(filepath.Join(dir, "audio.bin"), []byte("audio"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := jb.persistLocked(); err != nil {
+		t.Fatal(err)
+	}
+	jobPath := filepath.Join(dir, "job.json")
+	savedJobPath := filepath.Join(dir, "job.saved.json")
+	if err := os.Rename(jobPath, savedJobPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(jobPath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	changed, err := jb.transitionWithEventsFrom(
+		jobRunning,
+		jobAwaitingReview,
+		"",
+		now.Add(time.Second),
+		jobEvent{name: "result", data: map[string]any{"text": "complete"}},
+		jobEvent{name: "review-required", data: map[string]any{"reason": "check"}},
+	)
+	if err == nil || changed {
+		t.Fatalf("transition = changed %v, error %v; want rolled-back failure", changed, err)
+	}
+	if jb.status != jobRunning || jb.done || len(jb.events) != 0 {
+		t.Fatalf("in-memory transition was not rolled back: status=%s done=%v events=%#v", jb.status, jb.done, jb.events)
+	}
+	events, err := loadEvents(filepath.Join(dir, "events.ndjson"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 0 {
+		t.Fatalf("partially committed event batch remained: %#v", events)
+	}
+	if err := os.Remove(jobPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(savedJobPath, jobPath); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := loadJob(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.status != jobRunning || len(loaded.events) != 0 {
+		t.Fatalf("persisted transition was not rolled back: status=%s events=%#v", loaded.status, loaded.events)
+	}
+}
+
+func TestTransitionWithEventsDoesNotAdvanceStateWhenJournalAppendFails(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "append-failure")
+	if err := os.MkdirAll(filepath.Join(dir, "events.ndjson"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	jb := &job{id: "append-failure", dir: dir, createdAt: now, updatedAt: now, status: jobRunning}
+	if err := jb.persistLocked(); err != nil {
+		t.Fatal(err)
+	}
+	changed, err := jb.transitionWithEventsFrom(
+		jobRunning,
+		jobSucceeded,
+		"",
+		now.Add(time.Second),
+		jobEvent{name: "result", data: map[string]any{"text": "must not commit"}},
+	)
+	if err == nil || changed {
+		t.Fatalf("transition = changed %v, error %v; want append failure", changed, err)
+	}
+	if jb.status != jobRunning || jb.done || len(jb.events) != 0 {
+		t.Fatalf("state advanced despite append failure: status=%s done=%v events=%#v", jb.status, jb.done, jb.events)
+	}
+}
+
+func TestTransitionKeepsMatchingStateAfterPostRenameSyncFailure(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "post-rename")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	jb := &job{id: "post-rename", dir: dir, createdAt: now, updatedAt: now, status: jobRunning}
+	if err := jb.persistLocked(); err != nil {
+		t.Fatal(err)
+	}
+	jb.syncSnapshotDirectory = func(string) error {
+		return errors.New("injected post-rename directory sync failure")
+	}
+	changed, err := jb.transitionWithEventsFrom(
+		jobRunning,
+		jobSucceeded,
+		"",
+		now.Add(time.Second),
+		jobEvent{name: "result", data: map[string]any{"text": "committed"}},
+	)
+	if err == nil || !changed || !writeWasCommitted(err) {
+		t.Fatalf("transition = changed %v, error %v; want committed sync error", changed, err)
+	}
+	if jb.status != jobSucceeded || !jb.done || len(jb.events) != 1 {
+		t.Fatalf("runtime state diverged after committed rename: status=%s done=%v events=%#v", jb.status, jb.done, jb.events)
+	}
+	loaded, err := loadJob(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.status != jobSucceeded || !loaded.done || len(loaded.events) != 1 || loaded.events[0].Name != "result" {
+		t.Fatalf("snapshot and journal diverged after committed rename: status=%s events=%#v", loaded.status, loaded.events)
+	}
+}
+
+func TestLoadEventsTruncatesTornFinalRecord(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "events.ndjson")
+	first, err := json.Marshal(sseEvent{ID: 1, Name: "progress", Data: `{"fraction":0.5}`})
+	if err != nil {
+		t.Fatal(err)
+	}
+	completePrefix := append(append([]byte(nil), first...), '\n')
+	body := append(append([]byte(nil), completePrefix...), []byte(`{"id":2,"name":"result","data":`)...)
+	if err := os.WriteFile(path, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	events, err := loadEvents(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 1 || events[0].ID != 1 {
+		t.Fatalf("events after torn-tail recovery = %#v", events)
+	}
+	repaired, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(repaired, completePrefix) {
+		t.Fatalf("journal was not truncated to the final complete record: %q", repaired)
+	}
+}
+
+func TestLoadJobMigratesLegacyJournalBeforeMutation(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "legacy")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	legacy := persistedJob{
+		ID: "legacy", Status: jobSucceeded, CreatedAt: now, UpdatedAt: now,
+		FinishedAt: now,
+	}
+	if err := writeJSONAtomic(filepath.Join(dir, "job.json"), legacy, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	event := []byte("{\"id\":1,\"name\":\"result\",\"data\":\"{}\"}\n")
+	if err := os.WriteFile(filepath.Join(dir, "events.ndjson"), event, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := loadJob(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(loaded.events) != 1 {
+		t.Fatalf("legacy event count = %d, want 1", len(loaded.events))
+	}
+	body, err := os.ReadFile(filepath.Join(dir, "job.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var migrated persistedJob
+	if err := json.Unmarshal(body, &migrated); err != nil {
+		t.Fatal(err)
+	}
+	if migrated.JournalVersion != 1 || migrated.JournalEventCount != 1 {
+		t.Fatalf("legacy journal was not migrated: version=%d count=%d", migrated.JournalVersion, migrated.JournalEventCount)
+	}
+}
+
+func TestLoadEventsRejectsCorruptionBeforeFinalRecord(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "events.ndjson")
+	body := "{\"id\":1,\"name\":\"progress\",\"data\":\"{}\"}\n" +
+		"{not-json}\n" +
+		"{\"id\":2,\"name\":\"result\",\"data\":\"{}\"}\n"
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadEvents(path); err == nil {
+		t.Fatal("corrupt middle journal record was accepted")
+	}
+}
+
+func TestLoadJobTruncatesUncommittedCompleteEventTail(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "uncommitted")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	jb := &job{
+		id: "uncommitted", dir: dir, createdAt: now, updatedAt: now, status: jobRunning,
+		request: jobRequest{AudioFile: "audio.bin"},
+	}
+	if err := os.WriteFile(filepath.Join(dir, "audio.bin"), []byte("audio"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := jb.persistLocked(); err != nil {
+		t.Fatal(err)
+	}
+	body := []byte("{\"id\":1,\"name\":\"result\",\"data\":\"{}\"}\n")
+	if err := os.WriteFile(filepath.Join(dir, "events.ndjson"), body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := loadJob(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(loaded.events) != 0 {
+		t.Fatalf("uncommitted tail was loaded: %#v", loaded.events)
+	}
+	info, err := os.Stat(filepath.Join(dir, "events.ndjson"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Size() != 0 {
+		t.Fatalf("uncommitted tail size = %d, want 0", info.Size())
 	}
 }
 
@@ -289,6 +527,174 @@ func TestPurgeExpiredJobsExpiresAwaitingReview(t *testing.T) {
 	}
 	if s.idempotency["review-key"] != nil {
 		t.Fatal("expired review idempotency binding remained after retention")
+	}
+}
+
+func TestPurgeExpiredJobsRetriesFailedDirectoryRemoval(t *testing.T) {
+	now := time.Now().UTC()
+	dir := filepath.Join(t.TempDir(), "retry-purge")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	jb := &job{
+		id: "retry-purge", dir: dir, createdAt: now.Add(-2 * time.Hour),
+		updatedAt: now.Add(-2 * time.Hour), finishedAt: now.Add(-2 * time.Hour),
+		status: jobSucceeded, done: true, request: jobRequest{Idempotency: "retry-key"},
+	}
+	s := &server{
+		jobTTL: time.Hour, logger: slog.Default(),
+		idempotency: map[string]*idempotencyBinding{"retry-key": committedIdempotencyBinding(jb.id)},
+		removeJobDir: func(string) error {
+			return errors.New("injected remove failure")
+		},
+	}
+	s.jobs.Store(jb.id, jb)
+	s.purgeExpiredJobs(now)
+	if _, ok := s.jobs.Load(jb.id); !ok {
+		t.Fatal("job was removed from memory after filesystem deletion failed")
+	}
+	if s.idempotency["retry-key"] == nil {
+		t.Fatal("idempotency binding was removed after filesystem deletion failed")
+	}
+	if _, err := os.Stat(dir); err != nil {
+		t.Fatalf("job directory did not remain for retry: %v", err)
+	}
+
+	s.removeJobDir = nil
+	s.purgeExpiredJobs(now)
+	if _, ok := s.jobs.Load(jb.id); ok {
+		t.Fatal("job remained after retrying successful filesystem deletion")
+	}
+	if s.idempotency["retry-key"] != nil {
+		t.Fatal("idempotency binding remained after successful purge retry")
+	}
+}
+
+func TestJanitorStopsWithWorkerContextAndPurges(t *testing.T) {
+	now := time.Now().UTC()
+	dir := filepath.Join(t.TempDir(), "janitor")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	s := &server{
+		jobTTL: 20 * time.Millisecond, logger: slog.Default(), workerCtx: ctx,
+		idempotency: make(map[string]*idempotencyBinding),
+	}
+	jb := &job{
+		id: "janitor", dir: dir, createdAt: now.Add(-time.Second),
+		updatedAt: now.Add(-time.Second), finishedAt: now.Add(-time.Second),
+		status: jobSucceeded, done: true,
+	}
+	s.jobs.Store(jb.id, jb)
+	stopped := make(chan struct{})
+	go func() {
+		s.janitor()
+		close(stopped)
+	}()
+	deadline := time.After(time.Second)
+	for {
+		if _, ok := s.jobs.Load(jb.id); !ok {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("janitor did not purge expired job")
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+	cancel()
+	select {
+	case <-stopped:
+	case <-time.After(time.Second):
+		t.Fatal("janitor did not stop with its worker context")
+	}
+}
+
+func TestGracefulShutdownMarksUnreadyAndCancelsJobs(t *testing.T) {
+	s := &server{
+		logger: slog.Default(), shutdownGrace: time.Second,
+		cancelFns: make(map[string]context.CancelFunc),
+	}
+	s.ready.Store(true)
+	jobCanceled := make(chan struct{})
+	_, cancelJob := context.WithCancelCause(context.Background())
+	s.cancelFns["running"] = func() {
+		cancelJob(errors.New("shutdown"))
+		close(jobCanceled)
+	}
+	workersStopped := make(chan struct{})
+	s.stopWorkers = func() { close(workersStopped) }
+
+	s.gracefulShutdown(&http.Server{})
+	if s.ready.Load() {
+		t.Fatal("server remained ready during graceful shutdown")
+	}
+	select {
+	case <-jobCanceled:
+	default:
+		t.Fatal("graceful shutdown did not cancel running jobs")
+	}
+	select {
+	case <-workersStopped:
+	default:
+		t.Fatal("graceful shutdown did not stop workers")
+	}
+}
+
+func TestServerAgentLimitsAreAppliedToWorkflowOptions(t *testing.T) {
+	s := &server{agentMaxTokens: 2_500_000, maxRunTime: 90 * time.Minute}
+	deps, err := config.NewTranscriptionDeps("test", s.buildOptionsFromValues(nil)...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = deps.Cleanup() }()
+	if deps.AgentMaxTokens != 2_500_000 {
+		t.Fatalf("agent token limit = %d, want 2500000", deps.AgentMaxTokens)
+	}
+	if deps.AgentMaxWallTimeSeconds != 5_400 {
+		t.Fatalf("agent wall-time limit = %d, want 5400", deps.AgentMaxWallTimeSeconds)
+	}
+}
+
+func TestPublicErrorMessageExposesOnlyTypedBudgetError(t *testing.T) {
+	budgetErr := &workflow.RunBudgetError{
+		MinimumTokens: 1_100_000,
+		CandidateRuns: 2,
+		MaximumTokens: 1_000_000,
+	}
+	if got := publicErrorMessage(budgetErr); got != budgetErr.Error() {
+		t.Fatalf("budget error message = %q, want %q", got, budgetErr.Error())
+	}
+	if got := publicErrorMessage(errors.New("secret upstream response")); strings.Contains(got, "secret") {
+		t.Fatalf("untyped internal error leaked to client: %q", got)
+	}
+}
+
+func TestRandomIDFailuresAreReturnedByHTTPCallSites(t *testing.T) {
+	failure := errors.New("entropy unavailable")
+	s := &server{
+		logger: slog.Default(),
+		generateID: func(int) (string, error) {
+			return "", failure
+		},
+	}
+	s.ready.Store(true)
+
+	createRec := httptest.NewRecorder()
+	s.createJobHTTP(createRec, httptest.NewRequest(http.MethodPost, "/api/jobs", nil))
+	if createRec.Code != http.StatusInternalServerError {
+		t.Fatalf("job id failure status = %d, want 500", createRec.Code)
+	}
+
+	called := false
+	handler := s.withRequestID(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		called = true
+	}))
+	requestRec := httptest.NewRecorder()
+	handler.ServeHTTP(requestRec, httptest.NewRequest(http.MethodGet, "/", nil))
+	if requestRec.Code != http.StatusInternalServerError || called {
+		t.Fatalf("request id failure status=%d called=%v, want 500 and no downstream call", requestRec.Code, called)
 	}
 }
 

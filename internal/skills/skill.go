@@ -43,6 +43,9 @@ func (s Skill) candidatePlan(primaryModel, parakeetModel string) []config.Candid
 		if model == "" {
 			continue
 		}
+		if kind == "gemini" {
+			model = config.NormalizeGeminiModelName(model)
+		}
 		spec := config.CandidateSpec{Kind: kind, ModelName: model}
 		switch kind {
 		case "gemini":

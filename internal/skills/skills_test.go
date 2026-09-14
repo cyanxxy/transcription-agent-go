@@ -159,14 +159,43 @@ func TestStrategyPlanSentinels(t *testing.T) {
 	if len(plan) != 2 {
 		t.Fatalf("expected 2 specs, got %d: %#v", len(plan), plan)
 	}
-	if plan[0].ModelName != "gemini-3-flash-preview" {
-		t.Errorf("@model unresolved: %q", plan[0].ModelName)
+	if plan[0].ModelName != "gemini-3.8-flash" {
+		t.Errorf("@model was not normalized: %q", plan[0].ModelName)
 	}
 	if plan[1].ModelName == plan[0].ModelName || plan[1].ModelName == "" {
 		t.Errorf("@secondary-auto unresolved: %q", plan[1].ModelName)
 	}
-	if plan[0].CandidateID != "gemini_3_flash_preview" {
+	if plan[0].CandidateID != "gemini_3.8_flash" {
 		t.Errorf("@auto id wrong: %q", plan[0].CandidateID)
+	}
+}
+
+func TestStrategyPlanNormalizesExplicitGeminiAlias(t *testing.T) {
+	const strategySkill = `---
+name: alias-strategy
+description: Exercises an explicit legacy Gemini model in a custom strategy.
+metadata:
+  kind: strategy
+  strategies: alias_strategy
+  candidate_plan: "gemini|@auto|google-gla:gemini-3-flash-preview"
+---
+Use the configured strategy.
+`
+	root := t.TempDir()
+	writeSkill(t, root, "alias-strategy", strategySkill)
+	reg, err := Load(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, ok := reg.StrategyPlan("alias_strategy", "gemini-3.8-flash", "")
+	if !ok || len(plan) != 1 {
+		t.Fatalf("strategy plan not found: ok=%v plan=%#v", ok, plan)
+	}
+	if plan[0].ModelName != "gemini-3.8-flash" {
+		t.Fatalf("explicit model alias was not normalized: %#v", plan[0])
+	}
+	if plan[0].CandidateID != "gemini_3.8_flash" {
+		t.Fatalf("auto id was not based on normalized model: %#v", plan[0])
 	}
 }
 

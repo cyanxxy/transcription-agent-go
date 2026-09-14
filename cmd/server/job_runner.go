@@ -73,17 +73,25 @@ func (s *server) executeJob(workerID int, jb *job) {
 		_, _ = finalizeCanceledJob(jb, false, "job canceled before execution")
 		return
 	}
-	if status != jobRunning {
-		return
-	}
 	if startErr != nil {
-		_, _ = jb.transitionWithEventsFrom(
-			jobRunning,
+		// A rolled-back start leaves the job queued, so fail it from whatever
+		// status it actually holds instead of assuming it is running.
+		at := time.Now().UTC()
+		failed, _ := jb.transitionWithEventsFrom(
+			status,
 			jobFailed,
 			"could not persist job start",
-			time.Now().UTC(),
+			at,
 			jobEvent{name: "error-event", data: map[string]any{"message": "could not persist job start", "request_id": jb.request.RequestID}},
 		)
+		if !failed {
+			// The event journal is unusable, so terminate without the event:
+			// nothing re-enqueues or purges a job left queued.
+			_, _ = jb.transitionWithEventsFrom(status, jobFailed, "could not persist job start", at)
+		}
+		return
+	}
+	if status != jobRunning {
 		return
 	}
 	s.registerJob(jb.id, cancel)
@@ -109,7 +117,11 @@ func (s *server) executeJob(workerID int, jb *job) {
 		}
 	}()
 	obs.LoggerFrom(jobCtx).Debug("job started", "attempt", attempt)
-	runCtx, timeoutCancel := context.WithTimeout(jobCtx, 30*time.Minute)
+	maxRunTime := s.maxRunTime
+	if maxRunTime == 0 {
+		maxRunTime = defaultMaxRunTime
+	}
+	runCtx, timeoutCancel := context.WithTimeout(jobCtx, maxRunTime)
 	defer timeoutCancel()
 	progress := func(stage string, fraction float64) {
 		if err := jb.push("progress", map[string]any{"stage": stage, "fraction": fraction}); err != nil {

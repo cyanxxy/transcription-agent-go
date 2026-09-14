@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -496,6 +497,174 @@ func TestParakeetAlignRejectsContentMutation(t *testing.T) {
 	original := []models.TranscriptSegment{seg("[00:00:00]", "Alice", "original")}
 	if _, err := sidecar.Align(context.Background(), "audio.wav", original); err == nil {
 		t.Fatal("expected alignment content mutation to be rejected")
+	}
+}
+
+func TestParseCommandArgsSupportsQuotesEscapesAndEmptyArguments(t *testing.T) {
+	command := `"/tmp/sidecar tools/python" --model 'nemo model' plain\ value prefix" suffix" "" --pattern "\\d+"`
+	got, err := parseCommandArgs(command)
+	if err != nil {
+		t.Fatalf("parseCommandArgs: %v", err)
+	}
+	want := []string{"/tmp/sidecar tools/python", "--model", "nemo model", "plain value", "prefix suffix", "", "--pattern", `\d+`}
+	if len(got) != len(want) {
+		t.Fatalf("parseCommandArgs(%q) = %#v, want %#v", command, got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("argument %d = %q, want %q", i, got[i], want[i])
+		}
+	}
+}
+
+func TestParseCommandArgsRejectsMalformedQuotes(t *testing.T) {
+	for _, command := range []string{`sidecar "unterminated`, `sidecar 'unterminated`, `sidecar trailing\`} {
+		if _, err := parseCommandArgs(command); err == nil {
+			t.Errorf("parseCommandArgs(%q) succeeded, want error", command)
+		}
+	}
+}
+
+func TestParakeetCommandSupportsQuotedExecutableAndArgument(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "sidecar scripts")
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	script := filepath.Join(dir, "parakeet sidecar.sh")
+	body := `#!/bin/sh
+if [ "$1" != "--model" ] || [ "$2" != "nemo model" ]; then
+  printf '%s' '{"error":"unexpected arguments"}'
+  exit 0
+fi
+printf '%s' '{"segments":[{"timestamp":"[00:00:01]","speaker":"Alice","text":"original"}]}'
+`
+	if err := os.WriteFile(script, []byte(body), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	sidecar := &ParakeetSidecar{
+		Command: fmt.Sprintf("%q --model %q", script, "nemo model"),
+		Model:   "test",
+	}
+	original := []models.TranscriptSegment{seg("[00:00:00]", "Alice", "original")}
+	aligned, err := sidecar.Align(context.Background(), "audio.wav", original)
+	if err != nil {
+		t.Fatalf("Align: %v", err)
+	}
+	if got, want := aligned[0].Timestamp, "[00:00:01]"; got != want {
+		t.Fatalf("aligned timestamp = %q, want %q", got, want)
+	}
+}
+
+func TestParakeetTranscribeGroupsWordsFromQuotedPathSidecar(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "quoted sidecar")
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	script := filepath.Join(dir, "transcribe words.sh")
+	body := `#!/bin/sh
+if [ "$1" != "--model" ] || [ "$2" != "nemo model" ]; then
+  printf '%s' '{"error":"unexpected arguments"}'
+  exit 0
+fi
+printf '%s' '{"words":[{"word":"Hello","start":1.2,"end":1.5},{"word":",","start":1.5,"end":1.6},{"word":"world","start":1.6,"end":2.0},{"word":"Again","start":3.5,"end":3.8},{"word":"!","start":3.8,"end":3.9}]}'
+`
+	if err := os.WriteFile(script, []byte(body), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	sidecar := &ParakeetSidecar{
+		Command: fmt.Sprintf("%q --model %q", script, "nemo model"),
+		Model:   "test",
+	}
+	segments, err := sidecar.Transcribe(context.Background(), "audio.wav", []string{"Alice"})
+	if err != nil {
+		t.Fatalf("Transcribe: %v", err)
+	}
+	want := []models.TranscriptSegment{
+		{Timestamp: "[00:00:01]", Speaker: "Alice", Text: "Hello, world"},
+		{Timestamp: "[00:00:03]", Speaker: "Alice", Text: "Again!"},
+	}
+	if len(segments) != len(want) {
+		t.Fatalf("Transcribe returned %#v, want %#v", segments, want)
+	}
+	for i := range want {
+		if segments[i].Timestamp != want[i].Timestamp || segments[i].Speaker != want[i].Speaker || segments[i].Text != want[i].Text {
+			t.Errorf("segment %d = %#v, want %#v", i, segments[i], want[i])
+		}
+	}
+}
+
+func TestTranscriptionAgentRunUsesUploadedFileAndOffsetsChunk(t *testing.T) {
+	requests := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		if r.URL.Path != "/v1beta/interactions" {
+			t.Errorf("interaction path = %q, want /v1beta/interactions", r.URL.Path)
+			http.Error(w, "unexpected path", http.StatusNotFound)
+			return
+		}
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Errorf("decode request: %v", err)
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		input, ok := body["input"].([]any)
+		if !ok || len(input) != 2 {
+			t.Errorf("interaction input = %#v, want text and audio", body["input"])
+		} else {
+			audio, _ := input[1].(map[string]any)
+			if got, want := audio["uri"], "https://files.example/chunk"; got != want {
+				t.Errorf("audio URI = %#v, want %q", got, want)
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(gemini.Interaction{
+			ID:     "transcription_interaction",
+			Status: "completed",
+			Steps: []gemini.InteractionStep{{
+				Type: "model_output",
+				Content: []gemini.InteractionContent{{
+					Type: "text",
+					Text: `{"segments":[{"timestamp":"[00:00:02]","speaker":"Alice","text":"Chunk text."}]}`,
+				}},
+			}},
+		})
+	}))
+	defer srv.Close()
+
+	deps, err := config.NewTranscriptionDeps("test-key", config.WithCandidateStrategy("single_gemini"), config.WithModelName("gemini-3.8-flash"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer deps.Cleanup()
+	agent := NewTranscriptionAgent(deps, gemini.NewClient("test-key").WithEndpoint(srv.URL))
+	segments, err := agent.Run(testContext(t), TranscribeInput{
+		AudioPath: "chunk.wav",
+		ChunkInfo: &ChunkInfo{
+			Index:      1,
+			StartMS:    65_000,
+			EndMS:      70_000,
+			DurationMS: 5_000,
+		},
+		UploadedFile: &gemini.FileInfo{
+			Name:     "files/uploaded",
+			URI:      "https://files.example/chunk",
+			MIMEType: "audio/wav",
+			State:    "ACTIVE",
+		},
+		AudioDurationSeconds: 5,
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if requests != 1 {
+		t.Fatalf("Run made %d requests, want only the interaction request", requests)
+	}
+	if len(segments) != 1 {
+		t.Fatalf("Run returned %#v, want one segment", segments)
+	}
+	if got, want := segments[0].Timestamp, "[00:01:07]"; got != want {
+		t.Fatalf("offset timestamp = %q, want %q", got, want)
 	}
 }
 

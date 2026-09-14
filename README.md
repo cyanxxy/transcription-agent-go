@@ -2,23 +2,27 @@
 
 # Transcription Agent
 
-**Durable, evidence-driven audio transcription in Go with bounded Gemini agents.**
+**Audio transcription in Go with Gemini, Meta, and Microsoft, durable jobs, and optional Gemini review agents.**
 
 [![CI](https://github.com/cyanxxy/transcription-agent-go/actions/workflows/ci.yml/badge.svg)](https://github.com/cyanxxy/transcription-agent-go/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/cyanxxy/transcription-agent-go)](https://github.com/cyanxxy/transcription-agent-go/releases/latest)
-[![Go](https://img.shields.io/badge/Go-1.25%2B-00ADD8?logo=go&logoColor=white)](go.mod)
+[![Go](https://img.shields.io/badge/Go-1.26%2B-00ADD8?logo=go&logoColor=white)](go.mod)
 [![Go Reference](https://pkg.go.dev/badge/github.com/cyanxxy/transcription-agent-go.svg)](https://pkg.go.dev/github.com/cyanxxy/transcription-agent-go)
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 
 </div>
 
 Transcription Agent turns audio into clean, speaker-labeled, timestamped
-transcripts. An adaptive runtime starts with a primary **Google Gemini**
-candidate, evaluates uncertainty, gathers independent evidence only when
-needed, and lets a bounded **judge agent** select or merge supported wording.
-Every span records candidate attempts, decisions, budgets, provenance, and
-human-review state. The HTTP service persists accepted jobs and SSE events so
-restarts do not erase queued work.
+transcripts. By default, **Gemini 3.5 Transcribe** converts audio directly into
+speaker-labeled, timestamped text. Each chunk needs one transcription request;
+there are no judge calls, extra candidates, skill routing, or global reviews.
+Long recordings are split at silence boundaries and transcribed concurrently.
+The HTTP service persists accepted jobs and SSE events across restarts.
+
+**Meta Muse Voice Transcribe** and **Microsoft MAI-Transcribe-2** are also
+available in the model menu and CLI. Both use direct transcription with native
+speaker labels and timestamps, without a judge. General-purpose Gemini models
+remain available with the optional evidence and judge pipeline described below.
 
 <p align="center">
   <img src="docs/ui.png" alt="Transcription Studio web interface" width="1120" />
@@ -38,6 +42,7 @@ restarts do not erase queued work.
 - [Architecture](#architecture)
 - [HTTP API](#http-api)
 - [Configuration](#configuration)
+- [Meta and Microsoft transcription](#meta-and-microsoft-transcription)
 - [CLI](#cli)
 - [Agent Skills](#agent-skills)
 - [Production safeguards](#production-safeguards)
@@ -48,6 +53,16 @@ restarts do not erase queued work.
 - [License](#license)
 
 ## Features
+
+- **Direct speech transcription by default.** Gemini 3.5 Transcribe supplies
+  word timestamps and speaker labels; the app assembles utterances and exports
+  TXT, SRT, or JSON. Its UI shows only relevant transcription settings.
+- **Three speech providers.** Choose Gemini Transcribe, Meta Muse Voice
+  Transcribe, or Microsoft MAI-Transcribe-2. Provider credentials stay on the
+  server; each direct model bypasses judging and agent loops.
+
+The evidence, judge, and skill features apply to general-purpose Gemini models.
+The web UI, durable jobs, chunking, and exports support all providers.
 
 - **Adaptive evidence loop.** Candidate strategies are ceilings, not eager
   fan-out plans. Deterministic evaluators decide when to run independent
@@ -79,13 +94,12 @@ restarts do not erase queued work.
 - **Race-safe control plane.** A legal job-state machine linearizes start,
   cancellation, completion, review, expiry, and shutdown recovery. Terminal
   review-expiry events remain replayable before retention cleanup.
-- **Minimal footprint.** Standard library + `gopkg.in/yaml.v3`; an external
+- **Minimal footprint.** Standard library + `go.yaml.in/yaml/v3`; an external
   `ffmpeg`/`ffprobe` for audio inspection.
 
 ## Quickstart
 
-**Requirements:** Go 1.25+, `ffmpeg` & `ffprobe` on `$PATH`, and a Gemini API
-key.
+**Requirements:** Go 1.26+, `ffmpeg` & `ffprobe` on `$PATH`, and credentials for your selected transcription provider.
 
 ```bash
 git clone https://github.com/cyanxxy/transcription-agent-go.git
@@ -105,12 +119,28 @@ export GEMINI_API_KEY=...
 
 ### Credentials
 
-`GEMINI_API_KEY` is a server-side credential and is never entered into the web
-UI. Set it in the server environment or pass `--api-key`. The UI's **Server
-access token** field is only for the optional bearer token configured through
-`API_AUTH_TOKEN` or `--auth-token`; it is sent to this service, not to Gemini.
+Set credentials for the providers you want to use in the server environment:
+
+| Provider | Required configuration |
+|---|---|
+| Gemini | `GEMINI_API_KEY` (or `--api-key`) |
+| Meta | `META_API_KEY` |
+| Microsoft | `AZURE_SPEECH_KEY` and `AZURE_SPEECH_ENDPOINT` |
+
+Provider keys are never entered into the web UI. The UI's **Server access
+token** field is only for the optional bearer token configured through
+`API_AUTH_TOKEN` or `--auth-token`; it authenticates to this app, not a model
+provider. Restart the server after changing its environment. See
+[Meta and Microsoft transcription](#meta-and-microsoft-transcription) for setup
+and provider-specific limits. If you configure only Meta or Microsoft, select
+that model explicitly; the default remains Gemini 3.5 Transcribe.
 
 ## Architecture
+
+Direct path: upload → chunk if needed → selected speech provider → merge → export.
+Gemini 3.5 Transcribe is the default; Meta and Microsoft use the same direct path.
+Their audio is converted to WAV and uploaded directly to the selected provider.
+The following architecture applies when selecting a general-purpose model.
 
 ```text
 durable job + context
@@ -154,12 +184,25 @@ durable job + context
 `POST /api/jobs` accepts `Idempotency-Key`; retries with the same key return the
 original job. SSE events have monotonic IDs and resume from `Last-Event-ID` or
 `?after=N`. The web UI supports bearer auth, cancellation, review actions, and
-an evidence view alongside transcript, SRT, JSON, judge, and quality tabs.
+transcript, SRT, and JSON tabs. General-purpose Gemini runs also expose
+evidence, judge, and quality tabs.
 Human-review responses include a deadline; expiration emits a terminal
 `expired` event that remains available for one retention window.
 Long files use the adaptive
 silence-aware chunk planner by default; the JSON result includes the actual
 chunk plan (`metadata.chunks`) with boundary type and confidence.
+
+To select a provider programmatically, send its model ID with the audio:
+
+```bash
+curl --fail-with-body http://localhost:8080/api/jobs \
+  -F 'audio=@meeting.m4a' \
+  -F 'model_name=muse-voice-transcribe-1.0'
+```
+
+Use `model_name=MAI-Transcribe-2` for Microsoft. If server authentication is
+configured, also send `Authorization: Bearer <server-access-token>`. Provider
+keys belong in the server environment, not in the request.
 
 ## Configuration
 
@@ -168,7 +211,10 @@ chunk plan (`metadata.chunks`) with boundary type and confidence.
 | Flag                 | Env                        | Default             | Purpose |
 |----------------------|----------------------------|---------------------|---------|
 | `--addr`             | `HTTP_ADDR`                | `:8080`             | Listen address |
-| `--api-key`          | `GEMINI_API_KEY`           | — (required)        | Gemini API key |
+| `--api-key`          | `GEMINI_API_KEY`           | — (for Gemini)      | Gemini API key |
+| —                    | `META_API_KEY`             | — (for Meta)        | Meta Model API key |
+| —                    | `AZURE_SPEECH_KEY`         | — (for Microsoft)   | Azure Speech resource key |
+| —                    | `AZURE_SPEECH_ENDPOINT`    | — (for Microsoft)   | HTTPS Speech resource origin |
 | `--auth-token`       | `API_AUTH_TOKEN`           | —                   | Optional `Bearer` token required to `POST /api/jobs` |
 | `--skills-dir`       | `SKILLS_DIR`               | `.skills`           | Directory of skill packs |
 | `--skill-router`     | `SKILL_ROUTER`             | `false`             | Let the model auto-select a format skill when none is given |
@@ -177,6 +223,8 @@ chunk plan (`metadata.chunks`) with boundary type and confidence.
 | `--max-upload-bytes` | `MAX_UPLOAD_BYTES`         | `209715200` (200 MiB) | Reject larger uploads |
 | `--max-concurrency`  | `MAX_CONCURRENCY`          | `4`                 | Cap on simultaneous jobs |
 | `--max-queued`       | `MAX_QUEUED`               | `12`                | Cap on accepted jobs waiting for a worker |
+| `--agent-max-tokens` | `AGENT_MAX_TOKENS`         | `1000000`           | Hard total Gemini-token budget for each run |
+| `--max-run-time`     | `MAX_RUN_TIME`             | `30m`               | Wall-clock deadline for each transcription run |
 | `--job-dir`          | `JOB_DIR`                  | `./data/jobs`       | Persistent job journal and staged audio |
 | `--job-ttl`          | `JOB_TTL`                  | `30m`               | Retention for completed jobs and deadline for human review |
 | `--shutdown-grace`   | `SHUTDOWN_GRACE`           | `30s`               | Drain period after SIGINT/SIGTERM |
@@ -184,13 +232,95 @@ chunk plan (`metadata.chunks`) with boundary type and confidence.
 | —                    | `LOG_LEVEL`                | `info`              | `debug` / `info` / `warn` / `error` |
 | —                    | `LOG_FORMAT`               | `json`              | `json` or `text` |
 
-**Models** (`--model`, `--judge-model`): `gemini-3.5-flash` (primary and judge
-default), `gemini-3.1-flash-lite`, and the preview compatibility model
-`gemini-3-flash-preview`.
-**Strategies** (`--strategy`): `single_gemini`, `dual_gemini`,
-`gemini_plus_parakeet`.
-**Service tiers** (`--service-tier`): `standard`, `flex`, `priority`.
-**Thinking levels:** `minimal`, `low`, `medium`, `high`.
+### Models and pipeline controls
+
+For the CLI, select models with `--model` and `--judge-model`. The HTTP API
+uses `model_name` and `judge_model_name` multipart fields.
+
+| Model ID | Provider | Pipeline | Availability |
+|---|---|---|---|
+| `gemini-3.5-transcribe` | Google | Direct speech; primary default | Web, CLI, API |
+| `muse-voice-transcribe-1.0` | Meta | Direct speech | Web, CLI, API |
+| `MAI-Transcribe-2` | Microsoft | Direct speech | Web, CLI, API |
+| `gemini-3.8-flash` | Google | General-purpose transcription; judge default | Web, CLI, API |
+| `gemini-3.1-flash-lite` | Google | General-purpose transcription | CLI, API; secondary candidate |
+
+`gemini-3.1-flash-lite` remains available through the CLI/API and supplies the
+secondary candidate for dual-Gemini runs. Gemini 3.5 Flash, 3.5 Flash-Lite,
+and 3.6 Flash are no longer accepted. The legacy `gemini-3-flash-preview` alias
+resolves to `gemini-3.8-flash`.
+
+Gemini 3.8 Flash uses the beta Interactions endpoint and supports `low`,
+`medium`, and `high` thinking levels; `minimal` is not supported.
+See the [model documentation](https://ai.google.dev/gemini-api/docs/models/gemini-3.8-flash).
+
+**Strategies** (`--strategy` in the CLI, `candidate_strategy` in the API):
+`single_gemini`, `dual_gemini`, `gemini_plus_parakeet` for general-purpose
+Gemini workflows. Direct models override candidate and judge settings:
+Gemini Transcribe reports `single_gemini`; Meta and Microsoft report
+`single_speech`. No strategy selection is needed for direct transcription.
+
+**Service tiers** (`--service-tier` in the CLI, `service_tier` in the API):
+`standard`, `flex`, `priority`.
+
+**Thinking levels:** `low`, `medium`, `high` for Gemini 3.8 Flash.
+Gemini 3.1 Flash-Lite also supports `minimal`. Direct speech models do not use
+thinking, service-tier selection, skills, or judge/global-review controls.
+
+**Gemini 3.5 Transcribe:** Uses the Interactions `v1beta` endpoint with verbatim
+transcription, speaker diarization, and word timestamps. Word annotations are
+grouped into timestamped utterances for transcript, SRT, and JSON export.
+This model always runs directly: judge, multi-candidate, agent, skill-router,
+and global-review flags are ignored. Local filler removal remains optional. Chunk duration is limited to 30 minutes (29.5 minutes with adaptive
+chunking, allowing for silence-boundary adjustments). The default remains two
+minutes. Transcribe requests always use Standard service; the selected service
+tier and thinking level apply only when a general-purpose model is selected. Free-form prompts, previous transcript context, and
+format skills are not sent to this audio-only model. Custom vocabulary and Smart
+mode are not enabled because they conflict with timestamps/diarization. Speaker
+labels are local to each chunk; speaker identity across chunks is not guaranteed.
+See Google's [transcription guide](https://ai.google.dev/gemini-api/docs/transcribe)
+and [model limitations](https://ai.google.dev/gemini-api/docs/models/gemini-3.5-transcribe)
+(checked September 14, 2026).
+
+## Meta and Microsoft transcription
+
+Both providers run directly, with speaker labels and timestamps, without a
+judge, second candidate, skill router, or global review. Gemini 3.5 Transcribe
+remains the default. Select a provider in the web model menu or with CLI `--model`.
+
+| Model | Server/CLI environment variables | API |
+|---|---|---|
+| Meta Muse Voice Transcribe (`muse-voice-transcribe-1.0`) | `META_API_KEY` | Meta file transcription, `/v1/asr/transcribe` |
+| Microsoft MAI-Transcribe-2 (`MAI-Transcribe-2`) | `AZURE_SPEECH_KEY`, `AZURE_SPEECH_ENDPOINT` | Azure Fast Transcription with MAI enhanced mode |
+
+For Microsoft, set the endpoint to your Speech resource origin, such as
+`https://your-resource.cognitiveservices.azure.com`, without an API path or query.
+The resource must support MAI-Transcribe-2. Keys are read by the server process;
+restart it after setting them. They are not submitted by the browser or saved
+in job forms. A Gemini key is unnecessary when using only these providers.
+Missing provider configuration is rejected before a job is queued.
+
+```bash
+# After setting META_API_KEY in your environment:
+./bin/transcriber-cli --model muse-voice-transcribe-1.0 -i meeting.m4a
+
+# After setting AZURE_SPEECH_KEY and AZURE_SPEECH_ENDPOINT:
+./bin/transcriber-cli --model MAI-Transcribe-2 -i meeting.m4a
+```
+
+Input audio is converted to mono 24 kHz, 16-bit WAV. Meta uses DIARIZATION mode
+and returns turn-level timestamps; Microsoft requests diarization and segment
+timestamps with verbatim text. Long recordings use the existing chunk pipeline.
+Meta permits at most 10 minutes / 32 MiB per request: fixed chunks may be up to
+600,000 ms and adaptive chunks up to 570,000 ms, allowing 30 seconds for silence
+boundary adjustment. The default 120-second chunks work for both providers.
+Microsoft's WAV request limit is 300 MiB. Rate limits and server errors retry
+up to twice with cancellable delays. Chunk speaker labels are local to each
+request; matching labels across chunks does not establish speaker identity.
+
+Implementation references, checked September 14, 2026:
+[Meta's official file transcription recipe](https://github.com/meta-models/meta-model-cookbook/tree/main/06_muse_voice/01_voice_api_fundamentals)
+and [Microsoft MAI-Transcribe-2 documentation](https://learn.microsoft.com/en-us/azure/ai-services/speech-service/mai-transcribe).
 
 ## CLI
 
@@ -198,9 +328,7 @@ default), `gemini-3.1-flash-lite`, and the preview compatibility model
 ./bin/transcriber-cli \
   --api-key "$GEMINI_API_KEY" \
   -i meeting.m4a \
-  --model gemini-3.5-flash \
-  --strategy dual_gemini \
-  --service-tier flex \
+  --model gemini-3.5-transcribe \
   --chunk-strategy adaptive \
   --chunk-concurrency 3 \
   --format srt \
@@ -209,15 +337,19 @@ default), `gemini-3.1-flash-lite`, and the preview compatibility model
 
 The rendered transcript goes to stdout unless `-o` is given; progress logs go to
 stderr (text by default — set `LOG_FORMAT=json` for machine output).
-`SIGINT`/`SIGTERM` cancel a run cleanly. Agent mode is enabled by default; use
-`--agentic=false` only for the fixed compatibility pipeline. Use
-`--service-tier flex` for
-latency-tolerant lower-cost runs or `priority` for higher-reliability paid-tier
-workloads, and `--chunk-concurrency 1` for strictly sequential chunk context.
+`SIGINT`/`SIGTERM` cancel a run cleanly. Direct speech models always disable
+agent mode. With a general-purpose Gemini model, agent mode is enabled by
+default; `--agentic=false` selects the fixed compatibility pipeline.
+`--service-tier` affects general-purpose Gemini requests only.
+
+Use `--chunk-concurrency 1` to process chunks sequentially. `--max-run-time`
+sets the wall-clock deadline for every provider (default 30 minutes).
+`--agent-max-tokens` controls the Gemini token budget (default 1,000,000);
+Meta and Microsoft requests do not consume that budget.
 
 ## Agent Skills
 
-The pipeline supports [Agent Skills](https://agentskills.io)-style capability
+General-purpose Gemini workflows support [Agent Skills](https://agentskills.io)-style capability
 packs. A skill is a directory under `.skills/` containing a `SKILL.md` (YAML
 frontmatter + Markdown body) plus optional bundled resources. Skills load at
 startup; transcription-specific routing lives under the manifest's `metadata`
@@ -300,7 +432,15 @@ environment.
 
 ```bash
 make docker
-docker run --rm -p 8080:8080 -e GEMINI_API_KEY=... transcription-agent:dev
+# Pass the credentials already set in your shell:
+docker run --rm -p 8080:8080 -e GEMINI_API_KEY transcription-agent:dev
+
+# Meta-only server (select Meta in the model menu):
+docker run --rm -p 8080:8080 -e META_API_KEY transcription-agent:dev
+
+# Microsoft-only server (select Microsoft in the model menu):
+docker run --rm -p 8080:8080 \
+  -e AZURE_SPEECH_KEY -e AZURE_SPEECH_ENDPOINT transcription-agent:dev
 ```
 
 Mount `/app/data/jobs` to retain accepted jobs across container replacement.
@@ -310,10 +450,10 @@ signal forwarding, and defines a `HEALTHCHECK` against `/healthz`.
 
 ## Deployment checklist
 
-- [ ] **Secrets** — provide `GEMINI_API_KEY` via a secret store, never baked into
+- [ ] **Secrets** — provide the selected providers' keys via a secret store, never baked into
       an image or echoed to logs (the logger redacts it, but treat it as
       sensitive).
-- [ ] **Protect job creation** — `POST /api/jobs` spends Gemini quota. Front it
+- [ ] **Protect job creation** — `POST /api/jobs` spends the selected provider's quota. Front it
       with proxy auth or set `--auth-token`/`API_AUTH_TOKEN` (clients then send
       `Authorization: Bearer <token>`). With a token set, drive the API
       programmatically or enter the token in the bundled UI. With no token the
@@ -342,8 +482,9 @@ make cover       # coverage profile + total
 make lint        # golangci-lint v2 (falls back to go vet if not installed)
 ```
 
-CI (`.github/workflows/ci.yml`) runs `gofmt`, `go vet`, `golangci-lint`, the
-race-enabled test suite, a build of both binaries, and a server smoke test. The
+CI (`.github/workflows/ci.yml`) runs `gofmt`, `go vet`, `golangci-lint`,
+`govulncheck`, the race-enabled test suite, a build of both binaries, and a
+server smoke test. The
 suites cover durable recovery, admission before body parsing, idempotency,
 cancellation/start races, late cancellation, concurrent review, expiry replay,
 shutdown recovery, exact span provenance, legal state transitions, atomic
@@ -355,13 +496,20 @@ end-to-end, chunk planning and overlap
 de-duplication, timestamp parsing/alignment, quality scoring, the skills engine
 (parsing, validation, selection, path-traversal rejection, the router), and the
 HTTP server (health/readiness, security headers, auth gate, SSE lifecycle,
-graceful-shutdown cancellation).
+graceful-shutdown cancellation). Meta and Microsoft tests cover multipart
+requests, authentication headers, model options, timestamp ordering, missing
+credentials, error redaction, and cancellation during rate-limit backoff.
+End-to-end tests convert short and chunked audio through mocked provider APIs
+and verify chunk offsets and the absence of Gemini or judge calls. Live provider
+access and transcription quality require separate tests with valid credentials.
 
 ## Project layout
 
 | Area                        | Location                                       |
 |-----------------------------|------------------------------------------------|
 | Adaptive workflow runtime   | `internal/workflow/workflow.go`                |
+| Meta / Microsoft adapters   | `internal/agents/speech.go`                    |
+| Gemini word-to-turn parser   | `internal/agents/transcribe.go`                |
 | Transcription agent         | `internal/agents/transcription.go`             |
 | Judge agent (+ tools)       | `internal/agents/judge.go`, `judge_tools.go`   |
 | Global review router        | `internal/agents/review.go`                    |
@@ -379,6 +527,12 @@ graceful-shutdown cancellation).
 | CLI                         | `cmd/cli`                                       |
 
 ### Implementation notes
+
+The Gemini integration remains a Go REST client rather than an SDK dependency.
+It now handles current Interactions error diagnostics, queued status, and UTF-8
+byte ranges on word annotations. Transcribe continues to use `store=false`.
+
+The judge and tool-loop notes below apply to general-purpose Gemini workflows.
 
 - The judge runs a **bounded Interactions tool loop** — it may call
   `quality_metrics`, `timestamp_analysis`, `candidate_diff`, and
@@ -404,7 +558,9 @@ graceful-shutdown cancellation).
   (`internal/agents/timestamp.go`; reference `tools/parakeet_sidecar.py`). Without
   one, `gemini_plus_parakeet` still runs. Alignment is accepted only when the
   segment count, text, speakers, and confidence are unchanged; only validated
-  timestamps can be copied onto the judged transcript.
+  timestamps can be copied onto the judged transcript. The command is parsed
+  as shell-style words without invoking a shell, so quote executable paths and
+  arguments containing spaces; shell expansion and pipelines are not supported.
 
 ## License
 

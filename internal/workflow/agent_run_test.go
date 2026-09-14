@@ -39,6 +39,11 @@ func TestValidateCandidateSpecsRejectsDuplicateAndUnknownKinds(t *testing.T) {
 	if err := validateCandidateSpecs([]config.CandidateSpec{{CandidateID: "x", Kind: "mystery"}}); err == nil {
 		t.Fatal("unknown candidate kind was accepted")
 	}
+	if err := validateCandidateSpecs([]config.CandidateSpec{{
+		CandidateID: "typo", Kind: "gemini", ModelName: "gemini-does-not-exist",
+	}}); err == nil {
+		t.Fatal("unsupported Gemini model was accepted")
+	}
 }
 
 func TestProvenanceEvidenceUsesExactSpanAttempts(t *testing.T) {
@@ -70,6 +75,21 @@ func TestInteractionBudgetReservesBeforeWork(t *testing.T) {
 	}
 	if recorder.run.Budget.InteractionRequestsUsed != 1 || recorder.run.Budget.ToolCallsUsed != 0 {
 		t.Fatalf("rejected reservations mutated usage: %#v", recorder.run.Budget)
+	}
+}
+
+func TestRunRecorderUsesConfiguredWallTime(t *testing.T) {
+	deps, err := config.NewTranscriptionDeps(
+		"key",
+		config.WithTempDir(t.TempDir()),
+		config.WithAgentMaxWallTimeSeconds(7200),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorder := newRunRecorder(deps, deps.ResolveCandidateSpecs(), 1)
+	if got := recorder.run.Budget.MaxWallTimeSeconds; got != 7200 {
+		t.Fatalf("max wall time = %d, want 7200", got)
 	}
 }
 

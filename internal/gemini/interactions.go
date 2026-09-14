@@ -15,8 +15,10 @@ import (
 	"github.com/cyanxxy/transcription-agent-go/internal/obs"
 )
 
-// InteractionRequest is the REST body for POST /v1/interactions. Preview-only
-// inference tiers are routed through v1beta until they appear in the v1 schema.
+// InteractionRequest is the REST body for POST /{api_version}/interactions.
+// Models and features absent from the v1 schema use v1beta, including
+// Gemini 3.8 Flash and Gemini 3.5 Transcribe. Schema checked 2026-09-14:
+// https://ai.google.dev/static/api/interactions.openapi.json
 // Store is a pointer because omitting it selects the API default (true).
 type InteractionRequest struct {
 	Model                 string                       `json:"model"`
@@ -47,9 +49,33 @@ type InteractionTool struct {
 // InteractionGenerationConfig contains generation controls supported by the
 // Interactions API. Response formatting belongs at the request top level.
 type InteractionGenerationConfig struct {
-	MaxOutputTokens int    `json:"max_output_tokens,omitempty"`
-	ThinkingLevel   string `json:"thinking_level,omitempty"`
-	ToolChoice      any    `json:"tool_choice,omitempty"`
+	TranscriptionConfig *TranscriptionConfig `json:"transcription_config,omitempty"`
+	MaxOutputTokens     int                  `json:"max_output_tokens,omitempty"`
+	ThinkingLevel       string               `json:"thinking_level,omitempty"`
+	ToolChoice          any                  `json:"tool_choice,omitempty"`
+}
+
+// TranscriptionConfig configures the dedicated speech model. Timestamps and
+// diarization require verbatim mode and cannot be combined with vocabulary biasing.
+type TranscriptionConfig struct {
+	Mode TranscriptionMode `json:"mode"`
+}
+
+type TranscriptionMode struct {
+	Type                   string   `json:"type"`
+	DiarizationMode        string   `json:"diarization_mode,omitempty"`
+	TimestampGranularities []string `json:"timestamp_granularities,omitempty"`
+}
+
+// WordInfo preserves the provider's word-level speaker and duration annotations.
+type WordInfo struct {
+	StartIndex  *int   `json:"start_index,omitempty"`
+	EndIndex    *int   `json:"end_index,omitempty"`
+	Type        string `json:"type"`
+	Text        string `json:"text,omitempty"`
+	Speaker     string `json:"speaker,omitempty"`
+	StartOffset string `json:"start_offset,omitempty"`
+	EndOffset   string `json:"end_offset,omitempty"`
 }
 
 // InteractionResponseFormat requests text, optionally constrained by JSON Schema.
@@ -61,11 +87,12 @@ type InteractionResponseFormat struct {
 
 // InteractionContent is a content block inside user_input or model_output.
 type InteractionContent struct {
-	Type     string `json:"type"`
-	Text     string `json:"text,omitempty"`
-	URI      string `json:"uri,omitempty"`
-	MIMEType string `json:"mime_type,omitempty"`
-	Data     string `json:"data,omitempty"`
+	Annotations []WordInfo `json:"annotations,omitempty"`
+	Type        string     `json:"type"`
+	Text        string     `json:"text,omitempty"`
+	URI         string     `json:"uri,omitempty"`
+	MIMEType    string     `json:"mime_type,omitempty"`
+	Data        string     `json:"data,omitempty"`
 }
 
 // InteractionStep is one typed entry in an interaction timeline. Model steps
@@ -148,20 +175,61 @@ type InteractionUsage struct {
 
 // Interaction is the typed response returned by the Interactions API.
 type Interaction struct {
-	ID                    string            `json:"id"`
-	Model                 string            `json:"model,omitempty"`
-	Status                string            `json:"status"`
-	ServiceTier           string            `json:"service_tier,omitempty"`
-	PreviousInteractionID string            `json:"previous_interaction_id,omitempty"`
-	Steps                 []InteractionStep `json:"steps,omitempty"`
-	Usage                 *InteractionUsage `json:"usage,omitempty"`
+	Errors                []InteractionError `json:"errors,omitempty"`
+	ID                    string             `json:"id"`
+	Model                 string             `json:"model,omitempty"`
+	Status                string             `json:"status"`
+	ServiceTier           string             `json:"service_tier,omitempty"`
+	PreviousInteractionID string             `json:"previous_interaction_id,omitempty"`
+	Steps                 []InteractionStep  `json:"steps,omitempty"`
+	Usage                 *InteractionUsage  `json:"usage,omitempty"`
 }
 
-// Text returns text from the last model_output step containing text.
+// InteractionError is a diagnostic returned in the current Interactions schema.
+// Code is an error-type URI, not an HTTP status number.
+type InteractionError struct {
+	Code    string `json:"code,omitempty"`
+	Message string `json:"message,omitempty"`
+}
+
+// Text returns the final consecutive run of text content, matching the Gemini
+// SDK output_text helper: earlier text separated by non-text content or steps
+// is excluded. When that run is empty it falls back to the last model_output
+// step carrying any text. Callers treat empty text as unparseable output and
+// silently degrade, so a trailing thought step or non-text content block must
+// not erase an answer the model actually produced.
 func (i *Interaction) Text() string {
 	if i == nil {
 		return ""
 	}
+	if text := i.trailingTextRun(); text != "" {
+		return text
+	}
+	return i.lastModelOutputText()
+}
+
+func (i *Interaction) trailingTextRun() string {
+	segments := make([]string, 0)
+	for index := len(i.Steps) - 1; index >= 0; index-- {
+		step := i.Steps[index]
+		if step.Type != "model_output" {
+			break
+		}
+		if len(step.Content) == 0 {
+			break
+		}
+		for contentIndex := len(step.Content) - 1; contentIndex >= 0; contentIndex-- {
+			content := step.Content[contentIndex]
+			if content.Type != "text" {
+				return joinReversedTextSegments(segments)
+			}
+			segments = append(segments, content.Text)
+		}
+	}
+	return joinReversedTextSegments(segments)
+}
+
+func (i *Interaction) lastModelOutputText() string {
 	for index := len(i.Steps) - 1; index >= 0; index-- {
 		step := i.Steps[index]
 		if step.Type != "model_output" {
@@ -178,6 +246,14 @@ func (i *Interaction) Text() string {
 		}
 	}
 	return ""
+}
+
+func joinReversedTextSegments(segments []string) string {
+	var out strings.Builder
+	for index := len(segments) - 1; index >= 0; index-- {
+		out.WriteString(segments[index])
+	}
+	return out.String()
 }
 
 // FunctionCalls returns all client-side function calls in this interaction.
@@ -263,6 +339,8 @@ var stableV1InteractionModels = map[string]struct{}{
 	"gemini-3.1-flash-image": {},
 	"gemini-3.1-flash-lite":  {},
 	"gemini-3.5-flash":       {},
+	"gemini-3.5-flash-lite":  {},
+	"gemini-3.6-flash":       {},
 }
 
 func interactionAPIVersion(model, serviceTier string) string {
@@ -351,6 +429,12 @@ func (c *Client) CreateInteraction(ctx context.Context, req *InteractionRequest)
 	var interaction Interaction
 	if err := json.Unmarshal(responseBody, &interaction); err != nil {
 		return nil, fmt.Errorf("decode interaction response: %w (body=%s)", err, snippetScrubbed(responseBody, c.apiKey))
+	}
+	// Provider diagnostics can echo request data. Preserve their useful detail
+	// without allowing our credential into downstream errors or logs.
+	for index := range interaction.Errors {
+		interaction.Errors[index].Code = scrubString(interaction.Errors[index].Code, c.apiKey)
+		interaction.Errors[index].Message = scrubString(interaction.Errors[index].Message, c.apiKey)
 	}
 	if tier := strings.TrimSpace(resp.Header.Get("X-Gemini-Service-Tier")); tier != "" {
 		interaction.ServiceTier = tier
@@ -508,7 +592,19 @@ func validateInteractionStatus(interaction *Interaction) error {
 			return errors.New("completed interaction unexpectedly returned function calls")
 		}
 	case "failed", "cancelled", "incomplete", "budget_exceeded": //nolint:misspell // Gemini may return the British spelling.
+		var diagnostics []string
+		for _, diagnostic := range interaction.Errors {
+			detail := strings.TrimSpace(diagnostic.Code + " " + diagnostic.Message)
+			if detail != "" {
+				diagnostics = append(diagnostics, detail)
+			}
+		}
+		if len(diagnostics) > 0 {
+			return fmt.Errorf("interaction ended with status %s: %s", interaction.Status, strings.Join(diagnostics, "; "))
+		}
 		return fmt.Errorf("interaction ended with status %s", interaction.Status)
+	case "queued":
+		return errors.New("synchronous interaction unexpectedly remained queued")
 	case "in_progress":
 		return errors.New("synchronous interaction unexpectedly remained in_progress")
 	case "requires_action":

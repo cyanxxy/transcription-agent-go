@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cyanxxy/transcription-agent-go/internal/agents"
 	"github.com/cyanxxy/transcription-agent-go/internal/config"
 	"github.com/cyanxxy/transcription-agent-go/internal/obs"
 )
@@ -93,7 +94,11 @@ func (s *server) createJobHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	key := strings.TrimSpace(r.Header.Get("Idempotency-Key"))
 	keyHash := ""
-	id := newRandomID(12)
+	id, err := s.randomID(12)
+	if err != nil {
+		respondError(w, r, http.StatusInternalServerError, "could not generate job id", err)
+		return
+	}
 	var binding *idempotencyBinding
 	if key != "" {
 		if len(key) > 256 {
@@ -226,7 +231,8 @@ func validateJobOptions(apiKey string, opts []config.TranscriptionOption) error 
 	if err != nil {
 		return err
 	}
-	return deps.Cleanup()
+	defer deps.Cleanup()
+	return agents.ValidateSpeechCredentials(deps)
 }
 
 func requestIDFromRequest(r *http.Request) string {

@@ -9,35 +9,49 @@ import (
 	"strings"
 )
 
+const DefaultTranscriptionModel = "gemini-3.5-transcribe"
+const MetaTranscriptionModel = "muse-voice-transcribe-1.0"
+const MicrosoftTranscriptionModel = "MAI-Transcribe-2"
+
+func IsExternalSpeechModel(model string) bool {
+	return model == MetaTranscriptionModel || model == MicrosoftTranscriptionModel
+}
+func IsDirectSpeechModel(model string) bool {
+	return model == DefaultTranscriptionModel || IsExternalSpeechModel(model)
+}
+
+const DefaultJudgeModel = "gemini-3.8-flash"
+
 // SupportedGeminiModels is the allow-list of Gemini model identifiers.
 var SupportedGeminiModels = map[string]struct{}{
-	"gemini-3-flash-preview": {},
-	"gemini-3.1-flash-lite":  {},
-	"gemini-3.5-flash":       {},
+	DefaultTranscriptionModel: {},
+	"gemini-3.1-flash-lite":   {},
+	"gemini-3.8-flash":        {},
 }
 
 // GeminiModelAliases redirects deprecated model names to their current ones.
 var GeminiModelAliases = map[string]string{
+	"gemini-3-flash-preview":        "gemini-3.8-flash",
 	"gemini-3.1-flash-lite-preview": "gemini-3.1-flash-lite",
 }
 
 // GeminiModelLabels are the human-friendly labels for each model.
 var GeminiModelLabels = map[string]string{
-	"gemini-3-flash-preview": "Gemini 3 Flash",
-	"gemini-3.1-flash-lite":  "Gemini 3.1 Flash-Lite",
-	"gemini-3.5-flash":       "Gemini 3.5 Flash",
+	DefaultTranscriptionModel: "Gemini 3.5 Transcribe",
+	"gemini-3.1-flash-lite":   "Gemini 3.1 Flash-Lite",
+	"gemini-3.8-flash":        "Gemini 3.8 Flash",
 }
 
 // GeminiModelThinkingLevels lists the legal thinking levels per model.
 var GeminiModelThinkingLevels = map[string]map[string]struct{}{
-	"gemini-3-flash-preview": {"minimal": {}, "low": {}, "medium": {}, "high": {}},
-	"gemini-3.1-flash-lite":  {"minimal": {}, "low": {}, "medium": {}, "high": {}},
-	"gemini-3.5-flash":       {"minimal": {}, "low": {}, "medium": {}, "high": {}},
+	"gemini-3.1-flash-lite": {"minimal": {}, "low": {}, "medium": {}, "high": {}},
+	"gemini-3.8-flash":      {"low": {}, "medium": {}, "high": {}},
 }
 
 // SupportedCandidateStrategies is the allow-list of candidate plans.
 var SupportedCandidateStrategies = map[string]struct{}{
 	"single_gemini":        {},
+	"single_speech":        {},
 	"dual_gemini":          {},
 	"gemini_plus_parakeet": {},
 }
@@ -77,13 +91,8 @@ func FormatGeminiModelLabel(name string) string {
 
 // ResolveDualGeminiSecondaryModel picks the second model for dual-candidate.
 func ResolveDualGeminiSecondaryModel(primary string) string {
-	switch primary {
-	case "gemini-3-flash-preview":
-		return "gemini-3.1-flash-lite"
-	case "gemini-3.1-flash-lite":
-		return "gemini-3.5-flash"
-	case "gemini-3.5-flash":
-		return "gemini-3.1-flash-lite"
+	if primary == "gemini-3.1-flash-lite" {
+		return "gemini-3.8-flash"
 	}
 	return "gemini-3.1-flash-lite"
 }
@@ -99,6 +108,9 @@ type CandidateSpec struct {
 // TranscriptionDeps holds settings for the transcription agent.
 type TranscriptionDeps struct {
 	APIKey                     string
+	MetaAPIKey                 string
+	AzureSpeechKey             string
+	AzureSpeechEndpoint        string
 	ModelName                  string
 	JudgeModelName             string
 	CandidateStrategy          string
@@ -129,6 +141,7 @@ type TranscriptionDeps struct {
 	AgentEscalationScore       float64
 	AgentGlobalReview          bool
 	AgentMaxTokens             int
+	AgentMaxWallTimeSeconds    int
 	tempDirOwned               bool
 }
 
@@ -136,8 +149,11 @@ type TranscriptionDeps struct {
 func NewTranscriptionDeps(apiKey string, opts ...TranscriptionOption) (*TranscriptionDeps, error) {
 	d := &TranscriptionDeps{
 		APIKey:                     apiKey,
-		ModelName:                  "gemini-3.5-flash",
-		JudgeModelName:             "gemini-3.5-flash",
+		MetaAPIKey:                 os.Getenv("META_API_KEY"),
+		AzureSpeechKey:             os.Getenv("AZURE_SPEECH_KEY"),
+		AzureSpeechEndpoint:        os.Getenv("AZURE_SPEECH_ENDPOINT"),
+		ModelName:                  DefaultTranscriptionModel,
+		JudgeModelName:             DefaultJudgeModel,
 		CandidateStrategy:          "dual_gemini",
 		MaxFileSizeMB:              200,
 		ChunkDurationMS:            120000,
@@ -163,6 +179,7 @@ func NewTranscriptionDeps(apiKey string, opts ...TranscriptionOption) (*Transcri
 		AgentEscalationScore:       78,
 		AgentGlobalReview:          true,
 		AgentMaxTokens:             1000000,
+		AgentMaxWallTimeSeconds:    1800,
 	}
 	for _, opt := range opts {
 		opt(d)
@@ -170,10 +187,10 @@ func NewTranscriptionDeps(apiKey string, opts ...TranscriptionOption) (*Transcri
 	d.ModelName = NormalizeGeminiModelName(d.ModelName)
 	d.JudgeModelName = NormalizeGeminiModelName(d.JudgeModelName)
 	d.ServiceTier = NormalizeServiceTier(d.ServiceTier)
-	if _, ok := SupportedGeminiModels[d.ModelName]; !ok {
-		return nil, fmt.Errorf("unsupported model: %s (supported: %s)", d.ModelName, sortedKeys(SupportedGeminiModels))
+	if _, ok := SupportedGeminiModels[d.ModelName]; !ok && !IsExternalSpeechModel(d.ModelName) {
+		return nil, fmt.Errorf("unsupported model: %s (supported: %s)", d.ModelName, sortedKeys(SupportedGeminiModels)+", "+MetaTranscriptionModel+", "+MicrosoftTranscriptionModel)
 	}
-	if _, ok := SupportedGeminiModels[d.JudgeModelName]; !ok {
+	if _, ok := SupportedGeminiModels[d.JudgeModelName]; !ok || d.JudgeModelName == DefaultTranscriptionModel {
 		return nil, fmt.Errorf("unsupported judge_model_name: %s (supported: %s)", d.JudgeModelName, sortedKeys(SupportedGeminiModels))
 	}
 	if _, ok := SupportedCandidateStrategies[d.CandidateStrategy]; !ok {
@@ -186,7 +203,13 @@ func NewTranscriptionDeps(apiKey string, opts ...TranscriptionOption) (*Transcri
 	if _, ok := SupportedServiceTiers[d.ServiceTier]; !ok {
 		return nil, fmt.Errorf("unsupported service_tier: %s (supported: standard, flex, priority)", d.ServiceTier)
 	}
-	level, err := validateThinkingLevel("transcription_thinking_level", d.ModelName, d.TranscriptionThinkingLevel)
+	// Keep a valid thinking level for secondary generative candidates. The
+	// dedicated transcription request omits thinking entirely.
+	thinkingModel := d.ModelName
+	if IsDirectSpeechModel(thinkingModel) {
+		thinkingModel = DefaultJudgeModel
+	}
+	level, err := validateThinkingLevel("transcription_thinking_level", thinkingModel, d.TranscriptionThinkingLevel)
 	if err != nil {
 		return nil, err
 	}
@@ -201,6 +224,25 @@ func NewTranscriptionDeps(apiKey string, opts ...TranscriptionOption) (*Transcri
 	}
 	if d.ChunkDurationMS < 10000 || d.ChunkDurationMS > 3600000 {
 		return nil, fmt.Errorf("chunk_duration_ms must be between 10000 and 3600000")
+	}
+	if d.ModelName == DefaultTranscriptionModel {
+		maxChunkMS := 1800000
+		// Adaptive silence boundaries may extend a chunk by up to 30 seconds.
+		if d.ChunkStrategy == "adaptive" {
+			maxChunkMS -= 30000
+		}
+		if d.ChunkDurationMS > maxChunkMS {
+			return nil, fmt.Errorf("gemini-3.5-transcribe chunk_duration_ms must not exceed %d with %s chunking", maxChunkMS, d.ChunkStrategy)
+		}
+	}
+	if d.ModelName == MetaTranscriptionModel {
+		limit := 600000
+		if d.ChunkStrategy == "adaptive" {
+			limit -= 30000
+		}
+		if d.ChunkDurationMS > limit {
+			return nil, fmt.Errorf("Meta chunk_duration_ms must not exceed %d with %s chunking", limit, d.ChunkStrategy)
+		}
 	}
 	if d.ChunkOverlapMS < 0 {
 		return nil, fmt.Errorf("chunk_overlap_ms must be >= 0")
@@ -232,6 +274,9 @@ func NewTranscriptionDeps(apiKey string, opts ...TranscriptionOption) (*Transcri
 	if d.AgentMaxTokens < 10000 || d.AgentMaxTokens > 10000000 {
 		return nil, fmt.Errorf("agent_max_tokens must be between 10000 and 10000000")
 	}
+	if d.AgentMaxWallTimeSeconds < 60 || d.AgentMaxWallTimeSeconds > 86400 {
+		return nil, fmt.Errorf("agent_max_wall_time_seconds must be between 60 and 86400")
+	}
 	if d.TempDir == "" {
 		dir, err := os.MkdirTemp("", "transcriber_")
 		if err != nil {
@@ -242,7 +287,27 @@ func NewTranscriptionDeps(apiKey string, opts ...TranscriptionOption) (*Transcri
 	} else if err := os.MkdirAll(d.TempDir, 0o755); err != nil {
 		return nil, fmt.Errorf("create temp dir %s: %w", d.TempDir, err)
 	}
+	d.ApplyModelCapabilities()
 	return d, nil
+}
+
+// ApplyModelCapabilities selects the direct speech path regardless of stale UI
+// or CLI pipeline flags. General-purpose Gemini models retain their settings.
+func (d *TranscriptionDeps) ApplyModelCapabilities() {
+	if !IsDirectSpeechModel(d.ModelName) {
+		return
+	}
+	d.UseJudgePipeline = false
+	d.CandidateStrategy = "single_gemini"
+	if IsExternalSpeechModel(d.ModelName) {
+		d.CandidateStrategy = "single_speech"
+	}
+	d.AgenticMode = false
+	d.AgentGlobalReview = false
+	d.UseSkillRouter = false
+	d.UseSkills = false
+	d.PreserveContext = false
+	d.AutoFormat = false
 }
 
 // NormalizeServiceTier trims and lowercases a Gemini service tier.
@@ -281,6 +346,9 @@ func validateThinkingLevel(field, model, level string) (string, error) {
 
 // ResolveCandidateSpecs returns the candidate plan for the judge pipeline.
 func (d *TranscriptionDeps) ResolveCandidateSpecs() []CandidateSpec {
+	if IsExternalSpeechModel(d.ModelName) {
+		return []CandidateSpec{{CandidateID: d.ModelName, Label: d.ModelName, Kind: "speech", ModelName: d.ModelName}}
+	}
 	specs := []CandidateSpec{
 		{
 			CandidateID: strings.ReplaceAll(d.ModelName, "-", "_"),
@@ -426,6 +494,9 @@ func WithAgentGlobalReview(v bool) TranscriptionOption {
 }
 func WithAgentMaxTokens(v int) TranscriptionOption {
 	return func(d *TranscriptionDeps) { d.AgentMaxTokens = v }
+}
+func WithAgentMaxWallTimeSeconds(v int) TranscriptionOption {
+	return func(d *TranscriptionDeps) { d.AgentMaxWallTimeSeconds = v }
 }
 
 // EditingDeps mirrors the editing options.

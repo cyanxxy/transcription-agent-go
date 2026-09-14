@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -81,7 +82,17 @@ func loadJob(dir string) (*job, error) {
 	if persisted.ID == "" || persisted.ID != filepath.Base(dir) {
 		return nil, errors.New("persisted job id does not match directory")
 	}
-	events, err := loadEvents(filepath.Join(dir, "events.ndjson"))
+	committedEventCount := -1
+	if persisted.JournalVersion != 0 {
+		if persisted.JournalVersion != 1 {
+			return nil, fmt.Errorf("unsupported job journal version %d", persisted.JournalVersion)
+		}
+		if persisted.JournalEventCount < 0 {
+			return nil, errors.New("persisted job has a negative journal event count")
+		}
+		committedEventCount = persisted.JournalEventCount
+	}
+	events, err := loadEventsCommitted(filepath.Join(dir, "events.ndjson"), committedEventCount)
 	if err != nil {
 		return nil, err
 	}
@@ -103,32 +114,177 @@ func loadJob(dir string) (*job, error) {
 			return nil, fmt.Errorf("validate recoverable job audio: %w", err)
 		}
 	}
+	if persisted.JournalVersion == 0 {
+		// Migrate legacy snapshots before the job becomes mutable. Otherwise a
+		// crash after appending an event batch could leave recovery unable to
+		// distinguish that uncommitted tail from legacy committed events.
+		if err := loaded.persistLocked(); err != nil {
+			return nil, fmt.Errorf("migrate legacy job journal: %w", err)
+		}
+	}
 	return loaded, nil
 }
 
 func loadEvents(path string) ([]sseEvent, error) {
-	file, err := os.Open(path)
-	if errors.Is(err, os.ErrNotExist) {
-		return nil, nil
-	}
+	return loadEventsCommitted(path, -1)
+}
+
+// loadEventsCommitted recovers a crash-torn final record and removes event
+// batches that were fsynced but not committed by the atomic job.json snapshot.
+// A negative committed count loads legacy journals without tail reconciliation.
+func loadEventsCommitted(path string, committedCount int) ([]sseEvent, error) {
+	events, repair, err := scanEventJournal(path, committedCount)
 	if err != nil {
 		return nil, err
 	}
+	if !repair.required() {
+		return events, nil
+	}
+	if err := repair.apply(path); err != nil {
+		return nil, err
+	}
+	return events, nil
+}
+
+// journalRepair is the on-disk mutation a scan decided the journal needs. It is
+// empty for every healthy journal, which is what lets recovery read those
+// without write access instead of dropping the job when the open fails.
+type journalRepair struct {
+	delimiterAt int64 // append the missing final '\n' here; negative when unneeded
+	truncateAt  int64 // drop everything from here; negative when unneeded
+	tornErr     error // decode failure the truncate is meant to discard
+}
+
+func (r journalRepair) required() bool {
+	return r.delimiterAt >= 0 || r.truncateAt >= 0
+}
+
+// fail surfaces the torn-record decode error, which only matters to the caller
+// once the repair that would have discarded it could not be applied.
+func (r journalRepair) fail(err error) error {
+	if r.tornErr != nil {
+		return errors.Join(r.tornErr, err)
+	}
+	return err
+}
+
+func (r journalRepair) apply(path string) error {
+	file, err := os.OpenFile(path, os.O_RDWR, 0o600)
+	if err != nil {
+		return r.fail(fmt.Errorf("open event journal for repair: %w", err))
+	}
 	defer file.Close()
+
+	// A planned truncate always lands before a missing delimiter, because it
+	// drops the final record the delimiter would have terminated.
+	if r.delimiterAt >= 0 && r.truncateAt < 0 {
+		if _, err := file.WriteAt([]byte{'\n'}, r.delimiterAt); err != nil {
+			return fmt.Errorf("repair final event delimiter: %w", err)
+		}
+		if err := file.Sync(); err != nil {
+			return fmt.Errorf("sync repaired event delimiter: %w", err)
+		}
+	}
+	if r.truncateAt >= 0 {
+		if err := truncateOpenJournal(file, r.truncateAt); err != nil {
+			if r.tornErr == nil {
+				err = fmt.Errorf("truncate uncommitted event tail: %w", err)
+			}
+			return r.fail(err)
+		}
+	}
+	return nil
+}
+
+// scanEventJournal reads the journal without mutating it, returning the events
+// recovery should keep alongside the repair needed to make disk match.
+func scanEventJournal(path string, committedCount int) ([]sseEvent, journalRepair, error) {
+	repair := journalRepair{delimiterAt: -1, truncateAt: -1}
+	file, err := os.Open(path)
+	if errors.Is(err, os.ErrNotExist) {
+		if committedCount > 0 {
+			return nil, repair, fmt.Errorf("event journal is missing %d committed events", committedCount)
+		}
+		return nil, repair, nil
+	}
+	if err != nil {
+		return nil, repair, err
+	}
+	defer file.Close()
+
 	events := make([]sseEvent, 0)
-	scanner := bufio.NewScanner(file)
-	scanner.Buffer(make([]byte, 64<<10), maxPersistedEventBytes+(1<<20))
-	for scanner.Scan() {
+	endOffsets := make([]int64, 0)
+	reader := bufio.NewReaderSize(file, 64<<10)
+	var offset int64
+	for {
+		lineStart := offset
+		line, readErr := readBoundedJournalLine(reader, maxPersistedEventBytes+(1<<20))
+		offset += int64(len(line))
+		if readErr != nil && !errors.Is(readErr, io.EOF) {
+			return nil, repair, readErr
+		}
+		if len(line) == 0 && errors.Is(readErr, io.EOF) {
+			break
+		}
+		terminated := len(line) > 0 && line[len(line)-1] == '\n'
 		var event sseEvent
-		if err := json.Unmarshal(scanner.Bytes(), &event); err != nil {
-			return nil, fmt.Errorf("decode event %d: %w", len(events)+1, err)
+		if err := json.Unmarshal(bytes.TrimSpace(line), &event); err != nil {
+			if errors.Is(readErr, io.EOF) && !terminated {
+				repair.tornErr = fmt.Errorf("decode torn event %d: %w", len(events)+1, err)
+				repair.truncateAt = lineStart
+				break
+			}
+			return nil, repair, fmt.Errorf("decode event %d: %w", len(events)+1, err)
 		}
 		if event.ID != int64(len(events)+1) {
-			return nil, fmt.Errorf("non-contiguous event id %d", event.ID)
+			return nil, repair, fmt.Errorf("non-contiguous event id %d", event.ID)
 		}
 		events = append(events, event)
+		if !terminated {
+			repair.delimiterAt = offset
+			offset++
+		}
+		endOffsets = append(endOffsets, offset)
+		if errors.Is(readErr, io.EOF) {
+			break
+		}
 	}
-	return events, scanner.Err()
+
+	if committedCount >= 0 {
+		if len(events) < committedCount {
+			return nil, repair, fmt.Errorf("event journal has %d events, job snapshot commits %d", len(events), committedCount)
+		}
+		if len(events) > committedCount {
+			repair.truncateAt = 0
+			if committedCount > 0 {
+				repair.truncateAt = endOffsets[committedCount-1]
+			}
+			events = events[:committedCount]
+		}
+	}
+	return events, repair, nil
+}
+
+func readBoundedJournalLine(reader *bufio.Reader, limit int) ([]byte, error) {
+	line := make([]byte, 0, min(limit, 64<<10))
+	for {
+		fragment, err := reader.ReadSlice('\n')
+		if len(line)+len(fragment) > limit {
+			return nil, fmt.Errorf("event exceeds maximum persisted size")
+		}
+		line = append(line, fragment...)
+		if errors.Is(err, bufio.ErrBufferFull) {
+			continue
+		}
+		return line, err
+	}
+}
+
+func truncateOpenJournal(file *os.File, size int64) error {
+	if err := file.Truncate(size); err != nil {
+		return err
+	}
+	return file.Sync()
 }
 
 func (s *server) createStagedJob(id, requestID, idempotencyHash string, r multipartRequest) (*job, error) {
@@ -184,6 +340,27 @@ func (s *server) createStagedJob(id, requestID, idempotencyHash string, r multip
 }
 
 func writeJSONAtomic(path string, value any, mode os.FileMode) error {
+	return writeJSONAtomicWithSync(path, value, mode, syncDirectory)
+}
+
+type committedWriteError struct {
+	err error
+}
+
+func (e *committedWriteError) Error() string {
+	return e.err.Error()
+}
+
+func (e *committedWriteError) Unwrap() error {
+	return e.err
+}
+
+func writeWasCommitted(err error) bool {
+	var committedErr *committedWriteError
+	return errors.As(err, &committedErr)
+}
+
+func writeJSONAtomicWithSync(path string, value any, mode os.FileMode, syncDir func(string) error) error {
 	dir := filepath.Dir(path)
 	temp, err := os.CreateTemp(dir, ".tmp-*.json")
 	if err != nil {
@@ -211,7 +388,13 @@ func writeJSONAtomic(path string, value any, mode os.FileMode) error {
 	if err := os.Rename(tempName, path); err != nil {
 		return err
 	}
-	return syncDirectory(dir)
+	if err := syncDir(dir); err != nil {
+		// The rename is already visible and cannot safely be rolled back:
+		// report the durability uncertainty while preserving matching runtime
+		// state and journal events.
+		return &committedWriteError{err: fmt.Errorf("sync directory after committed rename: %w", err)}
+	}
+	return nil
 }
 
 func syncDirectory(path string) error {

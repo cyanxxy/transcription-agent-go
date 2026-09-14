@@ -3,6 +3,7 @@ package workflow
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -85,6 +86,80 @@ func TestSanitizeFilename(t *testing.T) {
 	}
 	if strings.ContainsAny(got, "!@# /") {
 		t.Errorf("unsafe characters remained: %s", got)
+	}
+}
+
+func TestTranscribeMarksPreparationFailureAsError(t *testing.T) {
+	wfl, err := New("k", config.WithTempDir(t.TempDir()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	blockedTempDir := filepath.Join(t.TempDir(), "not-a-directory")
+	if err := os.WriteFile(blockedTempDir, []byte("file"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	wfl.Deps.Transcription.TempDir = blockedTempDir
+
+	_, err = wfl.Transcribe(context.Background(), TranscribeInput{
+		FileBytes: []byte("not reached"),
+		Filename:  "meeting.wav",
+	})
+	if err == nil {
+		t.Fatal("expected run dependency preparation to fail")
+	}
+	if got := wfl.status(); got != models.StatusError {
+		t.Fatalf("workflow status = %q, want %q", got, models.StatusError)
+	}
+}
+
+func TestMinimumAudioTokenBudgetRejectsImpossibleRun(t *testing.T) {
+	deps, err := config.NewTranscriptionDeps(
+		"k",
+		config.WithTempDir(t.TempDir()),
+		config.WithCandidateStrategy("single_gemini"),
+		config.WithAgentMaxTokens(1_000_000),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const durationMS = 34_200_000
+	chunkCount := audio.ChunkPlanCount(durationMS, deps.ChunkDurationMS, deps.ChunkOverlapMS)
+	err = validateMinimumAudioTokenBudget(durationMS, chunkCount, deps, deps.ResolveCandidateSpecs())
+	if err == nil || !strings.Contains(err.Error(), "exceeding the configured agent token budget") {
+		t.Fatalf("impossible run was not rejected clearly: %v", err)
+	}
+	var budgetErr *RunBudgetError
+	if !errors.As(err, &budgetErr) || budgetErr.MinimumTokens <= int64(deps.AgentMaxTokens) {
+		t.Fatalf("preflight did not return a structured budget error: %#v", err)
+	}
+
+	deps.AgentMaxTokens = 2_000_000
+	if err := validateMinimumAudioTokenBudget(durationMS, chunkCount, deps, deps.ResolveCandidateSpecs()); err != nil {
+		t.Fatalf("feasible run was rejected: %v", err)
+	}
+}
+
+func TestMinimumAudioTokenBudgetCountsOnlyGuaranteedAdaptiveCandidate(t *testing.T) {
+	deps, err := config.NewTranscriptionDeps(
+		"k",
+		config.WithModelName("gemini-3.8-flash"),
+		config.WithTempDir(t.TempDir()),
+		config.WithCandidateStrategy("dual_gemini"),
+		config.WithAgentMaxTokens(1_000_000),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const durationMS = 18_000_000
+	chunkCount := audio.ChunkPlanCount(durationMS, deps.ChunkDurationMS, deps.ChunkOverlapMS)
+	specs := deps.ResolveCandidateSpecs()
+	if err := validateMinimumAudioTokenBudget(durationMS, chunkCount, deps, specs); err != nil {
+		t.Fatalf("adaptive run rejected even though its guaranteed primary fits: %v", err)
+	}
+
+	deps.AgenticMode = false
+	if err := validateMinimumAudioTokenBudget(durationMS, chunkCount, deps, specs); err == nil {
+		t.Fatal("fixed dual-candidate run was accepted although both guaranteed candidates exceed the budget")
 	}
 }
 
@@ -224,14 +299,14 @@ func TestRunUnitWithJudgeRejectsOutOfSpanOutput(t *testing.T) {
 			"name": "files/chunk", "uri": "https://example.test/chunk", "state": "ACTIVE", "mimeType": "audio/wav",
 		})
 	})
-	mux.HandleFunc("/v1/interactions", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/v1beta/interactions", func(w http.ResponseWriter, r *http.Request) {
 		var body map[string]any
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			t.Error(err)
 			w.WriteHeader(http.StatusBadRequest)
 			return
 		}
-		text := `{"segments":[{"timestamp":"[00:20:00]","speaker":"S","text":"invented boundary"}],"selected_candidate_ids":["gemini_3.5_flash"],"processing_notes":["judge output"]}`
+		text := `{"segments":[{"timestamp":"[00:20:00]","speaker":"S","text":"invented boundary"}],"selected_candidate_ids":["gemini_3.8_flash"],"processing_notes":["judge output"]}`
 		if interactionInputHasType(body, "audio") {
 			text = `{"segments":[{"timestamp":"[00:00:00]","speaker":"S","text":"candidate evidence"}]}`
 		}
@@ -247,7 +322,7 @@ func TestRunUnitWithJudgeRejectsOutOfSpanOutput(t *testing.T) {
 		t.Fatal(err)
 	}
 	wfl, err := New("key",
-		config.WithCandidateStrategy("single_gemini"),
+		config.WithModelName("gemini-3.8-flash"), config.WithCandidateStrategy("single_gemini"),
 		config.WithAgenticMode(false),
 		config.WithTempDir(t.TempDir()),
 	)
@@ -269,7 +344,7 @@ func TestRunUnitWithJudgeRejectsOutOfSpanOutput(t *testing.T) {
 	if len(result.finalSegments) != 1 || result.finalSegments[0].Timestamp != "[00:01:00]" || result.finalSegments[0].Text != "candidate evidence" {
 		t.Fatalf("out-of-span judge output was accepted: %#v", result.finalSegments)
 	}
-	if len(result.selectedCandidateIDs) != 1 || result.selectedCandidateIDs[0] != "gemini_3.5_flash" {
+	if len(result.selectedCandidateIDs) != 1 || result.selectedCandidateIDs[0] != "gemini_3.8_flash" {
 		t.Fatalf("fallback provenance is wrong: %#v", result.selectedCandidateIDs)
 	}
 	if !strings.Contains(strings.Join(result.judgeNotes, " "), "rejected by span validation") {
@@ -302,7 +377,7 @@ func TestDualGeminiCandidatesShareOneFilesUpload(t *testing.T) {
 			"name": "files/shared", "uri": "https://example.test/shared", "state": "ACTIVE", "mimeType": "audio/wav",
 		})
 	})
-	mux.HandleFunc("/v1/interactions", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/v1beta/interactions", func(w http.ResponseWriter, r *http.Request) {
 		var body map[string]any
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			t.Fatal(err)
@@ -316,11 +391,16 @@ func TestDualGeminiCandidatesShareOneFilesUpload(t *testing.T) {
 		}}})
 	})
 
+	mux.HandleFunc("/v1/interactions", func(w http.ResponseWriter, r *http.Request) {
+		r.URL.Path = "/v1beta/interactions"
+		mux.ServeHTTP(w, r)
+	})
+
 	audioPath := filepath.Join(t.TempDir(), "audio.wav")
 	if err := os.WriteFile(audioPath, []byte("wav"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	wfl, err := New("key", config.WithCandidateStrategy("dual_gemini"), config.WithAgenticMode(false), config.WithTempDir(t.TempDir()))
+	wfl, err := New("key", config.WithModelName("gemini-3.8-flash"), config.WithCandidateStrategy("dual_gemini"), config.WithAgenticMode(false), config.WithTempDir(t.TempDir()))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -443,7 +523,7 @@ func TestSanitizeFilenameRejectsDotDot(t *testing.T) {
 	}
 }
 
-func TestTranscribeEndToEndJudgePipeline(t *testing.T) {
+func TestTranscribeEndToEndDirectPipeline(t *testing.T) {
 	if _, err := exec.LookPath("ffmpeg"); err != nil {
 		t.Skip("ffmpeg not installed")
 	}
@@ -451,115 +531,112 @@ func TestTranscribeEndToEndJudgePipeline(t *testing.T) {
 		t.Skip("ffprobe not installed")
 	}
 
-	tmp := t.TempDir()
-	wavPath := filepath.Join(tmp, "sine.wav")
-	if err := exec.Command("ffmpeg",
-		"-f", "lavfi",
-		"-i", "sine=frequency=440:duration=2",
-		"-ar", "16000",
-		"-ac", "1",
-		"-y", wavPath,
-	).Run(); err != nil {
-		t.Fatalf("ffmpeg failed to generate test wav: %v", err)
-	}
-	const transcriptText = `{"segments":[{"timestamp":"[00:00:00]","speaker":"Alice","text":"Hello world"}]}`
-	const cannedText = `{"segments":[{"timestamp":"[00:00:00]","speaker":"Alice","text":"Hello world"}],"selected_candidate_ids":["gemini_3.5_flash"],"processing_notes":["ok"]}`
-	var judgeRequests atomic.Int32
+	for _, duration := range []string{"2", "22"} {
+		t.Run(duration+"seconds", func(t *testing.T) {
+			tmp := t.TempDir()
+			wavPath := filepath.Join(tmp, "sine.wav")
+			if err := exec.Command("ffmpeg",
+				"-f", "lavfi",
+				"-i", "sine=frequency=440:duration="+duration,
+				"-ar", "16000",
+				"-ac", "1",
+				"-y", wavPath,
+			).Run(); err != nil {
+				t.Fatalf("ffmpeg failed to generate test wav: %v", err)
+			}
+			var extraRequests, transcribeRequests atomic.Int32
 
-	mux := http.NewServeMux()
-	srv := httptest.NewUnstartedServer(mux)
-	srv.Start()
-	defer srv.Close()
+			mux := http.NewServeMux()
+			srv := httptest.NewUnstartedServer(mux)
+			srv.Start()
+			defer srv.Close()
 
-	uploadFinish := srv.URL + "/upload-finish"
+			uploadFinish := srv.URL + "/upload-finish"
 
-	mux.HandleFunc("/upload/v1beta/files", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("X-Goog-Upload-URL", uploadFinish)
-		w.WriteHeader(http.StatusOK)
-	})
-	mux.HandleFunc("/upload-finish", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		json.NewEncoder(w).Encode(map[string]any{
-			"file": map[string]any{
-				"name":     "files/x",
-				"uri":      "https://api.example/files/x",
-				"state":    "ACTIVE",
-				"mimeType": "audio/wav",
-			},
+			mux.HandleFunc("/upload/v1beta/files", func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("X-Goog-Upload-URL", uploadFinish)
+				w.WriteHeader(http.StatusOK)
+			})
+			mux.HandleFunc("/upload-finish", func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(http.StatusOK)
+				json.NewEncoder(w).Encode(map[string]any{
+					"file": map[string]any{
+						"name":     "files/x",
+						"uri":      "https://api.example/files/x",
+						"state":    "ACTIVE",
+						"mimeType": "audio/wav",
+					},
+				})
+			})
+			// Handles GET (waitFileActive) and DELETE (best-effort cleanup).
+			mux.HandleFunc("/v1beta/files/x", func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(http.StatusOK)
+				json.NewEncoder(w).Encode(map[string]any{
+					"name":     "files/x",
+					"uri":      "https://api.example/files/x",
+					"state":    "ACTIVE",
+					"mimeType": "audio/wav",
+				})
+			})
+			mux.HandleFunc("/v1/interactions", func(w http.ResponseWriter, r *http.Request) {
+				extraRequests.Add(1)
+				t.Error("direct transcription must not call a judge, router, or generative candidate")
+				http.Error(w, "unexpected model call", http.StatusBadRequest)
+			})
+
+			mux.HandleFunc("/v1beta/interactions", func(w http.ResponseWriter, r *http.Request) {
+				transcribeRequests.Add(1)
+				var req gemini.InteractionRequest
+				if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+					t.Error(err)
+					return
+				}
+				if req.Model != config.DefaultTranscriptionModel || req.GenerationConfig.TranscriptionConfig == nil {
+					t.Errorf("unexpected transcription request: %#v", req)
+				}
+				_, _ = w.Write([]byte(`{"id":"transcribe","status":"completed","steps":[{"type":"model_output","content":[{"type":"text","text":"Hello world","annotations":[{"type":"word_info","text":"Hello","speaker":"spk_1","start_offset":"0.1s","end_offset":"0.4s"},{"type":"word_info","text":"world","speaker":"spk_1","start_offset":"0.5s","end_offset":"0.9s"}]}]}]}`))
+			})
+
+			c := gemini.NewClient("k").WithEndpoint(srv.URL)
+			wfl, err := workflowNewForTest(t,
+				config.WithCandidateStrategy("dual_gemini"),
+				config.WithUseJudgePipeline(true), config.WithAgenticMode(true), config.WithUseSkillRouter(true),
+				config.WithChunkConcurrency(3), config.WithChunkDurationMS(10000),
+				config.WithTempDir(t.TempDir()),
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			wfl.WithClient(c)
+
+			res, err := wfl.Transcribe(context.Background(), TranscribeInput{
+				FilePath: wavPath,
+				Filename: "test.wav",
+			})
+			if err != nil {
+				t.Fatalf("Transcribe returned error: %v", err)
+			}
+			if len(res.Segments) < 1 {
+				t.Fatalf("expected at least one segment, got %d", len(res.Segments))
+			}
+			if !strings.Contains(res.Segments[0].Text, "Hello") {
+				t.Errorf("first segment text = %q, expected to contain Hello", res.Segments[0].Text)
+			}
+			if res.JudgeUsed || res.JudgeModelUsed != "" || len(res.JudgeNotes) != 0 || len(res.Candidates) != 0 {
+				t.Fatalf("unexpected judging metadata: %#v", res)
+			}
+			if extraRequests.Load() != 0 || int(transcribeRequests.Load()) != res.Metadata.ChunkCount {
+				t.Fatalf("extra=%d transcription=%d", extraRequests.Load(), transcribeRequests.Load())
+			}
+			if res.AgentRun.Plan.Mode != "direct" || res.AgentRun.Budget.MaxJudgeCalls != 0 || res.AgentRun.Budget.MaxToolCalls != 0 || res.AgentRun.Budget.MaxGlobalReviews != 0 {
+				t.Fatalf("unexpected direct plan: %#v", res.AgentRun)
+			}
+
+			if res.CandidateStrategy != "single_gemini" {
+				t.Errorf("CandidateStrategy = %q, want single_gemini", res.CandidateStrategy)
+			}
+
 		})
-	})
-	// Handles GET (waitFileActive) and DELETE (best-effort cleanup).
-	mux.HandleFunc("/v1beta/files/x", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		json.NewEncoder(w).Encode(map[string]any{
-			"name":     "files/x",
-			"uri":      "https://api.example/files/x",
-			"state":    "ACTIVE",
-			"mimeType": "audio/wav",
-		})
-	})
-	mux.HandleFunc("/v1/interactions", func(w http.ResponseWriter, r *http.Request) {
-		var body map[string]any
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-			t.Fatal(err)
-		}
-		text := cannedText
-		id := "workflow_judge"
-		if interactionInputHasType(body, "audio") {
-			text = transcriptText
-			id = "workflow_candidate"
-		} else {
-			judgeRequests.Add(1)
-		}
-		if body["store"] != false || body["response_format"] == nil {
-			t.Errorf("unexpected interaction request: %#v", body)
-		}
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(gemini.Interaction{
-			ID:     id,
-			Status: "completed",
-			Steps: []gemini.InteractionStep{{
-				Type:    "model_output",
-				Content: []gemini.InteractionContent{{Type: "text", Text: text}},
-			}},
-		})
-	})
-
-	c := gemini.NewClient("k").WithEndpoint(srv.URL)
-	wfl, err := workflowNewForTest(t,
-		config.WithCandidateStrategy("single_gemini"),
-		config.WithChunkConcurrency(1),
-		config.WithTempDir(t.TempDir()),
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	wfl.WithClient(c)
-
-	res, err := wfl.Transcribe(context.Background(), TranscribeInput{
-		FilePath: wavPath,
-		Filename: "test.wav",
-	})
-	if err != nil {
-		t.Fatalf("Transcribe returned error: %v", err)
-	}
-	if len(res.Segments) < 1 {
-		t.Fatalf("expected at least one segment, got %d", len(res.Segments))
-	}
-	if !strings.Contains(res.Segments[0].Text, "Hello") {
-		t.Errorf("first segment text = %q, expected to contain Hello", res.Segments[0].Text)
-	}
-	if !res.JudgeUsed {
-		t.Errorf("expected JudgeUsed == true")
-	}
-	if judgeRequests.Load() != 1 {
-		t.Errorf("judge interaction requests = %d, want 1", judgeRequests.Load())
-	}
-	if len(res.JudgeNotes) == 0 || res.JudgeNotes[0] != "ok" {
-		t.Errorf("judge decision was not applied: %#v", res.JudgeNotes)
-	}
-	if res.CandidateStrategy != "single_gemini" {
-		t.Errorf("CandidateStrategy = %q, want single_gemini", res.CandidateStrategy)
 	}
 }
 
@@ -589,7 +666,7 @@ func TestTranscribeInjectsFormatSkill(t *testing.T) {
 	}
 
 	const transcriptText = `{"segments":[{"timestamp":"[00:00:00]","speaker":"Alice","text":"Hello world"}]}`
-	const cannedText = `{"segments":[{"timestamp":"[00:00:00]","speaker":"Alice","text":"Hello world"}],"selected_candidate_ids":["gemini_3.5_flash"],"processing_notes":["ok"]}`
+	const cannedText = `{"segments":[{"timestamp":"[00:00:00]","speaker":"Alice","text":"Hello world"}],"selected_candidate_ids":["gemini_3.8_flash"],"processing_notes":["ok"]}`
 
 	var mu sync.Mutex
 	var bodies []string
@@ -613,7 +690,7 @@ func TestTranscribeInjectsFormatSkill(t *testing.T) {
 			"name": "files/x", "uri": "https://api.example/files/x", "state": "ACTIVE", "mimeType": "audio/wav",
 		})
 	})
-	mux.HandleFunc("/v1/interactions", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/v1beta/interactions", func(w http.ResponseWriter, r *http.Request) {
 		b, _ := io.ReadAll(r.Body)
 		mu.Lock()
 		bodies = append(bodies, string(b))
@@ -643,7 +720,7 @@ func TestTranscribeInjectsFormatSkill(t *testing.T) {
 
 	c := gemini.NewClient("k").WithEndpoint(srv.URL)
 	wfl, err := workflowNewForTest(t,
-		config.WithCandidateStrategy("single_gemini"),
+		config.WithModelName("gemini-3.8-flash"), config.WithCandidateStrategy("single_gemini"),
 		config.WithChunkConcurrency(1),
 		config.WithTempDir(t.TempDir()),
 	)
@@ -681,9 +758,7 @@ func TestTranscribeInjectsFormatSkill(t *testing.T) {
 	}
 }
 
-// workflowNewForTest builds a Workflow with the judge pipeline enabled. The
-// judge pipeline is the default, so this just wraps New and fails the test on
-// construction errors.
+// workflowNewForTest builds a workflow with the requested model settings.
 func workflowNewForTest(t *testing.T, opts ...config.TranscriptionOption) (*Workflow, error) {
 	t.Helper()
 	return New("k", opts...)
@@ -698,4 +773,67 @@ func interactionInputHasType(body map[string]any, contentType string) bool {
 		}
 	}
 	return false
+}
+
+type externalSpeechTransport func(*http.Request) (*http.Response, error)
+
+func (f externalSpeechTransport) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+func TestExternalSpeechDirectWorkflow(t *testing.T) {
+	if _, err := exec.LookPath("ffmpeg"); err != nil {
+		t.Skip("ffmpeg missing")
+	}
+	old := http.DefaultClient
+	defer func() { http.DefaultClient = old }()
+	for _, model := range []string{config.MetaTranscriptionModel, config.MicrosoftTranscriptionModel} {
+		for _, duration := range []string{"2", "22"} {
+			t.Run(model+duration, func(t *testing.T) {
+				tmp := t.TempDir()
+				path := filepath.Join(tmp, "input.wav")
+				if err := exec.Command("ffmpeg", "-v", "error", "-f", "lavfi", "-i", "sine=frequency=440:duration="+duration, "-y", path).Run(); err != nil {
+					t.Fatal(err)
+				}
+				var requests atomic.Int32
+				http.DefaultClient = &http.Client{Transport: externalSpeechTransport(func(r *http.Request) (*http.Response, error) {
+					defer r.Body.Close()
+					io.Copy(io.Discard, r.Body)
+					id := requests.Add(1)
+					var data string
+					switch r.URL.Host {
+					case "api.meta.ai":
+						data = fmt.Sprintf(`{"turns":[{"startMs":1000,"speaker":"A","transcript":"Turn %d."}]}`, id)
+					case "test.cognitiveservices.azure.com":
+						data = fmt.Sprintf(`{"phrases":[{"offsetMilliseconds":1000,"speaker":0,"text":"Turn %d."}]}`, id)
+					default:
+						t.Errorf("unexpected provider traffic: %s", r.URL.Host)
+						return nil, fmt.Errorf("unexpected traffic")
+					}
+					return &http.Response{StatusCode: 200, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(data))}, nil
+				})}
+				w, err := workflowNewForTest(t, config.WithModelName(model), config.WithChunkDurationMS(10000), config.WithChunkOverlapMS(0), config.WithChunkStrategy("fixed"), config.WithTempDir(tmp), func(d *config.TranscriptionDeps) {
+					d.MetaAPIKey = "test"
+					d.AzureSpeechKey = "test"
+					d.AzureSpeechEndpoint = "https://test.cognitiveservices.azure.com"
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				w.Client = nil // Direct providers must never access a Gemini client.
+				result, err := w.Transcribe(context.Background(), TranscribeInput{FilePath: path, Filename: "input.wav"})
+				if err != nil {
+					t.Fatal(err)
+				}
+				want := 1
+				if duration == "22" {
+					want = 3
+				}
+				if int(requests.Load()) != want || len(result.Segments) != want || result.JudgeUsed || result.CandidateStrategy != "single_speech" || result.AgentRun.Plan.Mode != "direct" {
+					t.Fatalf("unexpected direct result: %#v", result)
+				}
+				if want == 3 && result.Segments[2].Timestamp != "[00:00:21]" {
+					t.Fatal(result.Segments)
+				}
+			})
+		}
+	}
 }

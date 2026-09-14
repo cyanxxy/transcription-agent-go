@@ -20,6 +20,7 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/cyanxxy/transcription-agent-go/internal/agents"
 	"github.com/cyanxxy/transcription-agent-go/internal/config"
@@ -53,6 +54,49 @@ func skillRoots(dir string) []string {
 // build-time variable; override with -ldflags "-X main.version=..."
 var version = "dev"
 
+type cliOptions struct {
+	model            string
+	judgeModel       string
+	strategy         string
+	serviceTier      string
+	thinking         string
+	judgeThinking    string
+	useJudge         bool
+	agenticMode      bool
+	autoFormat       bool
+	removeFillers    bool
+	chunkStrategy    string
+	chunkDuration    int
+	chunkOverlap     int
+	chunkConcurrency int
+	maxFileSizeMB    int
+	agentMaxTokens   int
+	maxRunTime       time.Duration
+	skillRouter      bool
+}
+
+func transcriptionOptions(o cliOptions) []config.TranscriptionOption {
+	return []config.TranscriptionOption{
+		config.WithModelName(o.model),
+		config.WithJudgeModelName(o.judgeModel),
+		config.WithCandidateStrategy(o.strategy),
+		config.WithServiceTier(o.serviceTier),
+		config.WithThinkingLevels(o.thinking, o.judgeThinking),
+		config.WithUseJudgePipeline(o.useJudge),
+		config.WithAgenticMode(o.agenticMode),
+		config.WithAutoFormat(o.autoFormat),
+		config.WithRemoveFillers(o.removeFillers),
+		config.WithChunkStrategy(o.chunkStrategy),
+		config.WithChunkDurationMS(o.chunkDuration),
+		config.WithChunkOverlapMS(o.chunkOverlap),
+		config.WithChunkConcurrency(o.chunkConcurrency),
+		config.WithMaxFileSizeMB(o.maxFileSizeMB),
+		config.WithAgentMaxTokens(o.agentMaxTokens),
+		config.WithAgentMaxWallTimeSeconds(int(o.maxRunTime / time.Second)),
+		config.WithUseSkillRouter(o.skillRouter),
+	}
+}
+
 func main() {
 	if err := run(); err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
@@ -66,8 +110,8 @@ func run() error {
 		input              = flag.String("i", "", "Audio file path (required)")
 		output             = flag.String("o", "", "Output file path (default stdout)")
 		format             = flag.String("format", "txt", "Output format: txt, srt, json")
-		model              = flag.String("model", "gemini-3.5-flash", "Primary Gemini model")
-		judgeModel         = flag.String("judge-model", "gemini-3.5-flash", "Judge Gemini model")
+		model              = flag.String("model", config.DefaultTranscriptionModel, "Transcription model (Gemini, Muse Voice Transcribe, or MAI-Transcribe-2)")
+		judgeModel         = flag.String("judge-model", config.DefaultJudgeModel, "Judge Gemini model")
 		strategy           = flag.String("strategy", "dual_gemini", "Candidate strategy")
 		serviceTier        = flag.String("service-tier", "", "Gemini service tier: standard, flex, priority")
 		thinking           = flag.String("thinking", "high", "Transcription thinking level")
@@ -89,6 +133,8 @@ func run() error {
 		chunkOverlap       = flag.Int("chunk-overlap-ms", 5000, "Chunk overlap (ms)")
 		chunkConcurrency   = flag.Int("chunk-concurrency", 3, "Maximum chunk transcription/judge workers")
 		maxFileSizeMB      = flag.Int("max-file-size-mb", 200, "Maximum input audio size in MiB")
+		agentMaxTokens     = flag.Int("agent-max-tokens", 1_000_000, "Maximum total model tokens per run")
+		maxRunTime         = flag.Duration("max-run-time", 30*time.Minute, "Maximum wall-clock time per run")
 		skillsDir          = flag.String("skills-dir", envDefault("SKILLS_DIR", ".skills"), "Directory of skill packs (SKILL.md folders)")
 		skillRouter        = flag.Bool("skill-router", false, "Let the model auto-select a format skill when no expected-format is given")
 		showVersion        = flag.Bool("version", false, "Print version and exit")
@@ -98,7 +144,7 @@ func run() error {
 		fmt.Println(version)
 		return nil
 	}
-	if strings.TrimSpace(*apiKey) == "" {
+	if strings.TrimSpace(*apiKey) == "" && !config.IsExternalSpeechModel(*model) {
 		return fmt.Errorf("missing API key (pass --api-key or set GEMINI_API_KEY)")
 	}
 	if strings.TrimSpace(*input) == "" {
@@ -114,23 +160,26 @@ func run() error {
 	logger := obs.NewLogger(logCfg)
 	obs.Install(logger)
 
-	opts := []config.TranscriptionOption{
-		config.WithModelName(*model),
-		config.WithJudgeModelName(*judgeModel),
-		config.WithCandidateStrategy(*strategy),
-		config.WithServiceTier(*serviceTier),
-		config.WithThinkingLevels(*thinking, *judgeThinking),
-		config.WithUseJudgePipeline(*useJudge),
-		config.WithAgenticMode(*agenticMode),
-		config.WithAutoFormat(*autoFormat),
-		config.WithRemoveFillers(*removeFillers),
-		config.WithChunkStrategy(*chunkStrategy),
-		config.WithChunkDurationMS(*chunkDuration),
-		config.WithChunkOverlapMS(*chunkOverlap),
-		config.WithChunkConcurrency(*chunkConcurrency),
-		config.WithMaxFileSizeMB(*maxFileSizeMB),
-		config.WithUseSkillRouter(*skillRouter),
-	}
+	opts := transcriptionOptions(cliOptions{
+		model:            *model,
+		judgeModel:       *judgeModel,
+		strategy:         *strategy,
+		serviceTier:      *serviceTier,
+		thinking:         *thinking,
+		judgeThinking:    *judgeThinking,
+		useJudge:         *useJudge,
+		agenticMode:      *agenticMode,
+		autoFormat:       *autoFormat,
+		removeFillers:    *removeFillers,
+		chunkStrategy:    *chunkStrategy,
+		chunkDuration:    *chunkDuration,
+		chunkOverlap:     *chunkOverlap,
+		chunkConcurrency: *chunkConcurrency,
+		maxFileSizeMB:    *maxFileSizeMB,
+		agentMaxTokens:   *agentMaxTokens,
+		maxRunTime:       *maxRunTime,
+		skillRouter:      *skillRouter,
+	})
 
 	wfl, err := workflow.New(*apiKey, opts...)
 	if err != nil {
@@ -199,7 +248,7 @@ func run() error {
 
 	result, err := wfl.Transcribe(ctx, workflow.TranscribeInput{
 		FilePath:    *input,
-		Filename:    *input,
+		Filename:    transcriptFilename(*input),
 		Progress:    progress,
 		UserContext: userCtx,
 	})
@@ -228,4 +277,10 @@ func run() error {
 		fmt.Fprintln(out)
 	}
 	return nil
+}
+
+// transcriptFilename strips host-specific directory information before the
+// input name is persisted in transcript metadata.
+func transcriptFilename(inputPath string) string {
+	return filepath.Base(inputPath)
 }

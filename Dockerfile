@@ -1,7 +1,7 @@
-# syntax=docker/dockerfile:1.7
+# syntax=docker/dockerfile:1
 
 # ---- Stage 1: build ---------------------------------------------------------
-FROM golang:1.26-alpine AS builder
+FROM golang:1.26.5-alpine3.24 AS builder
 
 ARG VERSION=dev
 WORKDIR /src
@@ -25,7 +25,7 @@ RUN CGO_ENABLED=0 GOOS=linux go build \
 # ---- Stage 2: runtime -------------------------------------------------------
 # We need ffmpeg/ffprobe at runtime for audio chunking, so we use a small
 # alpine base (distroless lacks them).
-FROM alpine:3.21
+FROM alpine:3.24.1
 
 RUN apk add --no-cache ffmpeg ca-certificates tini \
  && addgroup -S transcriber \

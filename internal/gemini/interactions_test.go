@@ -133,6 +133,98 @@ func TestCreateInteractionRoutesPreviewModelsToBeta(t *testing.T) {
 	}
 }
 
+func TestInteractionAPIVersionRoutesCurrentGAModelsToStable(t *testing.T) {
+	for _, model := range []string{
+		"gemini-3.6-flash",
+		"models/gemini-3.6-flash",
+		"gemini-3.5-flash-lite",
+		"models/gemini-3.5-flash-lite",
+	} {
+		t.Run(model, func(t *testing.T) {
+			if got := interactionAPIVersion(model, ""); got != "v1" {
+				t.Fatalf("interactionAPIVersion(%q) = %q, want v1", model, got)
+			}
+		})
+	}
+}
+
+func TestInteractionTextReturnsTrailingConsecutiveTextContent(t *testing.T) {
+	interaction := &Interaction{Steps: []InteractionStep{
+		{Type: "model_output", Content: []InteractionContent{{Type: "text", Text: "old"}}},
+		{Type: "thought", Summary: []InteractionContent{{Type: "text", Text: "not output"}}},
+		{Type: "model_output", Content: []InteractionContent{
+			{Type: "image", Data: "ignored"},
+			{Type: "text", Text: "final "},
+		}},
+		{Type: "model_output", Content: []InteractionContent{
+			{Type: "text", Text: "answer"},
+			{Type: "text", Text: "."},
+		}},
+	}}
+	if got := interaction.Text(); got != "final answer." {
+		t.Fatalf("Text() = %q, want trailing consecutive text", got)
+	}
+}
+
+func TestInteractionTextFallsBackWhenTrailingRunIsEmpty(t *testing.T) {
+	tests := []struct {
+		name  string
+		steps []InteractionStep
+		want  string
+	}{
+		{
+			name: "non-text step",
+			steps: []InteractionStep{
+				{Type: "model_output", Content: []InteractionContent{{Type: "text", Text: "earlier"}}},
+				{Type: "function_call", Name: "inspect"},
+			},
+			want: "earlier",
+		},
+		{
+			name: "trailing thought step",
+			steps: []InteractionStep{
+				{Type: "model_output", Content: []InteractionContent{{Type: "text", Text: "earlier"}}},
+				{Type: "thought", Summary: []InteractionContent{{Type: "text", Text: "not output"}}},
+			},
+			want: "earlier",
+		},
+		{
+			name: "non-text content",
+			steps: []InteractionStep{
+				{Type: "model_output", Content: []InteractionContent{
+					{Type: "text", Text: "ear"},
+					{Type: "text", Text: "lier"},
+					{Type: "image", Data: "final"},
+				}},
+			},
+			want: "earlier",
+		},
+		{
+			name: "empty model output",
+			steps: []InteractionStep{
+				{Type: "model_output", Content: []InteractionContent{{Type: "text", Text: "earlier"}}},
+				{Type: "model_output"},
+			},
+			want: "earlier",
+		},
+		{
+			name: "no text anywhere",
+			steps: []InteractionStep{
+				{Type: "model_output", Content: []InteractionContent{{Type: "image", Data: "only"}}},
+				{Type: "function_call", Name: "inspect"},
+			},
+			want: "",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := (&Interaction{Steps: test.steps}).Text(); got != test.want {
+				t.Fatalf("Text() = %q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
 func TestCreateInteractionRetriesTransientResponse(t *testing.T) {
 	var attempts atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -506,5 +598,28 @@ func TestInteractionObserverAccountsEveryTurn(t *testing.T) {
 	}
 	if requests != 2 || tools != 1 || inputTokens != 9 {
 		t.Fatalf("observer accounting requests=%d tools=%d input=%d", requests, tools, inputTokens)
+	}
+}
+
+// The current v1 reference does not list Gemini 3.8 Flash; use beta even
+// though the model itself has a stable release name.
+func TestGemini38UsesBetaInteractions(t *testing.T) {
+	for _, tier := range []string{"", "standard", "flex", "priority"} {
+		if got := interactionAPIVersion("gemini-3.8-flash", tier); got != "v1beta" {
+			t.Errorf("tier %q uses %s", tier, got)
+		}
+	}
+}
+
+func TestCurrentInteractionDiagnostics(t *testing.T) {
+	var response Interaction
+	if err := json.Unmarshal([]byte(`{"status":"failed","errors":[{"code":"quota_exceeded","message":"try later"}]}`), &response); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateInteractionStatus(&response); err == nil || !strings.Contains(err.Error(), "try later") {
+		t.Fatalf("missing diagnostic: %v", err)
+	}
+	if err := validateInteractionStatus(&Interaction{Status: "queued"}); err == nil {
+		t.Fatal("accepted queued synchronous response")
 	}
 }

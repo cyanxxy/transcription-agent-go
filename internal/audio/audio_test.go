@@ -197,3 +197,51 @@ func TestChunkifyProducesPlayableWavChunks(t *testing.T) {
 		t.Fatalf("first chunk duration %dms outside tolerance 3000..5000ms", first.DurationMS)
 	}
 }
+
+func TestDetectSilenceAndChunkifyAdaptive(t *testing.T) {
+	if _, err := exec.LookPath("ffmpeg"); err != nil {
+		t.Skip("ffmpeg not found in PATH")
+	}
+	if _, err := exec.LookPath("ffprobe"); err != nil {
+		t.Skip("ffprobe not found in PATH")
+	}
+
+	ctx := context.Background()
+	wavPath := filepath.Join(t.TempDir(), "speech-with-silence.wav")
+	gen := exec.CommandContext(
+		ctx,
+		"ffmpeg",
+		"-hide_banner",
+		"-loglevel", "error",
+		"-f", "lavfi", "-i", "sine=frequency=440:sample_rate=16000:duration=19",
+		"-f", "lavfi", "-i", "anullsrc=channel_layout=mono:sample_rate=16000:duration=4",
+		"-f", "lavfi", "-i", "sine=frequency=660:sample_rate=16000:duration=17",
+		"-filter_complex", "[0:a][1:a][2:a]concat=n=3:v=0:a=1[out]",
+		"-map", "[out]",
+		"-ar", "16000",
+		"-ac", "1",
+		"-y", wavPath,
+	)
+	if output, err := gen.CombinedOutput(); err != nil {
+		t.Fatalf("generate audio: %v: %s", err, output)
+	}
+
+	spans, err := DetectSilence(ctx, wavPath)
+	if err != nil {
+		t.Fatalf("DetectSilence: %v", err)
+	}
+	if len(spans) == 0 {
+		t.Fatal("expected the generated quiet interval to be detected")
+	}
+
+	chunks, err := ChunkifyAdaptive(ctx, wavPath, t.TempDir(), 20000, 5000)
+	if err != nil {
+		t.Fatalf("ChunkifyAdaptive: %v", err)
+	}
+	if len(chunks) < 2 {
+		t.Fatalf("adaptive chunking produced %d chunks, want at least 2", len(chunks))
+	}
+	if chunks[0].BoundaryType != BoundarySilence {
+		t.Fatalf("first adaptive boundary = %q, want %q; spans=%#v chunks=%#v", chunks[0].BoundaryType, BoundarySilence, spans, chunks)
+	}
+}

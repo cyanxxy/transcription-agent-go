@@ -892,3 +892,5 @@ button:disabled {
     transition-duration: 0.01ms !important;
   }
 }
+
+[hidden] { display: none !important; }
