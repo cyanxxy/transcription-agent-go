@@ -241,7 +241,7 @@ func NewTranscriptionDeps(apiKey string, opts ...TranscriptionOption) (*Transcri
 			limit -= 30000
 		}
 		if d.ChunkDurationMS > limit {
-			return nil, fmt.Errorf("Meta chunk_duration_ms must not exceed %d with %s chunking", limit, d.ChunkStrategy)
+			return nil, fmt.Errorf("meta chunk_duration_ms must not exceed %d with %s chunking", limit, d.ChunkStrategy)
 		}
 	}
 	if d.ChunkOverlapMS < 0 {
