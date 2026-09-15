@@ -25,11 +25,11 @@ func ValidateSpeechCredentials(d *config.TranscriptionDeps) error {
 	switch d.ModelName {
 	case config.MetaTranscriptionModel:
 		if strings.TrimSpace(d.MetaAPIKey) == "" {
-			return fmt.Errorf("Meta Muse Voice Transcribe requires META_API_KEY")
+			return fmt.Errorf("meta Muse Voice Transcribe requires META_API_KEY")
 		}
 	case config.MicrosoftTranscriptionModel:
 		if strings.TrimSpace(d.AzureSpeechKey) == "" {
-			return fmt.Errorf("Microsoft MAI-Transcribe-2 requires AZURE_SPEECH_KEY")
+			return fmt.Errorf("microsoft MAI-Transcribe-2 requires AZURE_SPEECH_KEY")
 		}
 		u, err := url.Parse(d.AzureSpeechEndpoint)
 		if err != nil || u.Scheme != "https" || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" || (u.Path != "" && u.Path != "/") {
@@ -45,7 +45,7 @@ func (a *TranscriptionAgent) runExternalSpeech(ctx context.Context, in Transcrib
 		return nil, err
 	}
 	if d.ModelName == config.MetaTranscriptionModel && in.AudioDurationSeconds > 600 {
-		return nil, fmt.Errorf("Meta file transcription is limited to 10 minutes per chunk")
+		return nil, fmt.Errorf("meta file transcription is limited to 10 minutes per chunk")
 	}
 	// Both APIs accept WAV. Normalize every input, including short M4A/MP4 uploads.
 	wav, err := os.CreateTemp(d.TempDir, "speech-*.wav")

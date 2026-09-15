@@ -231,7 +231,7 @@ func validateJobOptions(apiKey string, opts []config.TranscriptionOption) error 
 	if err != nil {
 		return err
 	}
-	defer deps.Cleanup()
+	defer func() { _ = deps.Cleanup() }()
 	return agents.ValidateSpeechCredentials(deps)
 }
 
