@@ -5,6 +5,7 @@ package agents
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math"
@@ -135,6 +136,9 @@ func (a *TranscriptionAgent) Run(ctx context.Context, in TranscribeInput) ([]mod
 		}
 	}
 	logger := obs.LoggerFrom(ctx).With("component", "transcription", "model", a.Deps.ModelName)
+	if in.ChunkInfo != nil {
+		logger = logger.With("chunk_index", in.ChunkInfo.Index+1, "chunk_start_ms", in.ChunkInfo.StartMS, "chunk_end_ms", in.ChunkInfo.EndMS)
+	}
 	file := in.UploadedFile
 	ownedUpload := false
 	if file == nil {
@@ -204,6 +208,18 @@ func (a *TranscriptionAgent) Run(ctx context.Context, in TranscribeInput) ([]mod
 	var segments []models.TranscriptSegment
 	if a.Deps.ModelName == config.DefaultTranscriptionModel {
 		segments, err = parseTranscribeSegments(resp)
+		if errors.Is(err, ErrNoWordAnnotations) {
+			if text := strings.TrimSpace(resp.Text()); text != "" {
+				logger.Warn("Gemini returned transcript text without requested word timestamps")
+				segments = []models.TranscriptSegment{{
+					Timestamp: "[00:00:00]", Speaker: "Untranscribed",
+					Text: "[word timestamps unavailable] " + text,
+				}}
+				err = nil
+			} else {
+				logger.Warn("Gemini returned no transcript text or word annotations")
+			}
+		}
 	} else {
 		segments, err = parseSegments(resp.Text())
 	}

@@ -3,6 +3,7 @@ package agents
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -198,5 +199,43 @@ func TestTranscribeWordByteOffsets(t *testing.T) {
 	end = 100
 	if _, err := parseTranscribeSegments(resp); err == nil {
 		t.Fatal("accepted invalid range")
+	}
+}
+
+func TestTranscribeWithoutWordAnnotations(t *testing.T) {
+	for _, tc := range []struct {
+		name, response, wantText string
+		wantError                bool
+	}{
+		{"text without annotations", `{"id":"speech","status":"completed","steps":[{"type":"model_output","content":[{"type":"text","text":"Hello world"}]}]}`, "[word timestamps unavailable] Hello world", false},
+		{"empty completed response", `{"id":"speech","status":"completed","steps":[]}`, "", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				_, _ = w.Write([]byte(tc.response))
+			}))
+			defer srv.Close()
+			deps, err := config.NewTranscriptionDeps("test")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer deps.Cleanup()
+			agent := NewTranscriptionAgent(deps, gemini.NewClient("test").WithEndpoint(srv.URL))
+			segments, err := agent.Run(context.Background(), TranscribeInput{
+				AudioPath:    "audio.m4a",
+				UploadedFile: &gemini.FileInfo{URI: "https://files.example/audio", MIMEType: "audio/m4a"},
+				ChunkInfo:    &ChunkInfo{StartMS: 30000, DurationMS: 10000},
+			})
+			if tc.wantError {
+				if !errors.Is(err, ErrNoWordAnnotations) {
+					t.Fatalf("error = %v, want ErrNoWordAnnotations", err)
+				}
+				return
+			}
+			if err != nil || len(segments) != 1 || segments[0].Timestamp != "[00:00:30]" ||
+				segments[0].Speaker != "Untranscribed" || segments[0].Text != tc.wantText {
+				t.Fatalf("segments = %#v, error = %v", segments, err)
+			}
+		})
 	}
 }

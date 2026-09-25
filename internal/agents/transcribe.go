@@ -1,6 +1,7 @@
 package agents
 
 import (
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -10,6 +11,11 @@ import (
 	"github.com/cyanxxy/transcription-agent-go/internal/gemini"
 	"github.com/cyanxxy/transcription-agent-go/internal/models"
 )
+
+// ErrNoWordAnnotations means Gemini completed a transcription request without
+// the timestamped words requested by the caller. A chunked workflow can keep
+// its other chunks and mark this interval for review.
+var ErrNoWordAnnotations = errors.New("transcription returned no word annotations with timestamps")
 
 // parseTranscribeSegments groups word annotations into speaker turns, splitting
 // on sentence endings, pauses, and long utterances. Offsets are relative to the
@@ -101,7 +107,7 @@ func parseTranscribeSegments(resp *gemini.Interaction) ([]models.TranscriptSegme
 	}
 	flush()
 	if len(segments) == 0 {
-		return nil, fmt.Errorf("transcription returned no word annotations with timestamps")
+		return nil, ErrNoWordAnnotations
 	}
 	return validateAndCleanSegments(segments)
 }

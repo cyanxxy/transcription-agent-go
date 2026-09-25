@@ -40,7 +40,7 @@ jobs:
       - name: golangci-lint
         uses: golangci/golangci-lint-action@v9.3.0
         with:
-          version: v2.12.2
+          version: v2.14.0
 
       - name: Scan for known vulnerabilities
         uses: golang/govulncheck-action@v1.1.0

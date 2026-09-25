@@ -3,7 +3,8 @@
 //
 // Example:
 //
-//	transcriber-cli --api-key $GEMINI_API_KEY -i meeting.m4a -format srt -o out.srt
+//	transcriber-cli auth set gemini
+//	transcriber-cli -i meeting.m4a -format srt -o out.srt
 //
 // SIGINT/SIGTERM cancel the in-flight transcription cleanly. Structured logs
 // go to stderr (set LOG_FORMAT=text for a friendlier console view).
@@ -105,8 +106,11 @@ func main() {
 }
 
 func run() error {
+	if len(os.Args) > 1 && os.Args[1] == "auth" {
+		return runAuth(os.Args[2:])
+	}
 	var (
-		apiKey             = flag.String("api-key", os.Getenv("GEMINI_API_KEY"), "Gemini API key (or GEMINI_API_KEY env)")
+		apiKey             = flag.String("api-key", os.Getenv("GEMINI_API_KEY"), "Gemini API key (or GEMINI_API_KEY env or saved credentials)")
 		input              = flag.String("i", "", "Audio file path (required)")
 		output             = flag.String("o", "", "Output file path (default stdout)")
 		format             = flag.String("format", "txt", "Output format: txt, srt, json")
@@ -144,8 +148,11 @@ func run() error {
 		fmt.Println(version)
 		return nil
 	}
+	if err := applyStoredCredentials(*model, apiKey); err != nil {
+		return err
+	}
 	if strings.TrimSpace(*apiKey) == "" && !config.IsExternalSpeechModel(*model) {
-		return fmt.Errorf("missing API key (pass --api-key or set GEMINI_API_KEY)")
+		return fmt.Errorf("missing API key (run 'transcriber-cli auth set gemini', pass --api-key, or set GEMINI_API_KEY)")
 	}
 	if strings.TrimSpace(*input) == "" {
 		return fmt.Errorf("--i is required")

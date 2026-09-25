@@ -284,7 +284,16 @@ func (w *Workflow) Transcribe(ctx context.Context, in TranscribeInput) (*models.
 			in.Progress("Formatting transcript...", 0.7)
 		}
 		finalSegments, resultEdited = w.applyOutputCleanup(runDeps, finalSegments)
-		if !config.IsDirectSpeechModel(runDeps.ModelName) {
+		needsQuality := !config.IsDirectSpeechModel(runDeps.ModelName)
+		if !needsQuality {
+			for _, seg := range finalSegments {
+				if seg.Speaker == "Untranscribed" {
+					needsQuality = true
+					break
+				}
+			}
+		}
+		if needsQuality {
 			if in.Progress != nil {
 				in.Progress("Analyzing quality...", 0.8)
 			}
@@ -1571,11 +1580,18 @@ func (w *Workflow) runDirectPipeline(
 		}
 		all, err := parallelMapOrdered(ctx, chunks, deps.ChunkConcurrency,
 			func(ctx context.Context, _ int, chunk audio.Chunk) ([]models.TranscriptSegment, error) {
-				return agents.NewTranscriptionAgent(deps, w.Client).Run(ctx, agents.TranscribeInput{
+				segs, err := agents.NewTranscriptionAgent(deps, w.Client).Run(ctx, agents.TranscribeInput{
 					AudioPath:            chunk.Path,
 					ChunkInfo:            &agents.ChunkInfo{Index: chunk.Index, StartMS: chunk.StartMS, EndMS: chunk.EndMS, DurationMS: chunk.DurationMS},
 					AudioDurationSeconds: float64(chunk.DurationMS) / 1000,
 				})
+				if errors.Is(err, agents.ErrNoWordAnnotations) {
+					return []models.TranscriptSegment{buildGapMarker(
+						&agents.ChunkInfo{StartMS: chunk.StartMS},
+						fmt.Sprintf("chunk %d of %d", chunk.Index+1, len(chunks)),
+					)}, nil
+				}
+				return segs, err
 			}, func(completed int) {
 				if progress != nil {
 					progress(fmt.Sprintf("Transcribed %d/%d chunks...", completed, len(chunks)), 0.3+0.4*float64(completed)/float64(len(chunks)))

@@ -94,7 +94,7 @@ The web UI, durable jobs, chunking, and exports support all providers.
 - **Race-safe control plane.** A legal job-state machine linearizes start,
   cancellation, completion, review, expiry, and shutdown recovery. Terminal
   review-expiry events remain replayable before retention cleanup.
-- **Minimal footprint.** Standard library + `go.yaml.in/yaml/v3`; an external
+- **Minimal footprint.** Standard library, `go.yaml.in/yaml/v3`, and `golang.org/x/term`; an external
   `ffmpeg`/`ffprobe` for audio inspection.
 
 ## Quickstart
@@ -106,20 +106,26 @@ git clone https://github.com/cyanxxy/transcription-agent-go.git
 cd transcription-agent-go
 make build                       # -> bin/transcription-server, bin/transcriber-cli
 
-export GEMINI_API_KEY=...
-
 # Run the streaming web service, then open http://localhost:8080
-./bin/transcription-server --addr :8080
+./bin/transcription-server --addr 127.0.0.1:8080
 
-# …or transcribe a file one-shot from the CLI
-./bin/transcriber-cli --api-key "$GEMINI_API_KEY" -i meeting.m4a -format srt -o meeting.srt
+# Enter one Gemini API key in the web page's Setup section.
+# Alternatively, set GEMINI_API_KEY in the server environment.
+
+# …or configure the CLI once and transcribe a file one-shot
+./bin/transcriber-cli auth set gemini
+./bin/transcriber-cli -i meeting.m4a -format srt -o meeting.srt
 ```
 
 > Supported input formats: `mp3`, `wav`, `m4a`, `flac`, `ogg`.
 
 ### Credentials
 
-Set credentials for the providers you want to use in the server environment:
+For Gemini, open the web page on localhost and save one API key in the Setup
+section. The server saves it in `data/jobs/gemini-api-key.json` with owner-only
+permissions, so it is available after a restart. The key is not stored in the
+browser or included in job journals. You can also set credentials in the server
+environment:
 
 | Provider | Required configuration |
 |---|---|
@@ -127,7 +133,16 @@ Set credentials for the providers you want to use in the server environment:
 | Meta | `META_API_KEY` |
 | Microsoft | `AZURE_SPEECH_KEY` and `AZURE_SPEECH_ENDPOINT` |
 
-Provider keys are never entered into the web UI. The UI's **Server access
+The CLI can save provider credentials separately from the server. Run
+`transcriber-cli auth set gemini` (or `meta` or `microsoft`) in a terminal to
+enter a key without echoing it. `auth status` reports which providers are
+configured without printing keys; `auth remove <provider>` deletes saved
+credentials. The CLI stores plaintext credentials in an owner-only file under
+the OS user config directory at `transcription-agent/credentials.json`.
+Environment variables take precedence over saved credentials. Set
+`TRANSCRIBER_CREDENTIALS_FILE` to an absolute path to use another file.
+
+Meta and Microsoft credentials are configured through the environment. The UI's **Server access
 token** field is only for the optional bearer token configured through
 `API_AUTH_TOKEN` or `--auth-token`; it authenticates to this app, not a model
 provider. Restart the server after changing its environment. See
@@ -326,7 +341,6 @@ and [Microsoft MAI-Transcribe-2 documentation](https://learn.microsoft.com/en-us
 
 ```bash
 ./bin/transcriber-cli \
-  --api-key "$GEMINI_API_KEY" \
   -i meeting.m4a \
   --model gemini-3.5-transcribe \
   --chunk-strategy adaptive \

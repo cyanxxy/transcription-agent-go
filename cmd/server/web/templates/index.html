@@ -24,6 +24,22 @@
       </div>
     </header>
 
+    <section class="glass-panel" id="key-card">
+      <div class="section-heading">
+        <p class="eyebrow">Setup</p>
+        <h2>Gemini API key</h2>
+      </div>
+      <div class="key-controls">
+        <label>
+          <span>Provider key</span>
+          <input id="gemini-api-key" type="password" autocomplete="off" spellcheck="false" autocapitalize="off" placeholder="Enter your Gemini API key" />
+        </label>
+        <button type="button" class="ghost" id="save-gemini-key">Save key</button>
+      </div>
+      <p class="hint" id="gemini-key-status" role="status" aria-live="polite">Checking key setup…</p>
+      <p class="hint">Saved only on this server. Open this page on localhost to add or replace the key. If server access authentication is enabled, enter that token below first.</p>
+    </section>
+
     <section class="glass-panel" id="upload-card">
       <div class="section-heading">
         <p class="eyebrow">Input</p>

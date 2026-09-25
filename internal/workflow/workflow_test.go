@@ -531,13 +531,20 @@ func TestTranscribeEndToEndDirectPipeline(t *testing.T) {
 		t.Skip("ffprobe not installed")
 	}
 
-	for _, duration := range []string{"2", "22"} {
-		t.Run(duration+"seconds", func(t *testing.T) {
+	for _, tc := range []struct {
+		name, duration string
+		emptyFirst     bool
+	}{
+		{"2seconds", "2", false},
+		{"22seconds", "22", false},
+		{"22seconds-empty-chunk", "22", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
 			tmp := t.TempDir()
 			wavPath := filepath.Join(tmp, "sine.wav")
 			if err := exec.Command("ffmpeg",
 				"-f", "lavfi",
-				"-i", "sine=frequency=440:duration="+duration,
+				"-i", "sine=frequency=440:duration="+tc.duration,
 				"-ar", "16000",
 				"-ac", "1",
 				"-y", wavPath,
@@ -585,7 +592,7 @@ func TestTranscribeEndToEndDirectPipeline(t *testing.T) {
 			})
 
 			mux.HandleFunc("/v1beta/interactions", func(w http.ResponseWriter, r *http.Request) {
-				transcribeRequests.Add(1)
+				requestNumber := transcribeRequests.Add(1)
 				var req gemini.InteractionRequest
 				if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 					t.Error(err)
@@ -593,6 +600,10 @@ func TestTranscribeEndToEndDirectPipeline(t *testing.T) {
 				}
 				if req.Model != config.DefaultTranscriptionModel || req.GenerationConfig.TranscriptionConfig == nil {
 					t.Errorf("unexpected transcription request: %#v", req)
+				}
+				if tc.emptyFirst && requestNumber == 1 {
+					_, _ = w.Write([]byte(`{"id":"transcribe","status":"completed","steps":[]}`))
+					return
 				}
 				_, _ = w.Write([]byte(`{"id":"transcribe","status":"completed","steps":[{"type":"model_output","content":[{"type":"text","text":"Hello world","annotations":[{"type":"word_info","text":"Hello","speaker":"spk_1","start_offset":"0.1s","end_offset":"0.4s"},{"type":"word_info","text":"world","speaker":"spk_1","start_offset":"0.5s","end_offset":"0.9s"}]}]}]}`))
 			})
@@ -620,7 +631,20 @@ func TestTranscribeEndToEndDirectPipeline(t *testing.T) {
 				t.Fatalf("expected at least one segment, got %d", len(res.Segments))
 			}
 			if !strings.Contains(res.Segments[0].Text, "Hello") {
-				t.Errorf("first segment text = %q, expected to contain Hello", res.Segments[0].Text)
+				if !tc.emptyFirst {
+					t.Errorf("first segment text = %q, expected to contain Hello", res.Segments[0].Text)
+				}
+			}
+			if tc.emptyFirst {
+				gaps := 0
+				for _, seg := range res.Segments {
+					if seg.Speaker == "Untranscribed" && strings.Contains(seg.Text, "no transcript produced for chunk") {
+						gaps++
+					}
+				}
+				if gaps != 1 || len(res.Quality.Issues) == 0 || res.Quality.Issues[0]["code"] != "incomplete_transcript" {
+					t.Fatalf("empty chunk was not marked for review: gaps=%d quality=%#v", gaps, res.Quality)
+				}
 			}
 			if res.JudgeUsed || res.JudgeModelUsed != "" || len(res.JudgeNotes) != 0 || len(res.Candidates) != 0 {
 				t.Fatalf("unexpected judging metadata: %#v", res)

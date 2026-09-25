@@ -151,7 +151,7 @@ func (s *server) createJobHTTP(w http.ResponseWriter, r *http.Request) {
 		respondError(w, r, status, "invalid upload", err)
 		return
 	}
-	if err := validateJobOptions(s.apiKey, s.buildOptionsFromValues(jb.request.Form)); err != nil {
+	if err := validateJobOptions(s.currentAPIKey(), s.buildOptionsFromValues(jb.request.Form)); err != nil {
 		_ = os.RemoveAll(jb.dir)
 		respondError(w, r, http.StatusBadRequest, "invalid configuration", err)
 		return

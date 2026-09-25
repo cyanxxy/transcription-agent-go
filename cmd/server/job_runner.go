@@ -51,6 +51,13 @@ func (s *server) jobWorker(workerID int) {
 			if jb == nil {
 				continue
 			}
+			if s.credentialsReady != nil {
+				select {
+				case <-s.credentialsReady:
+				case <-s.workerCtx.Done():
+					return
+				}
+			}
 			if s.workerCtx.Err() != nil {
 				return
 			}
@@ -206,7 +213,7 @@ func (s *server) transcribePersistedJob(ctx context.Context, jb *job, progress w
 	if err != nil {
 		return nil, err
 	}
-	wfl, err := workflow.New(s.apiKey, s.buildOptionsFromValues(jb.request.Form)...)
+	wfl, err := workflow.New(s.currentAPIKey(), s.buildOptionsFromValues(jb.request.Form)...)
 	if err != nil {
 		return nil, err
 	}

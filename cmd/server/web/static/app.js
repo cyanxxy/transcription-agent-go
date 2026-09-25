@@ -47,6 +47,9 @@
   let currentJobId = null;
   let currentStream = null;
   const authToken = $('auth-token');
+  const geminiKeyInput = $('gemini-api-key');
+  const saveGeminiKey = $('save-gemini-key');
+  const geminiKeyStatus = $('gemini-key-status');
   const cancelJob = $('cancel-job');
   const reviewPanel = $('review-panel');
   const reviewActions = $('review-actions');
@@ -64,6 +67,46 @@
     const token = authToken.value.trim();
     return token ? { ...extra, Authorization: `Bearer ${token}` } : extra;
   }
+
+  async function refreshGeminiKeyStatus() {
+    try {
+      const response = await fetch('/api/config', { cache: 'no-store' });
+      if (!response.ok) throw new Error(`server returned ${response.status}`);
+      const state = await response.json();
+      geminiKeyStatus.textContent = state.gemini_configured ? 'Gemini key is configured.' : 'Add a Gemini key to start transcribing.';
+      geminiKeyInput.disabled = !state.can_set_gemini_key;
+      saveGeminiKey.hidden = !state.can_set_gemini_key;
+    } catch (error) {
+      geminiKeyStatus.textContent = `Could not check Gemini key: ${error.message}`;
+    }
+  }
+
+  saveGeminiKey.addEventListener('click', async () => {
+    const key = geminiKeyInput.value.trim();
+    if (!key) {
+      geminiKeyStatus.textContent = 'Enter a Gemini API key first.';
+      geminiKeyInput.focus();
+      return;
+    }
+    saveGeminiKey.disabled = true;
+    geminiKeyStatus.textContent = 'Saving key…';
+    try {
+      const response = await fetch('/api/config/gemini-key', {
+        method: 'POST',
+        headers: authHeaders({ 'Content-Type': 'application/json' }),
+        body: JSON.stringify({ api_key: key }),
+      });
+      if (!response.ok) throw new Error(`server returned ${response.status}. Use localhost and check the server access token if configured.`);
+      geminiKeyInput.value = '';
+      geminiKeyStatus.textContent = 'Gemini key saved on this server. You can transcribe now.';
+    } catch (error) {
+      geminiKeyStatus.textContent = `Could not save key: ${error.message}`;
+    } finally {
+      saveGeminiKey.disabled = false;
+    }
+  });
+
+  void refreshGeminiKeyStatus();
 
   async function postJobAction(action, body) {
     if (!currentJobId) return;

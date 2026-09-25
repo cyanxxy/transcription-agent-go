@@ -69,37 +69,41 @@ const (
 )
 
 type server struct {
-	apiKey         string
-	authToken      string // optional shared bearer token required for POST /api/jobs
-	tempDir        string
-	parakeet       string
-	jobTTL         time.Duration
-	maxUploadBytes int64
-	maxConcurrency int
-	maxQueued      int
-	agentMaxTokens int
-	maxRunTime     time.Duration
-	jobDir         string
-	shutdownGrace  time.Duration
-	logger         *slog.Logger
-	indexHTML      []byte
-	static         http.Handler
-	jobs           sync.Map // map[string]*job
-	queue          chan *job
-	workerCtx      context.Context
-	stopWorkers    context.CancelFunc
-	jobWG          sync.WaitGroup
-	jobsMu         sync.Mutex
-	cancelFns      map[string]context.CancelFunc // for shutdown to cancel in-flight jobs
-	admissionMu    sync.Mutex
-	admitted       int
-	idempotencyMu  sync.Mutex
-	idempotency    map[string]*idempotencyBinding
-	ready          atomic.Bool
-	skillsReg      *skills.Registry
-	skillRouter    bool
-	generateID     func(int) (string, error)
-	removeJobDir   func(string) error
+	apiKey           string
+	apiKeyMu         sync.RWMutex
+	apiKeyFromEnv    bool
+	credentialsReady chan struct{}
+	credentialsOnce  sync.Once
+	authToken        string // optional shared bearer token required for POST /api/jobs
+	tempDir          string
+	parakeet         string
+	jobTTL           time.Duration
+	maxUploadBytes   int64
+	maxConcurrency   int
+	maxQueued        int
+	agentMaxTokens   int
+	maxRunTime       time.Duration
+	jobDir           string
+	shutdownGrace    time.Duration
+	logger           *slog.Logger
+	indexHTML        []byte
+	static           http.Handler
+	jobs             sync.Map // map[string]*job
+	queue            chan *job
+	workerCtx        context.Context
+	stopWorkers      context.CancelFunc
+	jobWG            sync.WaitGroup
+	jobsMu           sync.Mutex
+	cancelFns        map[string]context.CancelFunc // for shutdown to cancel in-flight jobs
+	admissionMu      sync.Mutex
+	admitted         int
+	idempotencyMu    sync.Mutex
+	idempotency      map[string]*idempotencyBinding
+	ready            atomic.Bool
+	skillsReg        *skills.Registry
+	skillRouter      bool
+	generateID       func(int) (string, error)
+	removeJobDir     func(string) error
 }
 
 func main() {
@@ -129,28 +133,25 @@ func main() {
 	logger := obs.NewLogger(obs.DefaultConfig())
 	obs.Install(logger)
 
-	if strings.TrimSpace(*apiKey) == "" && strings.TrimSpace(os.Getenv("META_API_KEY")) == "" && strings.TrimSpace(os.Getenv("AZURE_SPEECH_KEY")) == "" {
-		logger.Error("missing credentials: set GEMINI_API_KEY, META_API_KEY, or AZURE_SPEECH_KEY and AZURE_SPEECH_ENDPOINT")
-		os.Exit(2)
-	}
-
 	s := &server{
-		apiKey:         *apiKey,
-		authToken:      strings.TrimSpace(*authToken),
-		tempDir:        *tempDir,
-		parakeet:       *parakeet,
-		jobTTL:         *jobTTL,
-		maxUploadBytes: *maxUploadBytes,
-		maxConcurrency: *maxConcurrency,
-		maxQueued:      *maxQueued,
-		agentMaxTokens: *agentMaxTokens,
-		maxRunTime:     *maxRunTime,
-		jobDir:         *jobDir,
-		shutdownGrace:  *shutdownGrace,
-		logger:         logger,
-		cancelFns:      make(map[string]context.CancelFunc),
-		idempotency:    make(map[string]*idempotencyBinding),
-		skillRouter:    *skillRouter,
+		apiKey:           *apiKey,
+		apiKeyFromEnv:    strings.TrimSpace(*apiKey) != "",
+		credentialsReady: make(chan struct{}),
+		authToken:        strings.TrimSpace(*authToken),
+		tempDir:          *tempDir,
+		parakeet:         *parakeet,
+		jobTTL:           *jobTTL,
+		maxUploadBytes:   *maxUploadBytes,
+		maxConcurrency:   *maxConcurrency,
+		maxQueued:        *maxQueued,
+		agentMaxTokens:   *agentMaxTokens,
+		maxRunTime:       *maxRunTime,
+		jobDir:           *jobDir,
+		shutdownGrace:    *shutdownGrace,
+		logger:           logger,
+		cancelFns:        make(map[string]context.CancelFunc),
+		idempotency:      make(map[string]*idempotencyBinding),
+		skillRouter:      *skillRouter,
 	}
 	s.ready.Store(true)
 	if s.maxConcurrency < 1 || s.maxConcurrency > 64 || s.maxQueued < 0 || s.maxQueued > 10000 ||
@@ -173,6 +174,19 @@ func main() {
 		logger.Error("initialize durable job store", "error", storeErr)
 		os.Exit(1)
 	}
+	if !s.apiKeyFromEnv {
+		key, err := loadSavedGeminiAPIKey(s.jobDir)
+		if err != nil {
+			logger.Error("load saved Gemini API key", "error", err)
+			os.Exit(1)
+		}
+		s.apiKey = key
+	}
+	if s.hasProviderCredentials() {
+		s.credentialsOnce.Do(func() { close(s.credentialsReady) })
+	} else {
+		logger.Warn("no provider credentials configured: open the local web page to add a Gemini API key")
+	}
 	s.startJobWorkers(recoverable)
 
 	if reg, lerr := skills.Load(skillRoots(*skillsDir)...); reg != nil {
@@ -183,7 +197,7 @@ func main() {
 		logger.Info("skills loaded", slog.Int("count", reg.Len()))
 	}
 
-	if s.authToken == "" {
+	if s.authToken == "" && s.hasProviderCredentials() {
 		logger.Warn("no --auth-token/API_AUTH_TOKEN set: POST /api/jobs is unauthenticated and will spend your GEMINI_API_KEY quota; protect it via a reverse proxy or set a token")
 	}
 
@@ -269,6 +283,8 @@ func (s *server) routes() http.Handler {
 	// optional shared token. Job status/stream reads are gated by the
 	// unguessable 96-bit job id acting as a capability URL.
 	mux.Handle("/api/jobs", s.withAuth(http.HandlerFunc(s.handleCreateJob)))
+	mux.HandleFunc("/api/config", s.handleConfig)
+	mux.Handle("/api/config/gemini-key", s.withAuth(http.HandlerFunc(s.handleGeminiKey)))
 	mux.HandleFunc("/api/jobs/", s.handleJob)
 	mux.HandleFunc("/healthz", s.handleHealthz)
 	mux.HandleFunc("/readyz", s.handleReadyz)

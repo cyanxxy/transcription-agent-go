@@ -224,10 +224,25 @@ body::after {
   box-shadow: 0 0 0 5px rgba(28, 143, 87, 0.12);
 }
 
+#key-card,
 #upload-card,
 #status-card,
 #result-card {
   padding: 24px;
+}
+
+.key-controls {
+  display: flex;
+  align-items: end;
+  gap: 12px;
+}
+
+.key-controls label {
+  flex: 1;
+}
+
+.key-controls button {
+  flex: 0 0 auto;
 }
 
 .section-heading {
@@ -810,6 +825,7 @@ button:disabled {
   }
 
   .hero,
+  #key-card,
   #upload-card,
   #status-card,
   #result-card {
@@ -860,6 +876,16 @@ button:disabled {
   }
 
   button.primary {
+    width: 100%;
+  }
+
+  .key-controls {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .key-controls label,
+  .key-controls button {
     width: 100%;
   }
 }
