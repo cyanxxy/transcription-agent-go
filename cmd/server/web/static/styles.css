@@ -1105,9 +1105,16 @@ pre.output {
 }
 
 .review-reasons {
+  max-height: 14rem;
+  overflow-y: auto;
   margin: 6px 0 12px;
+  padding-left: 1.2rem;
   color: var(--ink-2);
   font-size: 0.9rem;
+}
+
+.review-reasons li + li {
+  margin-top: 4px;
 }
 
 .row-actions {

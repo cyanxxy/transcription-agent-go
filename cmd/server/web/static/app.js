@@ -954,9 +954,16 @@
     reviewPanel.hidden = false;
     reviewActions.hidden = false;
     reviewNote.disabled = false;
-    reviewReasons.textContent = reasons.length
-      ? reasons.join(' ')
-      : reviewReasons.textContent || 'Some passages were disputed. Check them before accepting this transcript.';
+    if (reasons.length || !reviewReasons.childElementCount) {
+      const items = reasons.length
+        ? reasons
+        : ['Some passages were disputed. Check them before accepting this transcript.'];
+      reviewReasons.replaceChildren(...items.map((reason) => {
+        const item = document.createElement('li');
+        item.textContent = reason;
+        return item;
+      }));
+    }
     if (expiresAt) setReviewDeadline(expiresAt);
     cancelJob.hidden = true;
     statusCard.hidden = true;

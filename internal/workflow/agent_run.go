@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"math"
 	"sort"
 	"strings"
 	"sync"
@@ -524,11 +525,10 @@ func buildRunEvidence(final []models.TranscriptSegment, candidates []models.Tran
 		sources := make([]string, 0)
 		candidateTexts := make([]string, 0)
 		for _, candidate := range candidates {
-			match, ok := nearestCandidateSegment(candidate.Segments, targetSeconds)
+			match, similarity, ok := bestCandidateSegment(candidate.Segments, targetSeconds, segment.Text)
 			if !ok {
 				continue
 			}
-			similarity := wordSimilarity(segment.Text, match.Text)
 			if similarity >= 0.55 {
 				sources = append(sources, candidate.CandidateID)
 			}
@@ -538,14 +538,14 @@ func buildRunEvidence(final []models.TranscriptSegment, candidates []models.Tran
 		notes := make([]string, 0, 2)
 		if len(sources) == 0 {
 			notes = append(notes, "No candidate strongly supports the final wording.")
-			reviewReasons = append(reviewReasons, fmt.Sprintf("Segment %d has weak candidate support.", index))
+			reviewReasons = append(reviewReasons, reviewLocation(segment)+": no candidate transcript supports this wording.")
 		}
 		status := "adjudicated"
 		if disputed {
 			notes = append(notes, "Candidate wording differs around this timestamp.")
 			if !intersectsSelected(sources, selectedSet) {
 				status = "review_required"
-				reviewReasons = append(reviewReasons, fmt.Sprintf("Segment %d remains disputed.", index))
+				reviewReasons = append(reviewReasons, reviewLocation(segment)+": candidate transcripts disagree here.")
 			}
 			disputes = append(disputes, models.DisputedSpan{
 				StartTimestamp: segment.Timestamp,
@@ -573,26 +573,38 @@ func buildRunEvidence(final []models.TranscriptSegment, candidates []models.Tran
 	return evidence, mergeAdjacentDisputes(disputes), review
 }
 
-func nearestCandidateSegment(segs []models.TranscriptSegment, target float64) (models.TranscriptSegment, bool) {
-	bestDistance := 8.0
+// bestCandidateSegment returns the candidate segment within 8 seconds of
+// target whose wording best matches text, preferring the nearest on ties.
+// Timestamps have whole-second resolution, so several short turns can share
+// one; matching on time alone would compare a segment with its neighbor.
+func bestCandidateSegment(segs []models.TranscriptSegment, target float64, text string) (models.TranscriptSegment, float64, bool) {
 	var best models.TranscriptSegment
-	found := false
+	bestSimilarity, bestDistance := -1.0, 0.0
 	for _, seg := range segs {
 		seconds, err := seg.TimestampSeconds()
 		if err != nil {
 			continue
 		}
-		distance := seconds - target
-		if distance < 0 {
-			distance = -distance
+		distance := math.Abs(seconds - target)
+		if distance > 8 {
+			continue
 		}
-		if distance <= bestDistance {
-			bestDistance = distance
-			best = seg
-			found = true
+		similarity := wordSimilarity(text, seg.Text)
+		if similarity > bestSimilarity || (similarity == bestSimilarity && distance < bestDistance) {
+			best, bestSimilarity, bestDistance = seg, similarity, distance
 		}
 	}
-	return best, found
+	return best, bestSimilarity, bestSimilarity >= 0
+}
+
+// reviewLocation identifies a segment for a reviewer by time, speaker, and
+// the start of its text, rather than by an internal index.
+func reviewLocation(segment models.TranscriptSegment) string {
+	text := strings.Join(strings.Fields(segment.Text), " ")
+	if words := strings.Fields(text); len(words) > 10 {
+		text = strings.Join(words[:10], " ") + "…"
+	}
+	return fmt.Sprintf("%s %s: \u201c%s\u201d", segment.Timestamp, segment.Speaker, text)
 }
 
 func wordSimilarity(a, b string) float64 {

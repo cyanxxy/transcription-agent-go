@@ -62,6 +62,36 @@ func TestProvenanceEvidenceUsesExactSpanAttempts(t *testing.T) {
 	}
 }
 
+// Short turns often share a whole-second timestamp; each must be matched to
+// its own wording, not to a neighbor that happens to be nearer in time.
+func TestRunEvidenceMatchesSameSecondTurnsByWording(t *testing.T) {
+	final := []models.TranscriptSegment{
+		{Timestamp: "[00:11:32]", Speaker: "Speaker 5", Text: "Or is"},
+		{Timestamp: "[00:11:32]", Speaker: "Speaker 1", Text: "You"},
+		{Timestamp: "[00:11:32]", Speaker: "Speaker 5", Text: "the"},
+		{Timestamp: "[00:11:33]", Speaker: "Speaker 1", Text: "mean the pricing tier?"},
+	}
+	candidates := []models.TranscriptCandidate{{CandidateID: "primary", Segments: final}}
+	evidence, disputes, review := buildRunEvidence(final, candidates, []string{"primary"})
+	if review.Status != "not_required" || len(disputes) != 0 {
+		t.Fatalf("direct output flagged against itself: review=%#v disputes=%#v", review, disputes)
+	}
+	for _, item := range evidence {
+		if len(item.SourceCandidateIDs) != 1 {
+			t.Fatalf("segment %d lost its source: %#v", item.SegmentIndex, item)
+		}
+	}
+
+	other := []models.TranscriptCandidate{{CandidateID: "other", Segments: []models.TranscriptSegment{
+		{Timestamp: "[00:11:32]", Speaker: "A", Text: "Something else entirely"},
+	}}}
+	_, _, review = buildRunEvidence(final[:1], other, []string{"other"})
+	want := "[00:11:32] Speaker 5: “Or is”: no candidate transcript supports this wording."
+	if review.Status != "required" || len(review.Reasons) != 1 || review.Reasons[0] != want {
+		t.Fatalf("reasons = %#v, want %q", review.Reasons, want)
+	}
+}
+
 func TestInteractionBudgetReservesBeforeWork(t *testing.T) {
 	recorder := &runRecorder{run: models.AgentRun{Budget: models.AgentBudget{MaxInteractionRequests: 1, MaxToolCalls: 2, MaxTotalTokens: 100}}}
 	if err := recorder.observeInteraction(gemini.InteractionObservation{Phase: "before_request"}); err != nil {
