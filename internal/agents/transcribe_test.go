@@ -133,8 +133,8 @@ func TestTranscribeRequestAndChunkOffsets(t *testing.T) {
 	}
 }
 
-func TestTranscribeRejectsMissingAndInvalidAnnotations(t *testing.T) {
-	for _, change := range []string{"missing", "bad_start", "negative", "bad_end", "reversed"} {
+func TestTranscribeRejectsMissingAnnotations(t *testing.T) {
+	for _, change := range []string{"missing", "untimed"} {
 		t.Run(change, func(t *testing.T) {
 			var resp gemini.Interaction
 			if err := json.Unmarshal([]byte(transcribeFixture), &resp); err != nil {
@@ -144,17 +144,49 @@ func TestTranscribeRejectsMissingAndInvalidAnnotations(t *testing.T) {
 			switch change {
 			case "missing":
 				resp.Steps[0].Content[0].Annotations = nil
-			case "bad_start":
-				words[0].StartOffset = "invalid"
-			case "negative":
-				words[0].StartOffset = "-1s"
-			case "bad_end":
-				words[0].EndOffset = ""
-			case "reversed":
-				words[0].EndOffset = "0s"
+			case "untimed":
+				for i := range words {
+					words[i].StartOffset, words[i].EndOffset = "", ""
+				}
 			}
-			if _, err := parseTranscribeSegments(&resp); err == nil {
-				t.Fatal("expected annotation error")
+			if _, err := parseTranscribeSegments(&resp); !errors.Is(err, ErrNoWordAnnotations) {
+				t.Fatalf("err = %v, want ErrNoWordAnnotations", err)
+			}
+		})
+	}
+}
+
+// One inconsistent word offset must not discard the rest of the response.
+func TestTranscribeRepairsInconsistentWordOffsets(t *testing.T) {
+	for _, tc := range []struct {
+		name, start, end string
+		wantFrom, wantTo int64
+	}{
+		{"bad_start", "invalid", "0.850s", 450, 850},
+		{"negative_start", "-1s", "0.850s", 450, 850},
+		{"missing_start", "", "0.850s", 450, 850},
+		{"missing_end", "0.500s", "", 500, 500},
+		{"reversed", "0.500s", "0.300s", 500, 500},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var resp gemini.Interaction
+			if err := json.Unmarshal([]byte(transcribeFixture), &resp); err != nil {
+				t.Fatal(err)
+			}
+			words := resp.Steps[0].Content[0].Annotations
+			words[1].StartOffset, words[1].EndOffset = tc.start, tc.end
+			units, repaired, err := transcribeWordUnits(&resp, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if repaired != 1 || len(units) != 3 {
+				t.Fatalf("repaired=%d units=%#v", repaired, units)
+			}
+			if got := units[1]; got.Text != "world." || got.StartMS != tc.wantFrom || got.EndMS != tc.wantTo {
+				t.Fatalf("units[1] = %#v, want %d-%d", got, tc.wantFrom, tc.wantTo)
+			}
+			if segs, err := parseTranscribeSegments(&resp); err != nil || len(segs) != 2 {
+				t.Fatalf("segments=%#v err=%v", segs, err)
 			}
 		})
 	}

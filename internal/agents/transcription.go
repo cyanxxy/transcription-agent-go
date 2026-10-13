@@ -168,7 +168,10 @@ func (a *TranscriptionAgent) RunTimed(ctx context.Context, in TranscribeInput) (
 	if in.ChunkInfo != nil {
 		offsetMS = int64(in.ChunkInfo.StartMS)
 	}
-	units, err := transcribeWordUnits(resp, offsetMS)
+	units, repaired, err := transcribeWordUnits(resp, offsetMS)
+	if repaired > 0 {
+		logger.Warn("repaired inconsistent Gemini word timestamps", slog.Int("words", repaired), slog.Int("total_words", len(units)))
+	}
 	if errors.Is(err, ErrNoWordAnnotations) {
 		if text := strings.TrimSpace(resp.Text()); text != "" {
 			logger.Warn("Gemini returned transcript text without requested word timestamps")

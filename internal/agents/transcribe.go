@@ -21,7 +21,7 @@ var ErrNoWordAnnotations = errors.New("transcription returned no word annotation
 // on sentence endings, pauses, and long utterances. Offsets are relative to the
 // uploaded audio.
 func parseTranscribeSegments(resp *gemini.Interaction) ([]models.TranscriptSegment, error) {
-	units, err := transcribeWordUnits(resp, 0)
+	units, _, err := transcribeWordUnits(resp, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -31,10 +31,19 @@ func parseTranscribeSegments(resp *gemini.Interaction) ([]models.TranscriptSegme
 // transcribeWordUnits extracts timed words from a transcription interaction,
 // shifted by offsetMS, with the provider's speaker labels. Provider
 // annotations may arrive out of order, including across content blocks, so
-// offsets are validated first and words stably sorted by start time.
-// Equal-start words retain their original order; overlapping speech is valid.
-func transcribeWordUnits(resp *gemini.Interaction, offsetMS int64) ([]TimedUnit, error) {
+// words are stably sorted by start time. Equal-start words retain their
+// original order; overlapping speech is valid.
+//
+// Word offsets are optional in the API and occasionally inconsistent, so one
+// bad word must not discard the whole response: a missing, invalid, or
+// negative start takes the previous word's end, and a missing, invalid, or
+// reversed end collapses to the start. repaired counts the words adjusted.
+// ErrNoWordAnnotations is returned when no word has a usable start.
+func transcribeWordUnits(resp *gemini.Interaction, offsetMS int64) ([]TimedUnit, int, error) {
 	var units []TimedUnit
+	var prevEnd time.Duration
+	repaired := 0
+	timed := false
 	for _, step := range resp.Steps {
 		if step.Type != "model_output" {
 			continue
@@ -50,25 +59,32 @@ func transcribeWordUnits(resp *gemini.Interaction, offsetMS int64) ([]TimedUnit,
 				text := strings.TrimSpace(word.Text)
 				if text == "" && (word.StartIndex != nil || word.EndIndex != nil) {
 					if word.StartIndex == nil || word.EndIndex == nil || *word.StartIndex < 0 || *word.EndIndex < *word.StartIndex || *word.EndIndex > len(content.Text) {
-						return nil, fmt.Errorf("invalid word byte range")
+						return nil, 0, fmt.Errorf("invalid word byte range")
 					}
 					raw := content.Text[*word.StartIndex:*word.EndIndex]
 					if !utf8.ValidString(raw) {
-						return nil, fmt.Errorf("word byte range splits UTF-8 text")
+						return nil, 0, fmt.Errorf("word byte range splits UTF-8 text")
 					}
 					text = strings.TrimSpace(raw)
 				}
 				if text == "" {
 					continue
 				}
+				fixed := false
 				from, err := time.ParseDuration(word.StartOffset)
 				if err != nil || from < 0 {
-					return nil, fmt.Errorf("invalid word start offset %q", word.StartOffset)
+					from, fixed = prevEnd, true
+				} else {
+					timed = true
 				}
 				to, err := time.ParseDuration(word.EndOffset)
 				if err != nil || to < from {
-					return nil, fmt.Errorf("invalid word end offset %q", word.EndOffset)
+					to, fixed = from, true
 				}
+				if fixed {
+					repaired++
+				}
+				prevEnd = to
 				units = append(units, TimedUnit{
 					Text: text, Speaker: word.Speaker,
 					StartMS: offsetMS + from.Milliseconds(), EndMS: offsetMS + to.Milliseconds(),
@@ -76,9 +92,9 @@ func transcribeWordUnits(resp *gemini.Interaction, offsetMS int64) ([]TimedUnit,
 			}
 		}
 	}
-	if len(units) == 0 {
-		return nil, ErrNoWordAnnotations
+	if !timed {
+		return nil, 0, ErrNoWordAnnotations
 	}
 	sort.SliceStable(units, func(i, j int) bool { return units[i].StartMS < units[j].StartMS })
-	return units, nil
+	return units, repaired, nil
 }
