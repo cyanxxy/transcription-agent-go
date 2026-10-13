@@ -140,7 +140,7 @@ func run() error {
 		removeFillers      = flag.Bool("remove-fillers", false, "Remove filler words")
 		parakeet           = flag.String("parakeet-cmd", os.Getenv("TRANSCRIBER_PARAKEET_CMD"), "Optional Parakeet sidecar command")
 		chunkStrategy      = flag.String("chunk-strategy", "adaptive", "Chunk planner: adaptive or fixed")
-		chunkDuration      = flag.Int("chunk-duration-ms", 120000, "Chunk duration (ms)")
+		chunkDuration      = flag.Int("chunk-duration-ms", 0, "Chunk duration (ms); 0 uses the model default")
 		chunkOverlap       = flag.Int("chunk-overlap-ms", 5000, "Chunk overlap (ms)")
 		chunkConcurrency   = flag.Int("chunk-concurrency", 3, "Maximum chunk transcription/judge workers")
 		maxFileSizeMB      = flag.Int("max-file-size-mb", 200, "Maximum input audio size in MiB")

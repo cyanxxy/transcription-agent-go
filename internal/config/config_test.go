@@ -206,6 +206,30 @@ func TestTranscribeModelConstraints(t *testing.T) {
 	}
 }
 
+func TestChunkDurationDefaultsByModel(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		opts []TranscriptionOption
+		want int
+	}{
+		{"transcribe", nil, TranscribeDefaultChunkDurationMS},
+		{"transcribe_explicit", []TranscriptionOption{WithChunkDurationMS(60000)}, 60000},
+		{"flash", []TranscriptionOption{WithModelName(DefaultJudgeModel)}, DefaultChunkDurationMS},
+		{"meta", []TranscriptionOption{WithModelName(MetaTranscriptionModel)}, DefaultChunkDurationMS},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			deps, err := NewTranscriptionDeps("test", tc.opts...)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer deps.Cleanup()
+			if deps.ChunkDurationMS != tc.want {
+				t.Fatalf("chunk duration = %d, want %d", deps.ChunkDurationMS, tc.want)
+			}
+		})
+	}
+}
+
 func TestAgentMaxWallTimeCanBeConfigured(t *testing.T) {
 	deps, err := NewTranscriptionDeps("test", WithAgentMaxWallTimeSeconds(7200))
 	if err != nil {

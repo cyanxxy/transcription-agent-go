@@ -22,6 +22,17 @@ func IsDirectSpeechModel(model string) bool {
 
 const DefaultJudgeModel = "gemini-3.8-flash"
 
+// Chunk durations used when a run does not set one. Gemini 3.5 Transcribe
+// accepts 30 minutes per request with diarization and word timestamps, and
+// each request labels speakers independently, so fewer, longer chunks keep
+// speakers consistent. 25 minutes leaves room for the overlap and for
+// adaptive silence boundaries. Review-pipeline models compare candidates per
+// span and keep short chunks.
+const (
+	DefaultChunkDurationMS           = 120000
+	TranscribeDefaultChunkDurationMS = 1500000
+)
+
 // SupportedGeminiModels is the allow-list of Gemini model identifiers.
 var SupportedGeminiModels = map[string]struct{}{
 	DefaultTranscriptionModel: {},
@@ -165,7 +176,6 @@ func NewTranscriptionDeps(apiKey string, opts ...TranscriptionOption) (*Transcri
 		JudgeModelName:             DefaultJudgeModel,
 		CandidateStrategy:          "dual_gemini",
 		MaxFileSizeMB:              200,
-		ChunkDurationMS:            120000,
 		ChunkOverlapMS:             5000,
 		ChunkStrategy:              "adaptive",
 		ChunkConcurrency:           3,
@@ -196,6 +206,12 @@ func NewTranscriptionDeps(apiKey string, opts ...TranscriptionOption) (*Transcri
 	d.ModelName = NormalizeGeminiModelName(d.ModelName)
 	d.JudgeModelName = NormalizeGeminiModelName(d.JudgeModelName)
 	d.ServiceTier = NormalizeServiceTier(d.ServiceTier)
+	if d.ChunkDurationMS == 0 {
+		d.ChunkDurationMS = DefaultChunkDurationMS
+		if d.ModelName == DefaultTranscriptionModel {
+			d.ChunkDurationMS = TranscribeDefaultChunkDurationMS
+		}
+	}
 	if _, ok := SupportedGeminiModels[d.ModelName]; !ok && !IsExternalSpeechModel(d.ModelName) {
 		return nil, fmt.Errorf("unsupported model: %s (supported: %s)", d.ModelName, sortedKeys(SupportedGeminiModels)+", "+MetaTranscriptionModel+", "+MicrosoftTranscriptionModel)
 	}
