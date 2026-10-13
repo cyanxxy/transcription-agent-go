@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -822,6 +823,9 @@ func TestPersistedAudioPathRejectsUntrustedFiles(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := os.Symlink(filepath.Join(dir, "outside.wav"), validPath); err != nil {
+		if runtime.GOOS == "windows" {
+			t.Skipf("creating symlinks needs extra privileges on Windows: %v", err)
+		}
 		t.Fatal(err)
 	}
 	if _, err := persistedAudioPath(jb); err == nil {

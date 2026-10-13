@@ -803,7 +803,7 @@ func retryFailureMayHaveConsumedTokens(err error) bool {
 	if errors.As(err, &opErr) && opErr.Op == "dial" {
 		return false
 	}
-	if strings.Contains(err.Error(), "connection refused") || strings.Contains(err.Error(), "no such host") {
+	if containsAny(err.Error(), refusedMessages...) || strings.Contains(err.Error(), "no such host") {
 		return false
 	}
 	return true
@@ -839,6 +839,38 @@ func sleepCtx(ctx context.Context, d time.Duration) error {
 	}
 }
 
+// Connection failures are matched by message because Windows reports Winsock
+// errors (WSAECONNRESET, WSAECONNREFUSED, WSAECONNABORTED) that do not match
+// the syscall.E* values used on Unix.
+var (
+	resetMessages = []string{
+		"connection reset",
+		"broken pipe",
+		"forcibly closed by the remote host",
+		"established connection was aborted",
+	}
+	refusedMessages = []string{
+		"connection refused",
+		"actively refused",
+	}
+)
+
+func containsAny(s string, phrases ...string) bool {
+	for _, phrase := range phrases {
+		if strings.Contains(s, phrase) {
+			return true
+		}
+	}
+	return false
+}
+
+// IsRetryableNetworkError reports transport failures worth another attempt:
+// timeouts, connections reset or refused on any platform, unexpected EOF, and
+// DNS failures. Context cancellation and deadlines are never retryable.
+func IsRetryableNetworkError(err error) bool {
+	return isRetryableNetErr(err)
+}
+
 func isRetryableNetErr(err error) bool {
 	if err == nil {
 		return false
@@ -857,8 +889,7 @@ func isRetryableNetErr(err error) bool {
 		return true
 	}
 	msg := err.Error()
-	return strings.Contains(msg, "connection reset") ||
-		strings.Contains(msg, "connection refused") ||
+	return containsAny(msg, resetMessages...) || containsAny(msg, refusedMessages...) ||
 		strings.Contains(msg, "no such host")
 }
 

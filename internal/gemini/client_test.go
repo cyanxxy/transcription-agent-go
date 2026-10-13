@@ -683,3 +683,22 @@ func TestRetryFailureTokenConsumptionClassification(t *testing.T) {
 		})
 	}
 }
+
+func TestNetworkErrorsAreRecognizedOnEveryPlatform(t *testing.T) {
+	windowsReset := errors.New("read tcp 10.0.0.2:51234->142.250.1.1:443: wsarecv: An existing connection was forcibly closed by the remote host.")
+	windowsRefused := errors.New("dial tcp 127.0.0.1:9: connectex: No connection could be made because the target machine actively refused it.")
+	for _, err := range []error{windowsReset, windowsRefused, errors.New("read: connection reset by peer"), io.ErrUnexpectedEOF} {
+		if !IsRetryableNetworkError(err) {
+			t.Errorf("not retryable: %v", err)
+		}
+	}
+	if IsRetryableNetworkError(context.Canceled) {
+		t.Error("cancellation must not be retried")
+	}
+	if retryFailureMayHaveConsumedTokens(windowsRefused) {
+		t.Error("a refused connection never reached the model")
+	}
+	if !retryFailureMayHaveConsumedTokens(windowsReset) {
+		t.Error("a reset connection may have consumed tokens")
+	}
+}

@@ -1,0 +1,4 @@
+# Keep line endings identical on every platform (Windows checkouts included).
+* text=auto eol=lf
+*.png binary
+*.docx binary

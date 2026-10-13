@@ -1908,6 +1908,12 @@ func stageInputPath(dir, sourcePath, filename string) (string, error) {
 
 var sanitizeRE = regexp.MustCompile(`[^a-zA-Z0-9._-]`)
 
+var windowsReservedRE = regexp.MustCompile(`(?i)^(con|prn|aux|nul|com[0-9]|lpt[0-9])(\..*)?$`)
+
+func windowsReservedName(stem string) bool {
+	return windowsReservedRE.MatchString(stem)
+}
+
 func sanitizeFilename(name string) string {
 	base := filepath.Base(name)
 	ext := filepath.Ext(base)
@@ -1919,6 +1925,10 @@ func sanitizeFilename(name string) string {
 	ext = sanitizeRE.ReplaceAllString(ext, "")
 	if ext == "" {
 		ext = ".audio"
+	}
+	// Windows reserves device names such as CON and COM1 with any extension.
+	if windowsReservedName(stem) {
+		stem = "_" + stem
 	}
 	result := stem + ext
 	// Reject names made only of dots (e.g. "." / ".."), which filepath.Join

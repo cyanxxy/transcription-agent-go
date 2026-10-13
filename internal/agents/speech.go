@@ -3,11 +3,9 @@ package agents
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"mime/multipart"
-	"net"
 	"net/http"
 	"net/textproto"
 	"net/url"
@@ -16,10 +14,10 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/cyanxxy/transcription-agent-go/internal/config"
+	"github.com/cyanxxy/transcription-agent-go/internal/gemini"
 	"github.com/cyanxxy/transcription-agent-go/internal/models"
 )
 
@@ -174,7 +172,7 @@ func transcribeSpeechUnits(ctx context.Context, d *config.TranscriptionDeps, pat
 			if ctx.Err() != nil {
 				return nil, ctx.Err()
 			}
-			if attempt < 2 && retryableSpeechNetErr(err) {
+			if attempt < 2 && gemini.IsRetryableNetworkError(err) {
 				if err := sleepSpeechRetry(ctx, time.Duration(1<<attempt)*time.Second); err != nil {
 					return nil, err
 				}
@@ -292,19 +290,6 @@ func parseSpeechUnits(model string, data []byte) ([]TimedUnit, error) {
 	}
 	sort.SliceStable(units, func(i, j int) bool { return units[i].StartMS < units[j].StartMS })
 	return units, nil
-}
-
-// retryableSpeechNetErr reports transport failures worth one more attempt:
-// timeouts, resets, and connections dropped mid-response.
-func retryableSpeechNetErr(err error) bool {
-	var netErr net.Error
-	if errors.As(err, &netErr) && netErr.Timeout() {
-		return true
-	}
-	if errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, io.EOF) || errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.ECONNREFUSED) {
-		return true
-	}
-	return strings.Contains(err.Error(), "connection reset")
 }
 
 func sleepSpeechRetry(ctx context.Context, delay time.Duration) error {

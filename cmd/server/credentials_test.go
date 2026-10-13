@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -75,7 +76,7 @@ func TestGeminiKeySetupAndReload(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := info.Mode().Perm(); got != 0o600 {
+	if got := info.Mode().Perm(); runtime.GOOS != "windows" && got != 0o600 {
 		t.Fatalf("key file permissions = %o", got)
 	}
 	loaded, err := loadSavedGeminiAPIKey(s.jobDir)
@@ -148,7 +149,7 @@ func TestProviderKeysSaveRemoveAndReload(t *testing.T) {
 	if meta, azureKey, _ := s.savedSpeechCredentials(); meta != "meta-key" || azureKey != "azure-key" {
 		t.Fatalf("saved credentials = %q %q", meta, azureKey)
 	}
-	if info, err := os.Stat(filepath.Join(s.jobDir, speechKeyFilename)); err != nil || info.Mode().Perm() != 0o600 {
+	if info, err := os.Stat(filepath.Join(s.jobDir, speechKeyFilename)); err != nil || (runtime.GOOS != "windows" && info.Mode().Perm() != 0o600) {
 		t.Fatalf("credentials file: %v %v", info, err)
 	}
 	reloaded, err := loadSavedSpeechCredentials(s.jobDir)

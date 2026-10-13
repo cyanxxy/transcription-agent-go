@@ -71,3 +71,56 @@ jobs:
           curl -fs http://127.0.0.1:8765/ -o /dev/null
           kill -TERM $PID
           wait $PID || true
+
+  windows:
+    name: windows · test · build
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - name: Set up Go
+        uses: actions/setup-go@v7.0.0
+        with:
+          go-version-file: go.mod
+          check-latest: true
+          cache: true
+
+      - name: Install ffmpeg
+        run: choco install ffmpeg --no-progress -y
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: Unit tests
+        run: go test ./... -count=1
+
+      - name: Build binaries
+        run: |
+          go build -trimpath -ldflags "-s -w -X main.version=ci" -o bin/transcription-server.exe ./cmd/server
+          go build -trimpath -ldflags "-s -w -X main.version=ci" -o bin/transcriber-cli.exe ./cmd/cli
+
+      - name: Server smoke test
+        shell: pwsh
+        run: |
+          # Point outbound HTTPS at a closed port so the queued job never
+          # reaches a real provider with the dummy key.
+          $env:GEMINI_API_KEY = "dummy"
+          $env:HTTPS_PROXY = "http://127.0.0.1:9"
+          $jobs = Join-Path $env:RUNNER_TEMP "jobs"
+          $server = Start-Process -FilePath .\bin\transcription-server.exe -ArgumentList "--addr", "127.0.0.1:8765", "--job-dir", $jobs -PassThru -NoNewWindow
+          for ($i = 0; $i -lt 40; $i++) {
+            try { Invoke-RestMethod http://127.0.0.1:8765/readyz | Out-Null; break } catch { Start-Sleep -Milliseconds 500 }
+          }
+          Invoke-RestMethod http://127.0.0.1:8765/healthz
+          Invoke-WebRequest http://127.0.0.1:8765/ -UseBasicParsing | Out-Null
+          $tone = Join-Path $env:RUNNER_TEMP "tone.wav"
+          ffmpeg -hide_banner -loglevel error -f lavfi -i "sine=frequency=440:duration=2" $tone
+          # Accepting a job exercises staging, the event journal, and atomic
+          # job snapshots on NTFS.
+          $job = curl.exe -fsS -F "audio=@$tone" -F "model_name=gemini-3.5-transcribe" http://127.0.0.1:8765/api/jobs | ConvertFrom-Json
+          if (-not $job.job_id) { throw "job was not accepted" }
+          $state = Invoke-RestMethod "http://127.0.0.1:8765/api/jobs/$($job.job_id)"
+          if ($state.events.Count -lt 1) { throw "job events were not persisted" }
+          curl.exe -fsS -X POST -H "Content-Type: application/json" -d "{}" "http://127.0.0.1:8765/api/jobs/$($job.job_id)/cancel"
+          .\bin\transcriber-cli.exe --version
+          Stop-Process -Id $server.Id

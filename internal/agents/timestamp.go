@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"os/exec"
+	"runtime"
 	"strings"
 
 	"github.com/cyanxxy/transcription-agent-go/internal/config"
@@ -296,6 +297,17 @@ func (p *ParakeetSidecar) invoke(ctx context.Context, payload map[string]any) (*
 // double quotes, backslash escaping, concatenated quoted/unquoted text, and
 // explicit empty arguments.
 func parseCommandArgs(command string) ([]string, error) {
+	return parseCommandArgsFor(command, runtime.GOOS == "windows")
+}
+
+// parseCommandArgsFor splits a command line with POSIX shell quoting. With
+// windows set, backslashes are path separators: they stay literal except
+// directly before a double quote, as in Windows command lines, so
+// C:\Tools\parakeet.exe works without quoting.
+func parseCommandArgsFor(command string, windows bool) ([]string, error) {
+	if windows {
+		command = literalBackslashes(command)
+	}
 	const (
 		unquoted = iota
 		singleQuoted
@@ -386,6 +398,33 @@ func parseCommandArgs(command string) ([]string, error) {
 	}
 	flush()
 	return args, nil
+}
+
+// literalBackslashes doubles every backslash outside single quotes that does
+// not escape a double quote, so the POSIX parser keeps it literally.
+func literalBackslashes(command string) string {
+	runes := []rune(command)
+	var out strings.Builder
+	inSingle, inDouble := false, false
+	for i := 0; i < len(runes); i++ {
+		r := runes[i]
+		switch {
+		case r == '\\' && !inSingle && i+1 < len(runes) && runes[i+1] == '"':
+			out.WriteString(`\"`)
+			i++
+		case r == '\\' && !inSingle:
+			out.WriteString(`\\`)
+		case r == '"' && !inSingle:
+			inDouble = !inDouble
+			out.WriteRune(r)
+		case r == '\'' && !inDouble:
+			inSingle = !inSingle
+			out.WriteRune(r)
+		default:
+			out.WriteRune(r)
+		}
+	}
+	return out.String()
 }
 
 type limitedOutputBuffer struct {

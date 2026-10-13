@@ -28,7 +28,7 @@ single-binary CLI.
 ## Contents
 
 - [Features](#features)
-- [Quickstart](#quickstart)
+- [Quickstart](#quickstart) · [Windows](#windows)
 - [Models](#models)
 - [Transcription options](#transcription-options)
 - [Long recordings](#long-recordings)
@@ -95,6 +95,27 @@ server computer (localhost).
 ```
 
 Supported input formats: `mp3`, `wav`, `m4a`, `flac`, `ogg`.
+
+### Windows
+
+The server and CLI run natively on Windows 10/11; CI tests x64, and ARM64
+builds too. Install Go and FFmpeg, then build with `go build` (the Makefile
+needs a Unix shell):
+
+```powershell
+winget install GoLang.Go                 # or: choco install golang ffmpeg
+winget install Gyan.FFmpeg
+git clone https://github.com/cyanxxy/transcription-agent-go.git
+cd transcription-agent-go
+go build -o bin\transcription-server.exe .\cmd\server
+go build -o bin\transcriber-cli.exe .\cmd\cli
+.\bin\transcription-server.exe --addr 127.0.0.1:8080
+```
+
+Open a new terminal after installing so `ffmpeg` and `ffprobe` are on `PATH`.
+The CLI stores keys in `%AppData%\transcription-agent\credentials.json`, and
+`--parakeet-cmd` accepts Windows paths such as `C:\Tools\parakeet.exe`
+(quote paths that contain spaces). The Docker image is Linux-only.
 
 ### Credentials
 
@@ -398,7 +419,8 @@ make cover       # coverage report
 ```
 
 CI runs formatting, `go vet`, `golangci-lint`, `govulncheck`, the race-enabled
-test suite, both builds, and a server smoke test. Provider APIs are mocked in
+test suite, both builds, and a server smoke test on Linux, plus vet, tests,
+builds, and a job-submission smoke test on Windows. Provider APIs are mocked in
 tests; checking live transcription quality needs real credentials.
 
 | Area | Location |

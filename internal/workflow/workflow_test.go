@@ -844,3 +844,11 @@ func TestSpeechReviewSendsTranscribeOutputToJudge(t *testing.T) {
 		t.Fatalf("segments = %#v", res.Segments)
 	}
 }
+
+func TestSanitizeFilenameAvoidsWindowsDeviceNames(t *testing.T) {
+	for in, want := range map[string]string{"CON.mp3": "_CON.mp3", "com1.wav": "_com1.wav", "nul": "_nul.audio", "console.mp3": "console.mp3", "Lpt9.tar.gz": "_Lpt9.tar.gz"} {
+		if got := sanitizeFilename(in); got != want {
+			t.Errorf("sanitizeFilename(%q) = %q, want %q", in, got, want)
+		}
+	}
+}

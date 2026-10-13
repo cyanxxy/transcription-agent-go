@@ -9,7 +9,9 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -503,6 +505,7 @@ func TestBuildContextPromptIncludesKeywords(t *testing.T) {
 }
 
 func TestParakeetAlignRejectsContentMutation(t *testing.T) {
+	requirePOSIXShell(t)
 	dir := t.TempDir()
 	script := filepath.Join(dir, "sidecar.sh")
 	body := "#!/bin/sh\nprintf '%s' '{\"segments\":[{\"timestamp\":\"[00:00:01]\",\"speaker\":\"Mallory\",\"text\":\"changed\"}]}'\n"
@@ -542,6 +545,7 @@ func TestParseCommandArgsRejectsMalformedQuotes(t *testing.T) {
 }
 
 func TestParakeetCommandSupportsQuotedExecutableAndArgument(t *testing.T) {
+	requirePOSIXShell(t)
 	dir := filepath.Join(t.TempDir(), "sidecar scripts")
 	if err := os.Mkdir(dir, 0o700); err != nil {
 		t.Fatal(err)
@@ -572,6 +576,7 @@ printf '%s' '{"segments":[{"timestamp":"[00:00:01]","speaker":"Alice","text":"or
 }
 
 func TestParakeetTranscribeGroupsWordsFromQuotedPathSidecar(t *testing.T) {
+	requirePOSIXShell(t)
 	dir := filepath.Join(t.TempDir(), "quoted sidecar")
 	if err := os.Mkdir(dir, 0o700); err != nil {
 		t.Fatal(err)
@@ -848,4 +853,28 @@ func containsSubstring(s, sub string) bool {
 func testContext(t *testing.T) context.Context {
 	t.Helper()
 	return context.Background()
+}
+
+// requirePOSIXShell skips tests whose fake sidecars are shell scripts.
+func requirePOSIXShell(t *testing.T) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("fake sidecars are POSIX shell scripts")
+	}
+}
+
+func TestParseCommandArgsKeepsWindowsPaths(t *testing.T) {
+	command := `C:\Tools\parakeet.exe --model "C:\Models\nemo v2" --note "It's \"quoted\"" 'C:\raw\path'`
+	got, err := parseCommandArgsFor(command, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{`C:\Tools\parakeet.exe`, "--model", `C:\Models\nemo v2`, "--note", `It's "quoted"`, `C:\raw\path`}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("parseCommandArgsFor(windows) = %#v, want %#v", got, want)
+	}
+	posix, err := parseCommandArgsFor(`plain\ value`, false)
+	if err != nil || !reflect.DeepEqual(posix, []string{"plain value"}) {
+		t.Fatalf("POSIX escapes changed: %#v, %v", posix, err)
+	}
 }

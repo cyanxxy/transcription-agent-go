@@ -11,6 +11,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"time"
@@ -399,7 +400,14 @@ func writeJSONAtomicWithSync(path string, value any, mode os.FileMode, syncDir f
 	return nil
 }
 
+// syncDirectory makes renames and new entries in path durable. Windows cannot
+// flush a directory handle (FlushFileBuffers needs write access, which a
+// directory handle cannot have), so it is a no-op there; file contents are
+// still flushed before every rename.
 func syncDirectory(path string) error {
+	if runtime.GOOS == "windows" {
+		return nil
+	}
 	dir, err := os.Open(path)
 	if err != nil {
 		return err
