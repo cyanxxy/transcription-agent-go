@@ -109,6 +109,9 @@
   let reviewExpiresAt = null;
   let reviewTimer = null;
   let checkingJobStatus = false;
+  // True while an upload or transcription is in progress. A transcript that
+  // only awaits review is not busy, so a new job can start meanwhile.
+  let busy = false;
   let elapsedTimer = null;
   let audioURL = null; // file selected for the next upload
   let jobAudioURL = null; // file behind the transcript on screen
@@ -184,13 +187,16 @@
     return match ? Number(match[1]) * 3600 + Number(match[2]) * 60 + Number(match[3]) : 0;
   }
 
-  async function errorMessage(response) {
-    const text = await response.text();
+  function messageFrom(text, status) {
     try {
       const body = JSON.parse(text);
       if (body && body.error) return body.error;
     } catch (_) { /* not JSON */ }
-    return text.trim() || `The server returned ${response.status}.`;
+    return String(text || '').trim() || `The server returned ${status}.`;
+  }
+
+  async function errorMessage(response) {
+    return messageFrom(await response.text(), response.status);
   }
 
   let toastTimer = null;
@@ -387,7 +393,7 @@
   }
 
   function updateSubmitState() {
-    const running = Boolean(currentStream) || awaitingReview;
+    const running = busy;
     const missing = requiredProviders(selectedModel(), speechReview.checked).some((p) => !providerConfigured(p));
     submitBtn.disabled = running || missing;
     submitBtn.title = missing ? 'Add the missing API key first' : '';
@@ -395,7 +401,50 @@
 
   form.addEventListener('change', (event) => {
     if (event.target.name === 'model_name' || event.target === speechReview) syncForm();
+    saveSettings();
   });
+
+  // Settings worth keeping between recordings. Per-recording context (speaker
+  // names, topic, instructions, keywords) is deliberately not remembered.
+  const SETTINGS_KEY = 'transcription-settings';
+  const REMEMBERED_FIELDS = [
+    'model_name', 'language_codes', 'remove_fillers', 'speech_review', 'judge_model_name',
+    'candidate_strategy', 'expected_format', 'transcription_thinking_level', 'judge_thinking_level',
+    'service_tier', 'use_judge_pipeline', 'agentic_mode', 'auto_format', 'chunk_strategy', 'chunk_concurrency',
+  ];
+
+  function saveSettings() {
+    const values = {};
+    REMEMBERED_FIELDS.forEach((name) => {
+      const field = form.elements.namedItem(name);
+      if (!field) return;
+      values[name] = field.type === 'checkbox' ? field.checked : field.value;
+    });
+    storage.set(localStorage, SETTINGS_KEY, JSON.stringify(values));
+  }
+
+  function restoreSettings() {
+    let values;
+    try {
+      values = JSON.parse(storage.get(localStorage, SETTINGS_KEY, '{}')) || {};
+    } catch (_) {
+      return;
+    }
+    REMEMBERED_FIELDS.forEach((name) => {
+      const field = form.elements.namedItem(name);
+      if (!field || !(name in values)) return;
+      if (field.type === 'checkbox') {
+        field.checked = Boolean(values[name]);
+      } else if (field instanceof RadioNodeList) {
+        // Only restore a model that still exists.
+        if ([...field].some((radio) => radio.value === values[name])) field.value = values[name];
+      } else if (field.tagName === 'SELECT') {
+        if ([...field.options].some((option) => option.value === values[name])) field.value = values[name];
+      } else {
+        field.value = String(values[name]);
+      }
+    });
+  }
 
   // ---- File selection --------------------------------------------------------------
   function showFormError(message) {
@@ -627,21 +676,35 @@
     setJobReference('');
   }
 
-  function setBusy(busy, label) {
-    spinner.hidden = !busy;
+  function setBusy(value, label) {
+    busy = value;
+    spinner.hidden = !value;
     submitLabel.textContent = label || 'Transcribe';
     updateSubmitState();
   }
 
   // ---- Submit -------------------------------------------------------------------
-  async function createJob(formData, idempotencyKey) {
+  // XMLHttpRequest rather than fetch: fetch cannot report upload progress.
+  function uploadJob(formData, idempotencyKey, onProgress) {
+    return new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      xhr.open('POST', '/api/jobs');
+      Object.entries(authHeaders({ 'Idempotency-Key': idempotencyKey })).forEach(([name, value]) => xhr.setRequestHeader(name, value));
+      xhr.upload.addEventListener('progress', (event) => {
+        if (event.lengthComputable) onProgress(event.loaded / event.total);
+      });
+      xhr.addEventListener('load', () => resolve({ status: xhr.status, text: xhr.responseText }));
+      xhr.addEventListener('error', () => reject(new Error('The connection dropped during the upload.')));
+      xhr.send(formData);
+    });
+  }
+
+  // The same Idempotency-Key makes a retry return the job the first attempt
+  // may already have created.
+  async function createJob(formData, idempotencyKey, onProgress) {
     for (let attempt = 0; attempt < 2; attempt += 1) {
       try {
-        return await fetch('/api/jobs', {
-          method: 'POST',
-          headers: authHeaders({ 'Idempotency-Key': idempotencyKey }),
-          body: formData,
-        });
+        return await uploadJob(formData, idempotencyKey, onProgress);
       } catch (error) {
         if (attempt > 0) throw error;
         progressLabel.textContent = 'Connection dropped; checking whether the upload arrived…';
@@ -665,6 +728,10 @@
     }
     showFormError('');
     const model = selectedModel();
+    if (currentStream) {
+      currentStream.close();
+      currentStream = null;
+    }
     if (jobAudioURL && jobAudioURL !== audioURL) URL.revokeObjectURL(jobAudioURL);
     jobAudioURL = audioURL;
     clearReviewState();
@@ -686,12 +753,14 @@
     });
 
     try {
-      const response = await createJob(data, crypto.randomUUID());
-      if (!response.ok) throw new Error(await errorMessage(response));
-      const started = await response.json();
+      const response = await createJob(data, crypto.randomUUID(), (fraction) => {
+        setStage('upload', `${Math.round(fraction * 100)}%`);
+        setProgress(fraction * 0.08);
+      });
+      if (response.status < 200 || response.status >= 300) throw new Error(messageFrom(response.text, response.status));
+      const started = JSON.parse(response.text);
       currentJobId = started.job_id;
       setJobReference(currentJobId);
-      storage.set(sessionStorage, ACTIVE_JOB_KEY, currentJobId);
       rememberJob({ id: currentJobId, name: file.name, model, at: Date.now() });
       if (started.idempotent_replay) appendLog('Recovered a submission the server had already accepted.');
       appendLog('Upload complete.');
@@ -736,6 +805,8 @@
       stopElapsed();
       progressElapsed.textContent = '';
     }
+    // Remember the job on screen so a reload brings it back.
+    storage.set(sessionStorage, ACTIVE_JOB_KEY, jobId);
     const stream = new EventSource(`/api/jobs/${encodeURIComponent(jobId)}/stream`);
     currentStream = stream;
     updateSubmitState();
@@ -798,7 +869,6 @@
     stream.close();
     if (currentStream === stream) currentStream = null;
     cancelJob.hidden = true;
-    storage.remove(sessionStorage, ACTIVE_JOB_KEY);
     stopElapsed();
     updateSubmitState();
   }
@@ -919,14 +989,14 @@
     setBusy(false);
   }
 
-  function completeReview(decision) {
+  // announce is false for decisions replayed from the job's history.
+  function completeReview(decision, announce = false) {
     awaitingReview = false;
     clearReviewTimer();
     reviewPanel.hidden = true;
     if (currentStream) closeStream(currentStream);
-    storage.remove(sessionStorage, ACTIVE_JOB_KEY);
     setBusy(false);
-    toast(decision === 'accept' ? 'Transcript accepted' : 'Transcript rejected');
+    if (announce) toast(decision === 'accept' ? 'Transcript accepted' : 'Transcript rejected');
   }
 
   async function submitReview(decision) {
@@ -943,7 +1013,7 @@
         error.status = response.status;
         throw error;
       }
-      completeReview(decision);
+      completeReview(decision, true);
     } catch (error) {
       if ([404, 409, 410].includes(error.status)) {
         markJobUnavailable('Review is no longer available for this transcript.', 'Expired');
@@ -1326,8 +1396,11 @@
 
   async function refreshSubtitles() {
     if (!currentJobId || !currentResult) return;
+    const jobId = currentJobId;
     try {
-      panes.subtitles.textContent = await (await fetchExport('srt', true)).text();
+      const text = await (await fetchExport('srt', true)).text();
+      // Ignore a preview that finishes after the user opened another job.
+      if (jobId === currentJobId) panes.subtitles.textContent = text;
     } catch (_) { /* keep the previous preview */ }
   }
 
@@ -1433,6 +1506,7 @@
   // ---- Start --------------------------------------------------------------------
   renderFormats();
   renderHistory();
+  restoreSettings();
   syncForm();
   void loadConfig();
   const resumable = storage.get(sessionStorage, ACTIVE_JOB_KEY, '');
