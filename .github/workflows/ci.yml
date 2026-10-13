@@ -4,14 +4,21 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
 
+# A newer push to the same branch or PR replaces the run in progress.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
-  build-test:
-    name: build · test · lint
+  linux:
+    name: linux · lint · test · build
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7.0.1
 
@@ -20,10 +27,9 @@ jobs:
         with:
           go-version-file: go.mod
           check-latest: true
-          cache: true
 
       - name: Install ffmpeg
-        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends ffmpeg
 
       - name: Verify formatting
         run: |
@@ -42,12 +48,10 @@ jobs:
         with:
           version: v2.14.0
 
-      - name: Scan for known vulnerabilities
-        uses: golang/govulncheck-action@v1.1.0
-        with:
-          repo-checkout: false
-          go-version-file: go.mod
-          go-package: ./...
+      # Runs with the toolchain from go.mod (the govulncheck action would
+      # install the latest stable Go instead).
+      - name: govulncheck
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
 
       - name: Unit tests (race detector)
         run: go test ./... -race -count=1
@@ -55,26 +59,29 @@ jobs:
       - name: Build binaries
         run: |
           go build -trimpath -ldflags "-s -w -X main.version=ci" -o bin/transcription-server ./cmd/server
-          go build -trimpath -ldflags "-s -w -X main.version=ci" -o bin/transcriber-cli      ./cmd/cli
+          go build -trimpath -ldflags "-s -w -X main.version=ci" -o bin/transcriber-cli ./cmd/cli
 
       - name: Server smoke test
+        env:
+          GEMINI_API_KEY: dummy
+          # Keep the accepted job from reaching a real provider.
+          HTTPS_PROXY: http://127.0.0.1:9
         run: |
-          GEMINI_API_KEY=dummy ./bin/transcription-server --addr 127.0.0.1:8765 &
-          PID=$!
-          # Wait for /readyz to come up.
-          for _ in $(seq 1 20); do
-            if curl -fs http://127.0.0.1:8765/readyz >/dev/null; then break; fi
-            sleep 0.5
-          done
-          curl -fs http://127.0.0.1:8765/healthz
-          curl -fs http://127.0.0.1:8765/readyz
-          curl -fs http://127.0.0.1:8765/ -o /dev/null
-          kill -TERM $PID
-          wait $PID || true
+          ./bin/transcription-server --addr 127.0.0.1:8765 --job-dir "$RUNNER_TEMP/jobs" &
+          trap 'kill $!' EXIT
+          for _ in $(seq 1 20); do curl -fs http://127.0.0.1:8765/readyz >/dev/null && break; sleep 0.5; done
+          curl -fsS http://127.0.0.1:8765/healthz
+          curl -fsS http://127.0.0.1:8765/ -o /dev/null
+          ffmpeg -hide_banner -loglevel error -f lavfi -i "sine=frequency=440:duration=2" "$RUNNER_TEMP/tone.wav"
+          job_id=$(curl -fsS -F "audio=@$RUNNER_TEMP/tone.wav" http://127.0.0.1:8765/api/jobs | jq -er .job_id)
+          curl -fsS "http://127.0.0.1:8765/api/jobs/$job_id" | jq -e '.events | length > 0' >/dev/null
+          curl -fsS -X POST -H "Content-Type: application/json" -d '{}' "http://127.0.0.1:8765/api/jobs/$job_id/cancel"
+          ./bin/transcriber-cli --version
 
   windows:
     name: windows · test · build
     runs-on: windows-latest
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v7.0.1
 
@@ -83,7 +90,6 @@ jobs:
         with:
           go-version-file: go.mod
           check-latest: true
-          cache: true
 
       - name: Install ffmpeg
         run: choco install ffmpeg --no-progress -y
@@ -101,26 +107,47 @@ jobs:
 
       - name: Server smoke test
         shell: pwsh
+        env:
+          GEMINI_API_KEY: dummy
+          # Keep the accepted job from reaching a real provider.
+          HTTPS_PROXY: http://127.0.0.1:9
         run: |
-          # Point outbound HTTPS at a closed port so the queued job never
-          # reaches a real provider with the dummy key.
-          $env:GEMINI_API_KEY = "dummy"
-          $env:HTTPS_PROXY = "http://127.0.0.1:9"
           $jobs = Join-Path $env:RUNNER_TEMP "jobs"
           $server = Start-Process -FilePath .\bin\transcription-server.exe -ArgumentList "--addr", "127.0.0.1:8765", "--job-dir", $jobs -PassThru -NoNewWindow
-          for ($i = 0; $i -lt 40; $i++) {
-            try { Invoke-RestMethod http://127.0.0.1:8765/readyz | Out-Null; break } catch { Start-Sleep -Milliseconds 500 }
+          try {
+            for ($i = 0; $i -lt 40; $i++) {
+              try { Invoke-RestMethod http://127.0.0.1:8765/readyz | Out-Null; break } catch { Start-Sleep -Milliseconds 500 }
+            }
+            Invoke-RestMethod http://127.0.0.1:8765/healthz
+            Invoke-WebRequest http://127.0.0.1:8765/ -UseBasicParsing | Out-Null
+            $tone = Join-Path $env:RUNNER_TEMP "tone.wav"
+            ffmpeg -hide_banner -loglevel error -f lavfi -i "sine=frequency=440:duration=2" $tone
+            # Accepting a job exercises staging, the event journal, and atomic
+            # job snapshots on NTFS.
+            $job = curl.exe -fsS -F "audio=@$tone" http://127.0.0.1:8765/api/jobs | ConvertFrom-Json
+            if (-not $job.job_id) { throw "job was not accepted" }
+            $state = Invoke-RestMethod "http://127.0.0.1:8765/api/jobs/$($job.job_id)"
+            if ($state.events.Count -lt 1) { throw "job events were not persisted" }
+            curl.exe -fsS -X POST -H "Content-Type: application/json" -d "{}" "http://127.0.0.1:8765/api/jobs/$($job.job_id)/cancel"
+            .\bin\transcriber-cli.exe --version
+          } finally {
+            Stop-Process -Id $server.Id -ErrorAction SilentlyContinue
           }
-          Invoke-RestMethod http://127.0.0.1:8765/healthz
-          Invoke-WebRequest http://127.0.0.1:8765/ -UseBasicParsing | Out-Null
-          $tone = Join-Path $env:RUNNER_TEMP "tone.wav"
-          ffmpeg -hide_banner -loglevel error -f lavfi -i "sine=frequency=440:duration=2" $tone
-          # Accepting a job exercises staging, the event journal, and atomic
-          # job snapshots on NTFS.
-          $job = curl.exe -fsS -F "audio=@$tone" -F "model_name=gemini-3.5-transcribe" http://127.0.0.1:8765/api/jobs | ConvertFrom-Json
-          if (-not $job.job_id) { throw "job was not accepted" }
-          $state = Invoke-RestMethod "http://127.0.0.1:8765/api/jobs/$($job.job_id)"
-          if ($state.events.Count -lt 1) { throw "job events were not persisted" }
-          curl.exe -fsS -X POST -H "Content-Type: application/json" -d "{}" "http://127.0.0.1:8765/api/jobs/$($job.job_id)/cancel"
-          .\bin\transcriber-cli.exe --version
-          Stop-Process -Id $server.Id
+
+  docker:
+    name: docker · build · smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - name: Build image
+        run: docker build --build-arg VERSION=ci -t transcription-agent:ci .
+
+      - name: Smoke test container
+        run: |
+          docker run -d --name app -p 8765:8080 transcription-agent:ci
+          trap 'docker logs app; docker rm -f app >/dev/null' EXIT
+          for _ in $(seq 1 30); do curl -fs http://127.0.0.1:8765/readyz >/dev/null && break; sleep 1; done
+          curl -fsS http://127.0.0.1:8765/healthz
+          docker exec app ffmpeg -version | head -1

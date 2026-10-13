@@ -1,4 +1,7 @@
 bin/
+# Local job storage holds saved API keys and recordings; never send it to the build.
+data/
+docs/
 .git/
 .github/
 README.md

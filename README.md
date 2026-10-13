@@ -147,7 +147,7 @@ make test-race   # tests with the race detector
 make lint        # golangci-lint
 ```
 
-CI runs lint, vulnerability scanning, and the test suite on Linux and Windows. Code lives in `cmd/` (server, CLI) and `internal/` (workflow, providers, audio, exports).
+CI runs lint, vulnerability scanning, and the test suite on Linux and Windows, and builds the Docker image. Code lives in `cmd/` (server, CLI) and `internal/` (workflow, providers, audio, exports).
 
 ## License
 
