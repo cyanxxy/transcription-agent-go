@@ -17,7 +17,7 @@ import (
 
 // InteractionRequest is the REST body for POST /{api_version}/interactions.
 // Models and features absent from the v1 schema use v1beta, including
-// Gemini 3.8 Flash and Gemini 3.5 Transcribe. Schema checked 2026-09-14:
+// Gemini 3.8 Flash and Gemini 3.5 Transcribe. Schema checked 2026-10-13:
 // https://ai.google.dev/static/api/interactions.openapi.json
 // Store is a pointer because omitting it selects the API default (true).
 type InteractionRequest struct {
@@ -56,9 +56,12 @@ type InteractionGenerationConfig struct {
 }
 
 // TranscriptionConfig configures the dedicated speech model. Timestamps and
-// diarization require verbatim mode and cannot be combined with vocabulary biasing.
+// diarization require verbatim mode and cannot be combined with vocabulary
+// biasing (custom_vocabulary), so that field is not modeled. LanguageCodes
+// are BCP-47 hints; omitted means automatic detection with code switching.
 type TranscriptionConfig struct {
-	Mode TranscriptionMode `json:"mode"`
+	Mode          TranscriptionMode `json:"mode"`
+	LanguageCodes []string          `json:"language_codes,omitempty"`
 }
 
 type TranscriptionMode struct {

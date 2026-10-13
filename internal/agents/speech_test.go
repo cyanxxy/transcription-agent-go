@@ -3,6 +3,7 @@ package agents
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"os"
@@ -84,7 +85,7 @@ func TestSpeechRejectsMissingTimingAndCredentials(t *testing.T) {
 		{config.MicrosoftTranscriptionModel, `{"phrases":[{"offsetMilliseconds":-1,"text":"hello"}]}`},
 		{config.MetaTranscriptionModel, `{"transcript":"hello"}`},
 	} {
-		if _, err := parseSpeechResponse(tc.model, []byte(tc.body)); err == nil {
+		if _, err := parseSpeechUnits(tc.model, []byte(tc.body)); err == nil {
 			t.Fatal("accepted missing/invalid timing")
 		}
 	}
@@ -118,5 +119,17 @@ func TestSpeechRateLimitCancellationAndErrorRedaction(t *testing.T) {
 	})
 	if _, err := transcribeSpeechWAV(context.Background(), d, path, client); err == nil || strings.Contains(err.Error(), "secret-key") {
 		t.Fatalf("unsafe/missing error: %v", err)
+	}
+}
+
+func TestSpeechEmptyTurnsWrapNoWordAnnotations(t *testing.T) {
+	for _, tc := range []struct{ model, body string }{
+		{config.MetaTranscriptionModel, `{"turns":[]}`},
+		{config.MicrosoftTranscriptionModel, `{"phrases":[]}`},
+	} {
+		_, err := parseSpeechUnits(tc.model, []byte(tc.body))
+		if !errors.Is(err, ErrNoWordAnnotations) {
+			t.Fatalf("%s: err = %v, want ErrNoWordAnnotations so chunked runs record a gap", tc.model, err)
+		}
 	}
 }

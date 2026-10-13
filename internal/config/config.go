@@ -25,26 +25,27 @@ const DefaultJudgeModel = "gemini-3.8-flash"
 // SupportedGeminiModels is the allow-list of Gemini model identifiers.
 var SupportedGeminiModels = map[string]struct{}{
 	DefaultTranscriptionModel: {},
-	"gemini-3.1-flash-lite":   {},
+	"gemini-3.5-flash-lite":   {},
 	"gemini-3.8-flash":        {},
 }
 
 // GeminiModelAliases redirects deprecated model names to their current ones.
 var GeminiModelAliases = map[string]string{
 	"gemini-3-flash-preview":        "gemini-3.8-flash",
-	"gemini-3.1-flash-lite-preview": "gemini-3.1-flash-lite",
+	"gemini-3.1-flash-lite":         "gemini-3.5-flash-lite",
+	"gemini-3.1-flash-lite-preview": "gemini-3.5-flash-lite",
 }
 
 // GeminiModelLabels are the human-friendly labels for each model.
 var GeminiModelLabels = map[string]string{
 	DefaultTranscriptionModel: "Gemini 3.5 Transcribe",
-	"gemini-3.1-flash-lite":   "Gemini 3.1 Flash-Lite",
+	"gemini-3.5-flash-lite":   "Gemini 3.5 Flash-Lite",
 	"gemini-3.8-flash":        "Gemini 3.8 Flash",
 }
 
 // GeminiModelThinkingLevels lists the legal thinking levels per model.
 var GeminiModelThinkingLevels = map[string]map[string]struct{}{
-	"gemini-3.1-flash-lite": {"minimal": {}, "low": {}, "medium": {}, "high": {}},
+	"gemini-3.5-flash-lite": {"minimal": {}, "low": {}, "medium": {}, "high": {}},
 	"gemini-3.8-flash":      {"low": {}, "medium": {}, "high": {}},
 }
 
@@ -91,10 +92,10 @@ func FormatGeminiModelLabel(name string) string {
 
 // ResolveDualGeminiSecondaryModel picks the second model for dual-candidate.
 func ResolveDualGeminiSecondaryModel(primary string) string {
-	if primary == "gemini-3.1-flash-lite" {
+	if primary == "gemini-3.5-flash-lite" {
 		return "gemini-3.8-flash"
 	}
-	return "gemini-3.1-flash-lite"
+	return "gemini-3.5-flash-lite"
 }
 
 // CandidateSpec describes one candidate transcription run.
@@ -107,12 +108,16 @@ type CandidateSpec struct {
 
 // TranscriptionDeps holds settings for the transcription agent.
 type TranscriptionDeps struct {
-	APIKey                     string
-	MetaAPIKey                 string
-	AzureSpeechKey             string
-	AzureSpeechEndpoint        string
-	ModelName                  string
-	JudgeModelName             string
+	APIKey              string
+	MetaAPIKey          string
+	AzureSpeechKey      string
+	AzureSpeechEndpoint string
+	ModelName           string
+	JudgeModelName      string
+	// LanguageCodes are per-run BCP-47 hints from the user's context. They
+	// are sent as transcription_config.language_codes to Gemini Transcribe
+	// and as the forced locale to MAI-Transcribe-2 when exactly one is set.
+	LanguageCodes              []string
 	CandidateStrategy          string
 	MaxFileSizeMB              int
 	ChunkDurationMS            int
@@ -130,19 +135,23 @@ type TranscriptionDeps struct {
 	FixCapitalization          bool
 	ParakeetModel              string
 	UseJudgePipeline           bool
-	SkillRoots                 []string
-	UseSkills                  bool
-	UseSkillRouter             bool
-	AgenticMode                bool
-	AgentMaxCandidateRuns      int
-	AgentMaxJudgeCalls         int
-	AgentMaxPlannerTurns       int
-	AgentMaxSpanEscalations    int
-	AgentEscalationScore       float64
-	AgentGlobalReview          bool
-	AgentMaxTokens             int
-	AgentMaxWallTimeSeconds    int
-	tempDirOwned               bool
+	// SpeechReview sends a speech model's transcript through the review
+	// pipeline (extra candidates, judge, and global review) instead of the
+	// default direct path. It has no effect on general-purpose Gemini models.
+	SpeechReview            bool
+	SkillRoots              []string
+	UseSkills               bool
+	UseSkillRouter          bool
+	AgenticMode             bool
+	AgentMaxCandidateRuns   int
+	AgentMaxJudgeCalls      int
+	AgentMaxPlannerTurns    int
+	AgentMaxSpanEscalations int
+	AgentEscalationScore    float64
+	AgentGlobalReview       bool
+	AgentMaxTokens          int
+	AgentMaxWallTimeSeconds int
+	tempDirOwned            bool
 }
 
 // NewTranscriptionDeps constructs a validated TranscriptionDeps.
@@ -292,9 +301,16 @@ func NewTranscriptionDeps(apiKey string, opts ...TranscriptionOption) (*Transcri
 }
 
 // ApplyModelCapabilities selects the direct speech path regardless of stale UI
-// or CLI pipeline flags. General-purpose Gemini models retain their settings.
+// or CLI pipeline flags unless SpeechReview opts a speech model into the
+// review pipeline. General-purpose Gemini models retain their settings.
 func (d *TranscriptionDeps) ApplyModelCapabilities() {
 	if !IsDirectSpeechModel(d.ModelName) {
+		return
+	}
+	if d.SpeechReview {
+		// The speech model is the primary candidate; the judge, optional
+		// second candidate, and global review follow the run's settings.
+		d.UseJudgePipeline = true
 		return
 	}
 	d.UseJudgePipeline = false
@@ -308,6 +324,12 @@ func (d *TranscriptionDeps) ApplyModelCapabilities() {
 	d.UseSkills = false
 	d.PreserveContext = false
 	d.AutoFormat = false
+}
+
+// NeedsGeminiKey reports whether the run calls Gemini: every Gemini model,
+// and Meta or Microsoft when their output goes to the Gemini judge.
+func (d *TranscriptionDeps) NeedsGeminiKey() bool {
+	return !IsExternalSpeechModel(d.ModelName) || d.UseJudgePipeline
 }
 
 // NormalizeServiceTier trims and lowercases a Gemini service tier.
@@ -346,17 +368,16 @@ func validateThinkingLevel(field, model, level string) (string, error) {
 
 // ResolveCandidateSpecs returns the candidate plan for the judge pipeline.
 func (d *TranscriptionDeps) ResolveCandidateSpecs() []CandidateSpec {
+	primary := CandidateSpec{
+		CandidateID: strings.ReplaceAll(d.ModelName, "-", "_"),
+		Label:       FormatGeminiModelLabel(d.ModelName),
+		Kind:        "gemini",
+		ModelName:   d.ModelName,
+	}
 	if IsExternalSpeechModel(d.ModelName) {
-		return []CandidateSpec{{CandidateID: d.ModelName, Label: d.ModelName, Kind: "speech", ModelName: d.ModelName}}
+		primary = CandidateSpec{CandidateID: d.ModelName, Label: d.ModelName, Kind: "speech", ModelName: d.ModelName}
 	}
-	specs := []CandidateSpec{
-		{
-			CandidateID: strings.ReplaceAll(d.ModelName, "-", "_"),
-			Label:       FormatGeminiModelLabel(d.ModelName),
-			Kind:        "gemini",
-			ModelName:   d.ModelName,
-		},
-	}
+	specs := []CandidateSpec{primary}
 	switch d.CandidateStrategy {
 	case "dual_gemini":
 		secondary := ResolveDualGeminiSecondaryModel(d.ModelName)
@@ -427,6 +448,35 @@ func WithJudgeModelName(name string) TranscriptionOption {
 func WithCandidateStrategy(s string) TranscriptionOption {
 	return func(d *TranscriptionDeps) { d.CandidateStrategy = s }
 }
+
+// WithMetaAPIKey sets the Meta key when one is given; otherwise META_API_KEY
+// from the environment is kept.
+func WithMetaAPIKey(key string) TranscriptionOption {
+	return func(d *TranscriptionDeps) {
+		if strings.TrimSpace(key) != "" {
+			d.MetaAPIKey = strings.TrimSpace(key)
+		}
+	}
+}
+
+// WithAzureSpeech sets the Azure Speech key and endpoint when given;
+// otherwise the AZURE_SPEECH_* environment values are kept.
+func WithAzureSpeech(key, endpoint string) TranscriptionOption {
+	return func(d *TranscriptionDeps) {
+		if strings.TrimSpace(key) != "" {
+			d.AzureSpeechKey = strings.TrimSpace(key)
+		}
+		if strings.TrimSpace(endpoint) != "" {
+			d.AzureSpeechEndpoint = strings.TrimSpace(endpoint)
+		}
+	}
+}
+
+// WithSpeechReview opts speech models into the review pipeline.
+func WithSpeechReview(v bool) TranscriptionOption {
+	return func(d *TranscriptionDeps) { d.SpeechReview = v }
+}
+
 func WithUseJudgePipeline(v bool) TranscriptionOption {
 	return func(d *TranscriptionDeps) { d.UseJudgePipeline = v }
 }

@@ -552,5 +552,5 @@ func (j *job) persistLocked() error {
 	if j.syncSnapshotDirectory != nil {
 		return writeJSONAtomicWithSync(path, j.persistedLocked(), 0o600, j.syncSnapshotDirectory)
 	}
-	return writeJSONAtomic(path, j.persistedLocked(), 0o600)
+	return writeJSONAtomic(path, j.persistedLocked())
 }

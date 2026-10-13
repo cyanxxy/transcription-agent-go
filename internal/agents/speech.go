@@ -3,9 +3,11 @@ package agents
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"mime/multipart"
+	"net"
 	"net/http"
 	"net/textproto"
 	"net/url"
@@ -14,6 +16,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/cyanxxy/transcription-agent-go/internal/config"
@@ -39,7 +42,9 @@ func ValidateSpeechCredentials(d *config.TranscriptionDeps) error {
 	return nil
 }
 
-func (a *TranscriptionAgent) runExternalSpeech(ctx context.Context, in TranscribeInput) ([]models.TranscriptSegment, error) {
+// runExternalSpeech transcribes with Meta or Microsoft and returns provider
+// turns with absolute offsets and request-local speaker labels.
+func (a *TranscriptionAgent) runExternalSpeech(ctx context.Context, in TranscribeInput) ([]TimedUnit, error) {
 	d := a.Deps
 	if err := ValidateSpeechCredentials(d); err != nil {
 		return nil, err
@@ -58,23 +63,32 @@ func (a *TranscriptionAgent) runExternalSpeech(ctx context.Context, in Transcrib
 	if err := cmd.Run(); err != nil {
 		return nil, fmt.Errorf("prepare speech WAV: %w", err)
 	}
-	segs, err := transcribeSpeechWAV(ctx, d, wav.Name(), http.DefaultClient)
+	units, err := transcribeSpeechUnits(ctx, d, wav.Name(), http.DefaultClient)
 	if err != nil {
 		return nil, err
 	}
 	if in.ChunkInfo != nil {
-		for i := range segs {
-			seconds, _ := segs[i].TimestampSeconds()
-			segs[i].Timestamp = models.FormatTimestamp(seconds + float64(in.ChunkInfo.StartMS)/1000)
+		offset := int64(in.ChunkInfo.StartMS)
+		for i := range units {
+			units[i].StartMS += offset
+			units[i].EndMS += offset
 		}
 	}
-	return segs, nil
+	return units, nil
 }
 
 // Requests follow Meta's official file cookbook and Azure Fast Transcription
 // api-version=2025-10-15 (MAI enhancedMode). Multipart bodies stay on disk so
 // retries and parallel chunks do not duplicate entire recordings in memory.
 func transcribeSpeechWAV(ctx context.Context, d *config.TranscriptionDeps, path string, client *http.Client) ([]models.TranscriptSegment, error) {
+	units, err := transcribeSpeechUnits(ctx, d, path, client)
+	if err != nil {
+		return nil, err
+	}
+	return segmentsFromUnits(labelSpeakersInOrder(units))
+}
+
+func transcribeSpeechUnits(ctx context.Context, d *config.TranscriptionDeps, path string, client *http.Client) ([]TimedUnit, error) {
 	endpoint := "https://api.meta.ai/v1/asr/transcribe"
 	key, header, auth := d.MetaAPIKey, "Authorization", "Bearer "
 	field := "request"
@@ -84,7 +98,13 @@ func transcribeSpeechWAV(ctx context.Context, d *config.TranscriptionDeps, path 
 		endpoint = strings.TrimRight(d.AzureSpeechEndpoint, "/") + "/speechtotext/transcriptions:transcribe?api-version=2025-10-15"
 		key, header, auth = d.AzureSpeechKey, "Ocp-Apim-Subscription-Key", ""
 		field = "definition"
-		options = map[string]any{"enhancedMode": map[string]any{"enabled": true, "model": d.ModelName, "modelOptions": map[string]any{"timestamps": "segment", "transcribeStyle": "verbatim"}}, "diarization": map[string]any{"enabled": true}}
+		definition := map[string]any{"enhancedMode": map[string]any{"enabled": true, "model": d.ModelName, "modelOptions": map[string]any{"timestamps": "segment", "transcribeStyle": "verbatim"}}, "diarization": map[string]any{"enabled": true}}
+		// MAI-Transcribe-2 accepts a single forced locale and otherwise
+		// auto-detects (including code switching), so only one code is sent.
+		if len(d.LanguageCodes) == 1 {
+			definition["locales"] = d.LanguageCodes
+		}
+		options = definition
 		limit = 300 << 20
 	}
 	audio, err := os.Open(path)
@@ -151,6 +171,15 @@ func transcribeSpeechWAV(ctx context.Context, d *config.TranscriptionDeps, path 
 		req.Header.Set(header, auth+key)
 		res, err := httpClient.Do(req)
 		if err != nil {
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			if attempt < 2 && retryableSpeechNetErr(err) {
+				if err := sleepSpeechRetry(ctx, time.Duration(1<<attempt)*time.Second); err != nil {
+					return nil, err
+				}
+				continue
+			}
 			return nil, fmt.Errorf("%s request failed: %w", d.ModelName, err)
 		}
 		data, readErr := io.ReadAll(io.LimitReader(res.Body, (16<<20)+1))
@@ -162,19 +191,15 @@ func transcribeSpeechWAV(ctx context.Context, d *config.TranscriptionDeps, path 
 			return nil, fmt.Errorf("speech response exceeds 16 MiB")
 		}
 		if res.StatusCode >= 200 && res.StatusCode < 300 {
-			return parseSpeechResponse(d.ModelName, data)
+			return parseSpeechUnits(d.ModelName, data)
 		}
 		if attempt < 2 && (res.StatusCode == 429 || res.StatusCode >= 500) {
 			delay := time.Duration(1<<attempt) * time.Second
 			if sec, err := strconv.Atoi(res.Header.Get("Retry-After")); err == nil && sec > 0 {
 				delay = time.Duration(min(sec, 120)) * time.Second
 			}
-			timer := time.NewTimer(delay)
-			select {
-			case <-ctx.Done():
-				timer.Stop()
-				return nil, ctx.Err()
-			case <-timer.C:
+			if err := sleepSpeechRetry(ctx, delay); err != nil {
+				return nil, err
 			}
 			continue
 		}
@@ -196,9 +221,11 @@ func transcribeSpeechWAV(ctx context.Context, d *config.TranscriptionDeps, path 
 	return nil, fmt.Errorf("speech retries exhausted")
 }
 
-func parseSpeechResponse(model string, data []byte) ([]models.TranscriptSegment, error) {
+// parseSpeechUnits returns provider turns sorted by start time, with
+// request-relative offsets and provider speaker labels.
+func parseSpeechUnits(model string, data []byte) ([]TimedUnit, error) {
 	type turn struct {
-		Start         *float64
+		Start, End    *float64
 		Text, Speaker string
 	}
 	var turns []turn
@@ -207,6 +234,7 @@ func parseSpeechResponse(model string, data []byte) ([]models.TranscriptSegment,
 			Transcript string `json:"transcript"`
 			Turns      []struct {
 				Start   *float64 `json:"startMs"`
+				End     *float64 `json:"endMs"`
 				Text    string   `json:"transcript"`
 				Speaker string   `json:"speaker"`
 			} `json:"turns"`
@@ -215,14 +243,15 @@ func parseSpeechResponse(model string, data []byte) ([]models.TranscriptSegment,
 			return nil, fmt.Errorf("decode Meta transcript: %w", err)
 		}
 		for _, t := range response.Turns {
-			turns = append(turns, turn{t.Start, t.Text, t.Speaker})
+			turns = append(turns, turn{t.Start, t.End, t.Text, t.Speaker})
 		}
 	} else {
 		var response struct {
 			Phrases []struct {
-				Start   *float64 `json:"offsetMilliseconds"`
-				Text    string   `json:"text"`
-				Speaker *int     `json:"speaker"`
+				Start    *float64 `json:"offsetMilliseconds"`
+				Duration *float64 `json:"durationMilliseconds"`
+				Text     string   `json:"text"`
+				Speaker  *int     `json:"speaker"`
 			} `json:"phrases"`
 		}
 		if err := json.Unmarshal(data, &response); err != nil {
@@ -233,33 +262,58 @@ func parseSpeechResponse(model string, data []byte) ([]models.TranscriptSegment,
 			if p.Speaker != nil {
 				speaker = strconv.Itoa(*p.Speaker)
 			}
-			turns = append(turns, turn{p.Start, p.Text, speaker})
+			var end *float64
+			if p.Start != nil && p.Duration != nil && *p.Duration >= 0 {
+				value := *p.Start + *p.Duration
+				end = &value
+			}
+			turns = append(turns, turn{p.Start, end, p.Text, speaker})
 		}
 	}
+	units := make([]TimedUnit, 0, len(turns))
 	for _, t := range turns {
 		if t.Start == nil || *t.Start < 0 {
 			return nil, fmt.Errorf("speech response has a missing or negative timestamp")
 		}
-	}
-	sort.SliceStable(turns, func(i, j int) bool { return *turns[i].Start < *turns[j].Start })
-	var segs []models.TranscriptSegment
-	speakers := map[string]string{}
-	for _, t := range turns {
 		if strings.TrimSpace(t.Text) == "" {
 			continue
 		}
-		label := "Unknown speaker"
-		if t.Speaker != "" {
-			label = speakers[t.Speaker]
-			if label == "" {
-				label = fmt.Sprintf("Speaker %d", len(speakers)+1)
-				speakers[t.Speaker] = label
-			}
+		start := int64(*t.Start)
+		end := start
+		if t.End != nil && int64(*t.End) > start {
+			end = int64(*t.End)
 		}
-		segs = append(segs, models.TranscriptSegment{Timestamp: models.FormatTimestamp(*t.Start / 1000), Speaker: label, Text: t.Text})
+		units = append(units, TimedUnit{Text: t.Text, Speaker: t.Speaker, StartMS: start, EndMS: end, Turn: true})
 	}
-	if len(segs) == 0 {
-		return nil, fmt.Errorf("%s returned no timestamped speech turns", model)
+	if len(units) == 0 {
+		// Wrap the shared sentinel so a silent or music-only chunk becomes a
+		// gap marker instead of failing the whole chunked run.
+		return nil, fmt.Errorf("%s returned no timestamped speech turns: %w", model, ErrNoWordAnnotations)
 	}
-	return validateAndCleanSegments(segs)
+	sort.SliceStable(units, func(i, j int) bool { return units[i].StartMS < units[j].StartMS })
+	return units, nil
+}
+
+// retryableSpeechNetErr reports transport failures worth one more attempt:
+// timeouts, resets, and connections dropped mid-response.
+func retryableSpeechNetErr(err error) bool {
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return true
+	}
+	if errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, io.EOF) || errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.ECONNREFUSED) {
+		return true
+	}
+	return strings.Contains(err.Error(), "connection reset")
+}
+
+func sleepSpeechRetry(ctx context.Context, delay time.Duration) error {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }

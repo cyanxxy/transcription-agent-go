@@ -7,7 +7,7 @@ import (
 )
 
 func TestRemovedFlashModelsAreRejected(t *testing.T) {
-	for _, model := range []string{"gemini-3.5-flash", "gemini-3.5-flash-lite", "gemini-3.6-flash"} {
+	for _, model := range []string{"gemini-3.5-flash", "gemini-3.6-flash", "gemini-3.7-flash"} {
 		for _, option := range []TranscriptionOption{WithModelName(model), WithJudgeModelName(model)} {
 			deps, err := NewTranscriptionDeps("test", option)
 			if deps != nil {
@@ -37,7 +37,8 @@ func TestNormalizeGeminiModelName(t *testing.T) {
 		"gemini-3.8-flash":                  "gemini-3.8-flash",
 		"gemini-3-flash-preview":            "gemini-3.8-flash",
 		"google-gla:gemini-3-flash-preview": "gemini-3.8-flash",
-		"gemini-3.1-flash-lite-preview":     "gemini-3.1-flash-lite",
+		"gemini-3.1-flash-lite-preview":     "gemini-3.5-flash-lite",
+		"gemini-3.1-flash-lite":             "gemini-3.5-flash-lite",
 	}
 	for in, want := range cases {
 		got := NormalizeGeminiModelName(in)
@@ -63,7 +64,7 @@ func TestResolveCandidateSpecsDualGemini(t *testing.T) {
 	if specs[0].ModelName != "gemini-3.8-flash" {
 		t.Errorf("primary model = %s", specs[0].ModelName)
 	}
-	if specs[1].ModelName != "gemini-3.1-flash-lite" {
+	if specs[1].ModelName != "gemini-3.5-flash-lite" {
 		t.Errorf("secondary model = %s", specs[1].ModelName)
 	}
 }
@@ -85,7 +86,7 @@ func TestLegacyFlashPreviewAliasUsesCurrentGAReplacement(t *testing.T) {
 
 func TestSupportsStableGemini31FlashLite(t *testing.T) {
 	deps, err := NewTranscriptionDeps("test",
-		WithModelName("gemini-3.1-flash-lite"),
+		WithModelName("gemini-3.5-flash-lite"),
 		WithJudgeModelName("gemini-3.1-flash-lite-preview"),
 		WithCandidateStrategy("single_gemini"),
 	)
@@ -93,10 +94,10 @@ func TestSupportsStableGemini31FlashLite(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer deps.Cleanup()
-	if deps.ModelName != "gemini-3.1-flash-lite" {
+	if deps.ModelName != "gemini-3.5-flash-lite" {
 		t.Errorf("model = %s", deps.ModelName)
 	}
-	if deps.JudgeModelName != "gemini-3.1-flash-lite" {
+	if deps.JudgeModelName != "gemini-3.5-flash-lite" {
 		t.Errorf("judge model = %s", deps.JudgeModelName)
 	}
 }
@@ -120,7 +121,7 @@ func TestSupportsGemini38Flash(t *testing.T) {
 }
 
 func TestSupportsCurrentGeminiFlashModels(t *testing.T) {
-	for _, model := range []string{"gemini-3.8-flash", "gemini-3.1-flash-lite"} {
+	for _, model := range []string{"gemini-3.8-flash", "gemini-3.5-flash-lite"} {
 		t.Run(model, func(t *testing.T) {
 			deps, err := NewTranscriptionDeps("test",
 				WithModelName(model),
@@ -157,7 +158,7 @@ func TestResolveCandidateSpecsDualGemini38Flash(t *testing.T) {
 	if specs[0].Label != "Gemini 3.8 Flash" {
 		t.Errorf("primary label = %s", specs[0].Label)
 	}
-	if specs[1].ModelName != "gemini-3.1-flash-lite" {
+	if specs[1].ModelName != "gemini-3.5-flash-lite" {
 		t.Errorf("secondary model = %s", specs[1].ModelName)
 	}
 }
@@ -495,5 +496,37 @@ func TestMetaChunkLimitIncludesAdaptiveExtension(t *testing.T) {
 		if (err == nil) != tc.valid {
 			t.Fatalf("%+v: %v", tc, err)
 		}
+	}
+}
+
+func TestSpeechReviewKeepsSpeechModelAsPrimaryCandidate(t *testing.T) {
+	cases := []struct {
+		model, wantKind string
+		review          bool
+		wantSpecs       int
+		wantJudge       bool
+	}{
+		{DefaultTranscriptionModel, "gemini", false, 1, false},
+		{DefaultTranscriptionModel, "gemini", true, 2, true},
+		{MetaTranscriptionModel, "speech", false, 1, false},
+		{MicrosoftTranscriptionModel, "speech", true, 2, true},
+	}
+	for _, tc := range cases {
+		deps, err := NewTranscriptionDeps("k", WithModelName(tc.model), WithSpeechReview(tc.review))
+		if err != nil {
+			t.Fatal(err)
+		}
+		specs := deps.ResolveCandidateSpecs()
+		if deps.UseJudgePipeline != tc.wantJudge || len(specs) != tc.wantSpecs || specs[0].ModelName != tc.model || specs[0].Kind != tc.wantKind {
+			t.Errorf("%s review=%v: judge=%v specs=%+v", tc.model, tc.review, deps.UseJudgePipeline, specs)
+		}
+		if tc.wantSpecs == 2 && specs[1].ModelName != "gemini-3.5-flash-lite" {
+			t.Errorf("%s: second candidate = %s, want gemini-3.5-flash-lite", tc.model, specs[1].ModelName)
+		}
+		wantGemini := tc.model == DefaultTranscriptionModel || tc.review
+		if deps.NeedsGeminiKey() != wantGemini {
+			t.Errorf("%s review=%v: NeedsGeminiKey = %v", tc.model, tc.review, deps.NeedsGeminiKey())
+		}
+		deps.Cleanup()
 	}
 }

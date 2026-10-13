@@ -19,31 +19,22 @@ var ErrNoWordAnnotations = errors.New("transcription returned no word annotation
 
 // parseTranscribeSegments groups word annotations into speaker turns, splitting
 // on sentence endings, pauses, and long utterances. Offsets are relative to the
-// uploaded audio; Run applies the chunk offset after parsing.
+// uploaded audio.
 func parseTranscribeSegments(resp *gemini.Interaction) ([]models.TranscriptSegment, error) {
-	var segments []models.TranscriptSegment
-	var words []string
-	var speaker string
-	var start, previousEnd time.Duration
-	speakers := map[string]string{}
-	flush := func() {
-		if len(words) == 0 {
-			return
-		}
-		segments = append(segments, models.TranscriptSegment{
-			Timestamp: models.FormatTimestamp(start.Seconds()),
-			Speaker:   speaker, Text: strings.Join(words, " "),
-		})
-		words = nil
+	units, err := transcribeWordUnits(resp, 0)
+	if err != nil {
+		return nil, err
 	}
-	// Provider annotations may arrive out of order, including across content
-	// blocks. Validate offsets first, then stably sort by numeric start time.
-	// Equal-start words retain their original order; overlapping speech is valid.
-	type timedWord struct {
-		text, speaker string
-		start, end    time.Duration
-	}
-	var annotations []timedWord
+	return segmentsFromUnits(labelSpeakersInOrder(units))
+}
+
+// transcribeWordUnits extracts timed words from a transcription interaction,
+// shifted by offsetMS, with the provider's speaker labels. Provider
+// annotations may arrive out of order, including across content blocks, so
+// offsets are validated first and words stably sorted by start time.
+// Equal-start words retain their original order; overlapping speech is valid.
+func transcribeWordUnits(resp *gemini.Interaction, offsetMS int64) ([]TimedUnit, error) {
+	var units []TimedUnit
 	for _, step := range resp.Steps {
 		if step.Type != "model_output" {
 			continue
@@ -78,36 +69,16 @@ func parseTranscribeSegments(resp *gemini.Interaction) ([]models.TranscriptSegme
 				if err != nil || to < from {
 					return nil, fmt.Errorf("invalid word end offset %q", word.EndOffset)
 				}
-				annotations = append(annotations, timedWord{text: text, speaker: word.Speaker, start: from, end: to})
+				units = append(units, TimedUnit{
+					Text: text, Speaker: word.Speaker,
+					StartMS: offsetMS + from.Milliseconds(), EndMS: offsetMS + to.Milliseconds(),
+				})
 			}
 		}
 	}
-	sort.SliceStable(annotations, func(i, j int) bool { return annotations[i].start < annotations[j].start })
-	for _, word := range annotations {
-		text, from, to := word.text, word.start, word.end
-		label := "Unknown speaker"
-		if word.speaker != "" {
-			label = speakers[word.speaker]
-			if label == "" {
-				label = fmt.Sprintf("Speaker %d", len(speakers)+1)
-				speakers[word.speaker] = label
-			}
-		}
-		if len(words) > 0 && (label != speaker || from-previousEnd > 2*time.Second || from-start >= 20*time.Second) {
-			flush()
-		}
-		if len(words) == 0 {
-			start, speaker = from, label
-		}
-		words = append(words, text)
-		previousEnd = max(previousEnd, to)
-		if strings.ContainsAny(text[len(text)-1:], ".!?") || strings.HasSuffix(text, "。") || strings.HasSuffix(text, "؟") {
-			flush()
-		}
-	}
-	flush()
-	if len(segments) == 0 {
+	if len(units) == 0 {
 		return nil, ErrNoWordAnnotations
 	}
-	return validateAndCleanSegments(segments)
+	sort.SliceStable(units, func(i, j int) bool { return units[i].StartMS < units[j].StartMS })
+	return units, nil
 }

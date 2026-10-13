@@ -3,253 +3,470 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Transcription Agent (Go)</title>
+  <title>Transcription Studio</title>
   <link rel="icon" href="data:," />
   <link rel="stylesheet" href="/static/styles.css" />
 </head>
 <body>
-  <main class="shell">
-    <header class="hero glass-panel">
-      <div class="hero-copy">
-        <p class="eyebrow">ExactTranscriber</p>
-        <h1>Transcription Studio</h1>
-        <p class="subtitle">
-          Turn audio into readable transcripts with speaker labels and timestamps.
-        </p>
+  <header class="topbar">
+    <a class="brand" href="/" aria-label="Transcription Studio home">
+      <span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i><i></i></span>
+      <span class="brand-name">Transcription Studio</span>
+    </a>
+    <nav class="topbar-actions" aria-label="App">
+      <div class="popover-anchor">
+        <button type="button" class="button ghost" id="history-button" aria-haspopup="true" aria-expanded="false" aria-controls="history-panel">History</button>
+        <div class="popover" id="history-panel" hidden>
+          <p class="popover-title">Recent transcripts</p>
+          <ul class="history-list" id="history-list"></ul>
+          <p class="popover-note" id="history-note"></p>
+        </div>
       </div>
-      <div class="hero-status" aria-label="Pipeline defaults">
-        <span><b></b>Gemini 3.5 Transcribe</span>
-        <span>Durable jobs</span>
-        <span>Speaker timestamps</span>
-      </div>
-    </header>
+      <button type="button" class="button ghost keys-button" id="keys-button">
+        <span class="status-dot" id="keys-dot" data-state="unknown" aria-hidden="true"></span>
+        API keys
+      </button>
+    </nav>
+  </header>
 
-    <section class="glass-panel" id="key-card">
-      <div class="section-heading">
-        <p class="eyebrow">Setup</p>
-        <h2>Gemini API key</h2>
-      </div>
-      <div class="key-controls">
-        <label>
-          <span>Provider key</span>
-          <input id="gemini-api-key" type="password" autocomplete="off" spellcheck="false" autocapitalize="off" placeholder="Enter your Gemini API key" />
-        </label>
-        <button type="button" class="ghost" id="save-gemini-key">Save key</button>
-      </div>
-      <p class="hint" id="gemini-key-status" role="status" aria-live="polite">Checking key setup…</p>
-      <p class="hint">Saved only on this server. Open this page on localhost to add or replace the key. If server access authentication is enabled, enter that token below first.</p>
-    </section>
-
-    <section class="glass-panel" id="upload-card">
-      <div class="section-heading">
-        <p class="eyebrow">Input</p>
-        <h2>Upload audio</h2>
-      </div>
-      <form id="upload-form" enctype="multipart/form-data">
-        <div class="dropzone" id="dropzone">
-          <input type="file" name="audio" id="audio-input" accept=".mp3,.wav,.m4a,.flac,.ogg" aria-label="Audio file" aria-describedby="file-hint" required />
-          <span class="dropzone-kicker">Audio source</span>
-          <p class="file-name" id="file-name">Drop an audio file here, or click to browse.</p>
-          <p class="hint" id="file-hint">Supported: mp3 &middot; wav &middot; m4a &middot; flac &middot; ogg</p>
+  <div class="app" id="app">
+    <!-- New transcription -->
+    <aside class="composer" aria-labelledby="composer-title">
+      <form id="upload-form" enctype="multipart/form-data" novalidate>
+        <div class="composer-head">
+          <h1 id="composer-title">New transcription</h1>
         </div>
 
-        <p id="direct-mode-hint" class="hint">Direct transcription with speaker labels and timestamps. One transcription request per chunk.</p>
-        <fieldset class="grid">
-          <legend>Transcription settings</legend>
-          <label class="full">
-            <span>Server access token</span>
-            <input id="auth-token" type="password" autocomplete="current-password" placeholder="Optional when server bearer auth is enabled" />
+        <div class="dropzone" id="dropzone">
+          <input type="file" name="audio" id="audio-input" accept=".mp3,.wav,.m4a,.flac,.ogg,audio/*" aria-describedby="file-hint" />
+          <div class="dropzone-empty" id="dropzone-empty">
+            <span class="dropzone-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" width="22" height="22"><path d="M12 15V4m0 0 4 4m-4-4-4 4M5 15v2a3 3 0 0 0 3 3h8a3 3 0 0 0 3-3v-2" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            </span>
+            <span class="dropzone-title">Add a recording</span>
+            <span class="dropzone-hint" id="file-hint">Drop a file or click to browse · MP3, WAV, M4A, FLAC, OGG</span>
+          </div>
+          <div class="file-card" id="file-card" hidden>
+            <span class="file-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" width="20" height="20"><path d="M9 18V6l10-2v12M9 18a3 3 0 1 1-3-3 3 3 0 0 1 3 3Zm10-2a3 3 0 1 1-3-3 3 3 0 0 1 3 3Z" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            </span>
+            <span class="file-meta">
+              <span class="file-name" id="file-name"></span>
+              <span class="file-detail" id="file-detail"></span>
+            </span>
+            <button type="button" class="icon-button" id="file-clear" aria-label="Remove file">
+              <svg viewBox="0 0 24 24" width="16" height="16"><path d="M6 6l12 12M18 6 6 18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+            </button>
+          </div>
+        </div>
+
+        <fieldset class="model-picker">
+          <legend>Model</legend>
+          <div class="model-group" role="radiogroup" aria-label="Speech-to-text models">
+            <p class="model-group-label">Speech-to-text</p>
+            <label class="model-option">
+              <input type="radio" name="model_name" value="gemini-3.5-transcribe" checked />
+              <span class="model-body">
+                <span class="model-name">Gemini 3.5 Transcribe <span class="tag">Recommended</span></span>
+                <span class="model-desc">Speakers and word-level timing</span>
+              </span>
+              <span class="tag tag-warn" data-key-badge="gemini" hidden>Needs key</span>
+            </label>
+            <label class="model-option">
+              <input type="radio" name="model_name" value="MAI-Transcribe-2" />
+              <span class="model-body">
+                <span class="model-name">Microsoft MAI-Transcribe-2</span>
+                <span class="model-desc">Speakers and phrase timing</span>
+              </span>
+              <span class="tag tag-warn" data-key-badge="microsoft" hidden>Needs key</span>
+            </label>
+            <label class="model-option">
+              <input type="radio" name="model_name" value="muse-voice-transcribe-1.0" />
+              <span class="model-body">
+                <span class="model-name">Meta Muse Voice</span>
+                <span class="model-desc">Speaker turns, up to 10-minute chunks</span>
+              </span>
+              <span class="tag tag-warn" data-key-badge="meta" hidden>Needs key</span>
+            </label>
+          </div>
+          <div class="model-group" role="radiogroup" aria-label="Gemini models with review">
+            <p class="model-group-label">Gemini with review</p>
+            <label class="model-option">
+              <input type="radio" name="model_name" value="gemini-3.8-flash" />
+              <span class="model-body">
+                <span class="model-name">Gemini 3.8 Flash</span>
+                <span class="model-desc">Compares candidates and judges each section · slower</span>
+              </span>
+              <span class="tag tag-warn" data-key-badge="gemini" hidden>Needs key</span>
+            </label>
+            <label class="model-option">
+              <input type="radio" name="model_name" value="gemini-3.5-flash-lite" />
+              <span class="model-body">
+                <span class="model-name">Gemini 3.5 Flash-Lite</span>
+                <span class="model-desc">Review pipeline at lower cost</span>
+              </span>
+              <span class="tag tag-warn" data-key-badge="gemini" hidden>Needs key</span>
+            </label>
+          </div>
+        </fieldset>
+
+        <div class="callout" id="key-callout" role="status" hidden>
+          <span id="key-callout-text"></span>
+          <button type="button" class="link" id="key-callout-action">Add key</button>
+        </div>
+
+        <div class="fields">
+          <label class="field" id="language-codes-field">
+            <span class="field-label">Languages <span class="optional">optional</span></span>
+            <input name="language_codes" type="text" placeholder="Detect automatically" autocomplete="off" spellcheck="false" />
+            <span class="field-help">BCP-47 codes such as en-US, nl-NL</span>
           </label>
-          <label>
-            <span>Transcription model</span>
-            <select name="model_name">
-              <option value="gemini-3.5-transcribe" selected>Gemini 3.5 Transcribe</option>
-              <option value="muse-voice-transcribe-1.0">Meta Muse Voice Transcribe</option>
-              <option value="MAI-Transcribe-2">Microsoft MAI-Transcribe-2</option>
-              <option value="gemini-3.8-flash">Gemini 3.8 Flash</option>
-            </select>
+          <label class="field">
+            <span class="field-label">Speaker names <span class="optional">optional</span></span>
+            <textarea name="speakers" rows="2" placeholder="One per line, in order of speaking"></textarea>
           </label>
-          <label data-generative-only hidden>
-            <span>Judge model</span>
-            <select name="judge_model_name">
-              <option value="gemini-3.8-flash" selected>Gemini 3.8 Flash</option>
-            </select>
-          </label>
-          <label data-generative-only hidden>
-            <span>Candidate strategy</span>
-            <select name="candidate_strategy">
-              <option value="single_gemini">Single Gemini</option>
-              <option value="dual_gemini" selected>Dual Gemini</option>
-              <option value="gemini_plus_parakeet">Gemini + Parakeet</option>
-            </select>
-          </label>
-          <label data-generative-only hidden>
-            <span>Service tier</span>
-            <select name="service_tier">
-              <option value="standard" selected>Standard</option>
-              <option value="flex">Flex</option>
-              <option value="priority">Priority</option>
-            </select>
-          </label>
-          <label>
-            <span>Chunk parallelism</span>
-            <input name="chunk_concurrency" type="number" min="1" max="8" value="3" />
-          </label>
-          <label>
-            <span>Chunk planner</span>
-            <select name="chunk_strategy">
-              <option value="adaptive" selected>Adaptive silence-aware</option>
-              <option value="fixed">Fixed windows</option>
-            </select>
-          </label>
-          <label data-generative-only hidden>
-            <span>Thinking (generative candidates only)</span>
-            <select name="transcription_thinking_level">
-              <option value="low">low</option>
-              <option value="medium">medium</option>
-              <option value="high" selected>high</option>
-            </select>
-          </label>
-          <label data-generative-only hidden>
-            <span>Thinking (judge)</span>
-            <select name="judge_thinking_level">
-              <option value="low">low</option>
-              <option value="medium">medium</option>
-              <option value="high" selected>high</option>
-            </select>
-          </label>
-          <label class="toggle" data-generative-only hidden>
-            <input type="checkbox" name="use_judge_pipeline" checked />
-            <span>Enable judge pipeline</span>
-          </label>
-          <label class="toggle" data-generative-only hidden>
-            <input type="checkbox" name="agentic_mode" checked />
-            <span>Adaptive agent mode</span>
-          </label>
-          <label class="toggle" data-generative-only hidden>
-            <input type="checkbox" name="auto_format" checked />
-            <span>Auto-format transcript</span>
-          </label>
-          <label class="toggle">
+        </div>
+
+        <div class="switches">
+          <label class="switch">
             <input type="checkbox" name="remove_fillers" />
-            <span>Remove filler words</span>
+            <span class="switch-track" aria-hidden="true"></span>
+            <span class="switch-text">Remove filler words <span class="switch-help">um, uh, you know</span></span>
           </label>
-        </fieldset>
+          <label class="switch" id="speech-review-field">
+            <input type="checkbox" name="speech_review" id="speech-review" />
+            <span class="switch-track" aria-hidden="true"></span>
+            <span class="switch-text">Double-check with a judge <span class="switch-help">A Gemini model reviews each section · slower</span></span>
+          </label>
+        </div>
 
-        <fieldset class="grid" data-generative-only hidden>
-          <legend>Context guidance</legend>
-          <label class="full">
-            <span>Topic</span>
-            <input name="topic" type="text" placeholder="e.g. quarterly product review" />
-          </label>
-          <label class="full">
-            <span>Speakers (one per line)</span>
-            <textarea name="speakers" rows="2" placeholder="Alice&#10;Bob"></textarea>
-          </label>
-          <label class="full">
-            <span>Technical terms (comma-separated)</span>
-            <input name="technical_terms" type="text" placeholder="kubernetes, BLAS, anchored backprop" />
-          </label>
-          <label class="full">
-            <span>Custom instructions</span>
-            <textarea name="custom_instructions" rows="2"></textarea>
-          </label>
-          <label>
-            <span>Language hints</span>
-            <input name="language_hints" type="text" placeholder="e.g. Dutch and English" />
-          </label>
-          <label>
-            <span>Expected format</span>
-            <select name="expected_format">
-              <option value="">Transcript</option>
-              <option value="meeting">Meeting</option>
-              <option value="interview">Interview</option>
-              <option value="lecture">Lecture</option>
-              <option value="podcast">Podcast</option>
-              <option value="legal">Legal</option>
-              <option value="medical">Medical</option>
-              <option value="technical">Technical</option>
-            </select>
-          </label>
-          <label class="full">
-            <span>Keywords (comma-separated)</span>
-            <input name="keywords" type="text" placeholder="names or phrases that need verification" />
-          </label>
-        </fieldset>
+        <details class="disclosure" data-review-only hidden>
+          <summary>Review settings</summary>
+          <div class="fields two">
+            <label class="field">
+              <span class="field-label">Judge model</span>
+              <select name="judge_model_name">
+                <option value="gemini-3.8-flash" selected>Gemini 3.8 Flash</option>
+                <option value="gemini-3.5-flash-lite">Gemini 3.5 Flash-Lite</option>
+              </select>
+            </label>
+            <label class="field">
+              <span class="field-label">Compare against</span>
+              <select name="candidate_strategy">
+                <option value="single_gemini">Nothing (judge one transcript)</option>
+                <option value="dual_gemini" selected>A second Gemini transcript</option>
+                <option value="gemini_plus_parakeet">Parakeet</option>
+              </select>
+            </label>
+            <label class="field">
+              <span class="field-label">Expected format</span>
+              <select name="expected_format">
+                <option value="">General</option>
+                <option value="meeting">Meeting</option>
+                <option value="interview">Interview</option>
+                <option value="lecture">Lecture</option>
+                <option value="podcast">Podcast</option>
+                <option value="legal">Legal</option>
+                <option value="medical">Medical</option>
+                <option value="technical">Technical</option>
+              </select>
+            </label>
+            <label class="field">
+              <span class="field-label">Topic</span>
+              <input name="topic" type="text" placeholder="e.g. quarterly review" />
+            </label>
+            <label class="field full">
+              <span class="field-label">Names and terms to get right</span>
+              <input name="technical_terms" type="text" placeholder="Comma-separated, e.g. Kubernetes, Dr. Okafor" />
+            </label>
+            <label class="field full">
+              <span class="field-label">Instructions</span>
+              <textarea name="custom_instructions" rows="2" placeholder="Anything the model should know"></textarea>
+            </label>
+            <label class="field">
+              <span class="field-label">Accent or dialect</span>
+              <input name="language_hints" type="text" placeholder="e.g. Scottish English" />
+            </label>
+            <label class="field">
+              <span class="field-label">Keywords to verify</span>
+              <input name="keywords" type="text" placeholder="Comma-separated" />
+            </label>
+            <label class="field">
+              <span class="field-label">Thinking · transcription</span>
+              <select name="transcription_thinking_level">
+                <option value="minimal" data-flash-lite-only>Minimal</option>
+                <option value="low">Low</option>
+                <option value="medium">Medium</option>
+                <option value="high" selected>High</option>
+              </select>
+            </label>
+            <label class="field">
+              <span class="field-label">Thinking · judge</span>
+              <select name="judge_thinking_level">
+                <option value="low">Low</option>
+                <option value="medium">Medium</option>
+                <option value="high" selected>High</option>
+              </select>
+            </label>
+            <label class="field">
+              <span class="field-label">Service tier</span>
+              <select name="service_tier">
+                <option value="standard" selected>Standard</option>
+                <option value="flex">Flex · cheaper, slower</option>
+                <option value="priority">Priority · faster</option>
+              </select>
+            </label>
+          </div>
+          <div class="switches">
+            <label class="switch" id="judge-pipeline-field">
+              <input type="checkbox" name="use_judge_pipeline" checked />
+              <span class="switch-track" aria-hidden="true"></span>
+              <span class="switch-text">Judge each section</span>
+            </label>
+            <label class="switch">
+              <input type="checkbox" name="agentic_mode" checked />
+              <span class="switch-track" aria-hidden="true"></span>
+              <span class="switch-text">Only fetch extra candidates when needed</span>
+            </label>
+            <label class="switch">
+              <input type="checkbox" name="auto_format" checked />
+              <span class="switch-track" aria-hidden="true"></span>
+              <span class="switch-text">Tidy punctuation and casing</span>
+            </label>
+          </div>
+        </details>
 
-        <button type="submit" class="primary" id="submit-btn">
-          <span class="label">Transcribe</span>
+        <details class="disclosure">
+          <summary>Long recordings</summary>
+          <div class="fields two">
+            <label class="field">
+              <span class="field-label">Split chunks</span>
+              <select name="chunk_strategy">
+                <option value="adaptive" selected>At pauses</option>
+                <option value="fixed">Evenly</option>
+              </select>
+            </label>
+            <label class="field">
+              <span class="field-label">Chunks at once</span>
+              <input name="chunk_concurrency" type="number" min="1" max="16" value="3" inputmode="numeric" />
+            </label>
+          </div>
+        </details>
+
+        <p class="form-error" id="form-error" role="alert" hidden></p>
+        <button type="submit" class="button primary block" id="submit-btn">
           <span class="spinner" hidden></span>
+          <span class="label">Transcribe</span>
         </button>
       </form>
-    </section>
+    </aside>
 
-    <section class="glass-panel" id="status-card" hidden>
-      <div class="section-heading">
-        <p class="eyebrow">Run state</p>
-        <h2>Progress</h2>
-      </div>
-      <div class="progress" role="progressbar" aria-labelledby="progress-label" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
-        <div class="progress-bar" id="progress-bar"></div>
-      </div>
-      <div class="run-status-row">
-        <div>
-          <p class="progress-label" id="progress-label" aria-live="polite">Initializing...</p>
-          <p class="job-reference" id="job-reference" hidden></p>
-        </div>
-        <span class="status-badge" id="connection-state" data-state="pending">Preparing</span>
-      </div>
-      <pre class="log" id="log" aria-live="polite"></pre>
-      <div class="actions">
-        <button type="button" class="ghost" id="cancel-job" hidden>Cancel job</button>
-      </div>
-    </section>
+    <!-- Workspace -->
+    <main class="workspace" id="workspace" aria-live="polite">
+      <section class="empty-state" id="empty-state">
+        <div class="empty-meter" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div>
+        <h2>Your transcript appears here</h2>
+        <ul class="empty-list">
+          <li>Speakers and timestamps on every line</li>
+          <li>Search, rename speakers, and play any moment</li>
+          <li>Export to Word, subtitles, CSV, and more</li>
+        </ul>
+        <button type="button" class="button primary" id="empty-keys" hidden>Add an API key to start</button>
+      </section>
 
-    <section class="glass-panel" id="result-card" hidden>
-      <div class="section-heading">
-        <p class="eyebrow">Output</p>
-        <h2>Result</h2>
-      </div>
-      <div class="result-summary" id="result-summary" aria-live="polite"></div>
-      <div class="tabs" role="tablist" aria-label="Transcript result views">
-        <button data-tab="formatted" class="tab active" id="tab-button-formatted" role="tab" aria-selected="true" aria-controls="tab-formatted">Formatted</button>
-        <button data-tab="srt" class="tab" id="tab-button-srt" role="tab" aria-selected="false" aria-controls="tab-srt">SRT</button>
-        <button data-tab="json" class="tab" id="tab-button-json" role="tab" aria-selected="false" aria-controls="tab-json">JSON</button>
-        <button data-tab="judge" class="tab" id="tab-button-judge" role="tab" aria-selected="false" aria-controls="tab-judge">Judge notes</button>
-        <button data-tab="quality" class="tab" id="tab-button-quality" role="tab" aria-selected="false" aria-controls="tab-quality">Quality</button>
-        <button data-tab="evidence" class="tab" id="tab-button-evidence" role="tab" aria-selected="false" aria-controls="tab-evidence">Evidence</button>
-      </div>
-      <pre class="output" id="tab-formatted" role="tabpanel" aria-labelledby="tab-button-formatted"></pre>
-      <pre class="output" id="tab-srt" role="tabpanel" aria-labelledby="tab-button-srt" hidden></pre>
-      <pre class="output" id="tab-json" role="tabpanel" aria-labelledby="tab-button-json" hidden></pre>
-      <pre class="output" id="tab-judge" role="tabpanel" aria-labelledby="tab-button-judge" hidden></pre>
-      <pre class="output" id="tab-quality" role="tabpanel" aria-labelledby="tab-button-quality" hidden></pre>
-      <pre class="output" id="tab-evidence" role="tabpanel" aria-labelledby="tab-button-evidence" hidden></pre>
-      <section class="review-panel" id="review-panel" aria-labelledby="review-title" hidden>
-        <div class="review-header">
-          <div>
-            <p class="eyebrow">Decision required</p>
-            <h3 id="review-title">Human review</h3>
+      <!-- Progress -->
+      <section class="panel run" id="status-card" aria-labelledby="run-title" hidden>
+        <div class="run-head">
+          <div class="run-title-block">
+            <h2 id="run-title">Transcribing</h2>
+            <p class="run-subtitle" id="run-subtitle"></p>
           </div>
-          <p class="review-deadline" id="review-deadline" hidden></p>
+          <span class="badge" id="connection-state" data-state="pending">Preparing</span>
         </div>
-        <p class="review-reasons" id="review-reasons"></p>
-        <label class="review-note" for="review-note">
-          <span>Review note (optional)</span>
-          <textarea id="review-note" rows="2" maxlength="2000" placeholder="Record what you checked or why the transcript is rejected."></textarea>
-        </label>
-        <div class="actions" id="review-actions">
-          <button type="button" class="primary" id="accept-review">Accept transcript</button>
-          <button type="button" class="ghost" id="reject-review">Reject transcript</button>
+        <ol class="stages" id="stages">
+          <li data-stage="upload"><span class="stage-dot" aria-hidden="true"></span><span class="stage-name">Upload</span><span class="stage-detail"></span></li>
+          <li data-stage="prepare"><span class="stage-dot" aria-hidden="true"></span><span class="stage-name">Prepare audio</span><span class="stage-detail"></span></li>
+          <li data-stage="transcribe"><span class="stage-dot" aria-hidden="true"></span><span class="stage-name">Transcribe</span><span class="stage-detail"></span></li>
+          <li data-stage="review" hidden><span class="stage-dot" aria-hidden="true"></span><span class="stage-name">Review</span><span class="stage-detail"></span></li>
+          <li data-stage="finish"><span class="stage-dot" aria-hidden="true"></span><span class="stage-name">Finish</span><span class="stage-detail"></span></li>
+        </ol>
+        <div class="progress" role="progressbar" aria-labelledby="progress-label" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+          <div class="progress-bar" id="progress-bar"></div>
+        </div>
+        <div class="run-foot">
+          <p class="progress-label" id="progress-label">Starting…</p>
+          <span class="run-meta"><span id="progress-elapsed"></span></span>
+        </div>
+        <div class="run-actions">
+          <button type="button" class="button ghost small" id="cancel-job" hidden>Cancel</button>
+          <button type="button" class="link small" id="job-reference" hidden title="Copy job ID"></button>
+        </div>
+        <details class="activity">
+          <summary>Activity</summary>
+          <pre class="log" id="log"></pre>
+        </details>
+      </section>
+
+      <!-- Result -->
+      <section class="result" id="result-card" aria-labelledby="result-title" hidden>
+        <header class="result-head">
+          <div>
+            <h2 id="result-title">Transcript</h2>
+            <p class="result-meta" id="result-summary"></p>
+          </div>
+          <button type="button" class="button ghost small mobile-only" id="new-transcription">New transcription</button>
+        </header>
+
+        <section class="review-panel" id="review-panel" aria-labelledby="review-title" hidden>
+          <div class="review-header">
+            <h3 id="review-title">Needs your review</h3>
+            <p class="review-deadline" id="review-deadline" hidden></p>
+          </div>
+          <p class="review-reasons" id="review-reasons"></p>
+          <label class="field">
+            <span class="field-label">Note <span class="optional">optional</span></span>
+            <textarea id="review-note" rows="2" maxlength="2000" placeholder="What you checked, or why you're rejecting it"></textarea>
+          </label>
+          <div class="row-actions" id="review-actions">
+            <button type="button" class="button primary" id="accept-review">Accept transcript</button>
+            <button type="button" class="button ghost" id="reject-review">Reject</button>
+          </div>
+        </section>
+
+        <section class="timeline-card" aria-label="Who spoke when">
+          <div class="timeline" id="timeline">
+            <div class="timeline-lanes" id="timeline-lanes"></div>
+            <div class="timeline-axis" id="timeline-axis" aria-hidden="true"></div>
+            <div class="playhead" id="playhead" hidden></div>
+          </div>
+          <div class="player" id="player" hidden>
+            <audio id="audio-player" controls preload="metadata"></audio>
+            <label class="switch compact">
+              <input type="checkbox" id="follow-audio" checked />
+              <span class="switch-track" aria-hidden="true"></span>
+              <span class="switch-text">Follow along</span>
+            </label>
+          </div>
+          <p class="timeline-hint" id="timeline-hint"></p>
+        </section>
+
+        <div class="result-body">
+          <div class="result-main">
+            <div class="tabs" role="tablist" aria-label="Result views">
+              <button data-tab="transcript" class="tab active" id="tab-button-transcript" role="tab" aria-selected="true" aria-controls="tab-transcript">Transcript</button>
+              <button data-tab="subtitles" class="tab" id="tab-button-subtitles" role="tab" aria-selected="false" aria-controls="tab-subtitles" tabindex="-1">Subtitles</button>
+              <button data-tab="judge" class="tab" id="tab-button-judge" role="tab" aria-selected="false" aria-controls="tab-judge" tabindex="-1" data-pipeline-only>Judge</button>
+              <button data-tab="quality" class="tab" id="tab-button-quality" role="tab" aria-selected="false" aria-controls="tab-quality" tabindex="-1" data-pipeline-only>Quality</button>
+              <button data-tab="evidence" class="tab" id="tab-button-evidence" role="tab" aria-selected="false" aria-controls="tab-evidence" tabindex="-1" data-pipeline-only>Evidence</button>
+              <button data-tab="json" class="tab" id="tab-button-json" role="tab" aria-selected="false" aria-controls="tab-json" tabindex="-1">JSON</button>
+            </div>
+
+            <div id="tab-transcript" role="tabpanel" aria-labelledby="tab-button-transcript">
+              <div class="transcript-toolbar">
+                <div class="search">
+                  <svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><circle cx="11" cy="11" r="6.5" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="m16 16 4 4" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
+                  <input type="search" id="transcript-search" placeholder="Search" aria-label="Search transcript" />
+                  <span class="search-count" id="search-count" aria-live="polite"></span>
+                </div>
+                <div class="speaker-chips" id="speaker-chips" aria-label="Speakers — click a name to rename"></div>
+              </div>
+              <ol class="transcript" id="transcript-view"></ol>
+            </div>
+            <pre class="output" id="tab-subtitles" role="tabpanel" aria-labelledby="tab-button-subtitles" hidden></pre>
+            <pre class="output" id="tab-judge" role="tabpanel" aria-labelledby="tab-button-judge" hidden></pre>
+            <pre class="output" id="tab-quality" role="tabpanel" aria-labelledby="tab-button-quality" hidden></pre>
+            <pre class="output" id="tab-evidence" role="tabpanel" aria-labelledby="tab-button-evidence" hidden></pre>
+            <pre class="output" id="tab-json" role="tabpanel" aria-labelledby="tab-button-json" hidden></pre>
+          </div>
+
+          <aside class="export" aria-labelledby="export-title">
+            <h3 id="export-title">Export</h3>
+            <div class="format-list" id="format-grid" role="radiogroup" aria-label="File format"></div>
+            <label class="switch compact" id="timestamps-option">
+              <input type="checkbox" id="export-timestamps" checked />
+              <span class="switch-track" aria-hidden="true"></span>
+              <span class="switch-text">Include timestamps</span>
+            </label>
+            <div class="row-actions">
+              <button type="button" class="button primary grow" id="export-download">Download</button>
+              <button type="button" class="button ghost" id="export-copy">Copy</button>
+            </div>
+            <p class="export-status" id="export-status" role="status" aria-live="polite"></p>
+          </aside>
         </div>
       </section>
-      <div class="actions">
-        <button class="ghost" id="download-txt">Download .txt</button>
-        <button class="ghost" id="download-srt">Download .srt</button>
-        <button class="ghost" id="download-json">Download .json</button>
-      </div>
-    </section>
-  </main>
+    </main>
+  </div>
+
+  <!-- API keys -->
+  <dialog class="dialog" id="keys-dialog" aria-labelledby="keys-title">
+    <form method="dialog" class="dialog-inner" id="keys-form">
+      <header class="dialog-head">
+        <h2 id="keys-title">API keys</h2>
+        <button type="submit" class="icon-button" value="close" aria-label="Close">
+          <svg viewBox="0 0 24 24" width="18" height="18"><path d="M6 6l12 12M18 6 6 18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+        </button>
+      </header>
+      <p class="dialog-intro" id="keys-intro">Keys are stored on this server, never in your browser. Add a key for each provider you want to use.</p>
+
+      <section class="key-row" data-provider="gemini">
+        <div class="key-row-head">
+          <span class="key-name">Google Gemini</span>
+          <span class="key-status" data-status></span>
+        </div>
+        <p class="key-use">Gemini models, and the judge for every model</p>
+        <div class="key-inputs">
+          <input type="password" data-field="api_key" placeholder="Paste a Gemini API key" autocomplete="off" spellcheck="false" aria-label="Gemini API key" />
+        </div>
+        <div class="key-actions">
+          <button type="button" class="button primary small" data-action="save">Save</button>
+          <button type="button" class="link small danger" data-action="remove" hidden>Remove</button>
+        </div>
+      </section>
+
+      <section class="key-row" data-provider="microsoft">
+        <div class="key-row-head">
+          <span class="key-name">Microsoft Azure Speech</span>
+          <span class="key-status" data-status></span>
+        </div>
+        <p class="key-use">MAI-Transcribe-2 · needs a Speech resource that supports it</p>
+        <div class="key-inputs">
+          <input type="password" data-field="api_key" placeholder="Speech resource key" autocomplete="off" spellcheck="false" aria-label="Azure Speech key" />
+          <input type="url" data-field="endpoint" placeholder="https://your-resource.cognitiveservices.azure.com" autocomplete="off" spellcheck="false" aria-label="Azure Speech endpoint" />
+        </div>
+        <div class="key-actions">
+          <button type="button" class="button primary small" data-action="save">Save</button>
+          <button type="button" class="link small danger" data-action="remove" hidden>Remove</button>
+        </div>
+      </section>
+
+      <section class="key-row" data-provider="meta">
+        <div class="key-row-head">
+          <span class="key-name">Meta</span>
+          <span class="key-status" data-status></span>
+        </div>
+        <p class="key-use">Muse Voice Transcribe</p>
+        <div class="key-inputs">
+          <input type="password" data-field="api_key" placeholder="Paste a Meta API key" autocomplete="off" spellcheck="false" aria-label="Meta API key" />
+        </div>
+        <div class="key-actions">
+          <button type="button" class="button primary small" data-action="save">Save</button>
+          <button type="button" class="link small danger" data-action="remove" hidden>Remove</button>
+        </div>
+      </section>
+
+      <section class="key-row token-row">
+        <label class="field">
+          <span class="field-label">Server access token <span class="optional">only if your server requires one</span></span>
+          <input type="password" id="auth-token" autocomplete="current-password" placeholder="Bearer token for this server" />
+        </label>
+      </section>
+
+      <p class="dialog-status" id="keys-status" role="status" aria-live="polite"></p>
+    </form>
+  </dialog>
+
+  <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
 
   <script src="/static/app.js"></script>
 </body>

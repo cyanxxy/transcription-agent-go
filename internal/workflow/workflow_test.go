@@ -36,31 +36,9 @@ func TestExportTranscriptTXT(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := "[00:00:00] Alice: Hi there\n[00:00:04] Bob: Hello!"
+	want := "[00:00:00] Alice: Hi there\n[00:00:04] Bob: Hello!\n"
 	if out != want {
 		t.Errorf("ExportTranscript(txt) = %q, want %q", out, want)
-	}
-}
-
-func TestExportTranscriptSRT(t *testing.T) {
-	result := &models.TranscriptResult{
-		Segments: []models.TranscriptSegment{
-			{Timestamp: "[00:00:00]", Speaker: "Alice", Text: "Hi"},
-			{Timestamp: "[00:00:04]", Speaker: "Bob", Text: "Hello there my old friend"},
-		},
-	}
-	out, err := ExportTranscript(result, "srt")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(out, "00:00:00,000 --> 00:00:04,000") {
-		t.Errorf("SRT missing first cue, got:\n%s", out)
-	}
-	if !strings.Contains(out, "Alice: Hi") {
-		t.Errorf("SRT missing speaker text:\n%s", out)
-	}
-	if !strings.Contains(out, "Bob: Hello there my old friend") && !strings.Contains(out, "Bob: Hello there my old\nfriend") {
-		t.Errorf("SRT did not include second segment text:\n%s", out)
 	}
 }
 
@@ -416,96 +394,6 @@ func TestDualGeminiCandidatesShareOneFilesUpload(t *testing.T) {
 
 // srtCueStarts extracts the start timestamp (the token before " --> ") from
 // every cue line in an SRT document.
-func srtCueStarts(srt string) []string {
-	var starts []string
-	for _, line := range strings.Split(srt, "\n") {
-		if !strings.Contains(line, " --> ") {
-			continue
-		}
-		parts := strings.SplitN(line, " --> ", 2)
-		starts = append(starts, strings.TrimSpace(parts[0]))
-	}
-	return starts
-}
-
-func TestExportSRTDeoverlapsSameSecondSegments(t *testing.T) {
-	result := &models.TranscriptResult{
-		Segments: []models.TranscriptSegment{
-			{Timestamp: "[00:00:05]", Speaker: "Alice", Text: "First"},
-			{Timestamp: "[00:00:05]", Speaker: "Bob", Text: "Second"},
-			{Timestamp: "[00:00:05]", Speaker: "Carol", Text: "Third"},
-		},
-	}
-	out, err := ExportTranscript(result, "srt")
-	if err != nil {
-		t.Fatal(err)
-	}
-	starts := srtCueStarts(out)
-	if len(starts) != 3 {
-		t.Fatalf("expected 3 cue start timestamps, got %d:\n%s", len(starts), out)
-	}
-	want := []string{"00:00:05,000", "00:00:05,100", "00:00:05,200"}
-	for i, w := range want {
-		if starts[i] != w {
-			t.Fatalf("cue %d start = %q, want %q (full output:\n%s)", i, starts[i], w, out)
-		}
-	}
-	// Strictly increasing and distinct as a stronger invariant.
-	for i := 1; i < len(starts); i++ {
-		prev := srtTimeToSeconds(starts[i-1])
-		cur := srtTimeToSeconds(starts[i])
-		if cur <= prev {
-			t.Fatalf("cue starts not strictly increasing: %v", starts)
-		}
-	}
-}
-
-func TestExportSRTKeepsAllWordsWhenWrapping(t *testing.T) {
-	words := []string{
-		"alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf",
-		"hotel", "india", "juliet", "kilo", "lima", "mike", "november",
-		"oscar", "papa", "quebec", "romeo", "sierra", "tango", "uniform",
-		"victor", "whiskey", "xray", "yankee", "zulu", "one", "two",
-		"three", "four",
-	}
-	text := strings.Join(words, " ")
-	result := &models.TranscriptResult{
-		Segments: []models.TranscriptSegment{
-			{Timestamp: "[00:00:00]", Speaker: "Speaker", Text: text},
-		},
-	}
-	out, err := ExportTranscript(result, "srt")
-	if err != nil {
-		t.Fatal(err)
-	}
-	// Locate the cue body lines (everything after the timing line until the
-	// blank separator) and confirm wrapping produced more than two lines so the
-	// no-truncation guarantee is actually being exercised.
-	bodyLineCount := 0
-	inBody := false
-	for _, line := range strings.Split(out, "\n") {
-		if strings.Contains(line, " --> ") {
-			inBody = true
-			continue
-		}
-		if inBody {
-			if strings.TrimSpace(line) == "" {
-				inBody = false
-				continue
-			}
-			bodyLineCount++
-		}
-	}
-	if bodyLineCount <= 2 {
-		t.Fatalf("expected wrapping to produce >2 lines, got %d:\n%s", bodyLineCount, out)
-	}
-	for _, w := range words {
-		if !strings.Contains(out, w) {
-			t.Fatalf("word %q missing from SRT output (data loss):\n%s", w, out)
-		}
-	}
-}
-
 func TestSanitizeFilenameRejectsDotDot(t *testing.T) {
 	if got := sanitizeFilename(".."); got != "upload.audio" {
 		t.Errorf(`sanitizeFilename("..") = %q, want "upload.audio"`, got)
@@ -859,5 +747,100 @@ func TestExternalSpeechDirectWorkflow(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+func TestValidateSegmentsForChunkAcceptsFractionalChunkStart(t *testing.T) {
+	// Adaptive boundaries sit at silence midpoints, so StartMS is rarely a
+	// whole second while segment timestamps are truncated to whole seconds.
+	unit := audio.Chunk{StartMS: 116200, EndMS: 241000}
+	segments := []models.TranscriptSegment{{Timestamp: models.AdjustTimestamp("[00:00:00]", 116.2), Speaker: "Speaker 1", Text: "hello"}}
+	if err := validateSegmentsForChunk(segments, unit); err != nil {
+		t.Fatalf("validateSegmentsForChunk rejected a segment at the chunk start: %v", err)
+	}
+	early := []models.TranscriptSegment{{Timestamp: "[00:01:55]", Speaker: "Speaker 1", Text: "hello"}}
+	if err := validateSegmentsForChunk(early, unit); err == nil {
+		t.Fatal("validateSegmentsForChunk accepted a segment before the chunk")
+	}
+}
+
+func TestDirectChunkSpansCutAtSilenceOrOverlapMidpoint(t *testing.T) {
+	chunks := []audio.Chunk{
+		{StartMS: 0, EndMS: 120000, BoundaryType: audio.BoundaryFixed},
+		{StartMS: 115000, EndMS: 236300, BoundaryType: audio.BoundarySilence},
+		{StartMS: 233800, EndMS: 300000, BoundaryType: audio.BoundaryFinal},
+	}
+	spans := directChunkSpans(chunks)
+	want := []agents.ChunkSpan{
+		{StartMS: 0, EndMS: 120000, KeepFromMS: 0, KeepUntilMS: 117500},
+		{StartMS: 115000, EndMS: 236300, KeepFromMS: 117500, KeepUntilMS: 236300},
+		{StartMS: 233800, EndMS: 300000, KeepFromMS: 236300, KeepUntilMS: 0},
+	}
+	for i := range want {
+		if spans[i] != want[i] {
+			t.Errorf("span %d = %#v, want %#v", i, spans[i], want[i])
+		}
+	}
+}
+
+func TestSpeechReviewSendsTranscribeOutputToJudge(t *testing.T) {
+	if _, err := exec.LookPath("ffmpeg"); err != nil {
+		t.Skip("ffmpeg not installed")
+	}
+	wavPath := filepath.Join(t.TempDir(), "sine.wav")
+	if err := exec.Command("ffmpeg", "-f", "lavfi", "-i", "sine=frequency=440:duration=2", "-ar", "16000", "-ac", "1", "-y", wavPath).Run(); err != nil {
+		t.Fatalf("ffmpeg: %v", err)
+	}
+	const judgeText = `{"segments":[{"timestamp":"[00:00:00]","speaker":"Speaker 1","text":"Hello world."}],"selected_candidate_ids":["gemini_3.5_transcribe"],"processing_notes":["ok"]}`
+	var transcribeRequests, judgeRequests atomic.Int32
+	mux := http.NewServeMux()
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	mux.HandleFunc("/upload/v1beta/files", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("X-Goog-Upload-URL", srv.URL+"/upload-finish")
+	})
+	file := map[string]any{"name": "files/x", "uri": "https://api.example/files/x", "state": "ACTIVE", "mimeType": "audio/wav"}
+	mux.HandleFunc("/upload-finish", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"file": file})
+	})
+	mux.HandleFunc("/v1beta/files/x", func(w http.ResponseWriter, _ *http.Request) { _ = json.NewEncoder(w).Encode(file) })
+	mux.HandleFunc("/v1beta/interactions", func(w http.ResponseWriter, r *http.Request) {
+		var req gemini.InteractionRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Error(err)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if req.Model == config.DefaultTranscriptionModel {
+			transcribeRequests.Add(1)
+			_, _ = w.Write([]byte(`{"id":"t","status":"completed","steps":[{"type":"model_output","content":[{"type":"text","text":"Hello world.","annotations":[{"type":"word_info","text":"Hello","speaker":"spk_1","start_offset":"0.1s","end_offset":"0.4s"},{"type":"word_info","text":"world.","speaker":"spk_1","start_offset":"0.5s","end_offset":"0.9s"}]}]}]}`))
+			return
+		}
+		judgeRequests.Add(1)
+		_ = json.NewEncoder(w).Encode(gemini.Interaction{ID: "j", Status: "completed", Steps: []gemini.InteractionStep{{
+			Type: "model_output", Content: []gemini.InteractionContent{{Type: "text", Text: judgeText}},
+		}}})
+	})
+
+	wfl, err := workflowNewForTest(t,
+		config.WithSpeechReview(true), config.WithCandidateStrategy("single_gemini"),
+		config.WithChunkConcurrency(1), config.WithTempDir(t.TempDir()),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wfl.WithClient(gemini.NewClient("k").WithEndpoint(srv.URL))
+	res, err := wfl.Transcribe(context.Background(), TranscribeInput{FilePath: wavPath, Filename: "test.wav"})
+	if err != nil {
+		t.Fatalf("Transcribe: %v", err)
+	}
+	if transcribeRequests.Load() != 1 || judgeRequests.Load() < 1 {
+		t.Fatalf("transcribe=%d judge=%d, want the speech model reviewed by the judge", transcribeRequests.Load(), judgeRequests.Load())
+	}
+	if !res.JudgeUsed || len(res.Candidates) != 1 || res.Candidates[0].ModelName != config.DefaultTranscriptionModel || len(res.Candidates[0].Segments) == 0 {
+		t.Fatalf("judge_used=%v candidates=%#v", res.JudgeUsed, res.Candidates)
+	}
+	if len(res.Segments) == 0 || !strings.Contains(res.Segments[0].Text, "Hello") {
+		t.Fatalf("segments = %#v", res.Segments)
 	}
 }

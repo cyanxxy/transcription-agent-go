@@ -117,14 +117,80 @@ type ChunkInfo struct {
 	DurationMS int
 }
 
-// Run uploads the audio to Gemini, asks for structured segments, and adjusts
-// timestamps if the input was a chunk.
+// Run transcribes one file or chunk. Direct speech models return word or turn
+// timing that is grouped into segments; general-purpose Gemini models return
+// structured segments. Chunk timestamps are shifted to the source timeline.
 func (a *TranscriptionAgent) Run(ctx context.Context, in TranscribeInput) ([]models.TranscriptSegment, error) {
+	if config.IsDirectSpeechModel(a.Deps.ModelName) {
+		units, err := a.RunTimed(ctx, in)
+		if err != nil {
+			return nil, err
+		}
+		segments, err := segmentsFromUnits(labelSpeakersInOrder(units))
+		if err != nil {
+			return nil, fmt.Errorf("parse transcript output: %w", err)
+		}
+		return segments, nil
+	}
+	resp, _, err := a.createTranscription(ctx, in)
+	if err != nil {
+		return nil, err
+	}
+	segments, err := parseSegments(resp.Text())
+	if err != nil {
+		return nil, fmt.Errorf("parse transcript output: %w", err)
+	}
+	if in.ChunkInfo != nil && in.ChunkInfo.StartMS > 0 {
+		offset := float64(in.ChunkInfo.StartMS) / 1000.0
+		for i := range segments {
+			segments[i].Timestamp = models.AdjustTimestamp(segments[i].Timestamp, offset)
+		}
+	}
+	return segments, nil
+}
+
+// RunTimed transcribes one file or chunk with a direct speech model and
+// returns provider-timed words or turns at absolute offsets, keeping the
+// provider's request-local speaker labels so chunked runs can stitch speakers
+// across chunks. Text returned without word timing becomes one Untimed unit.
+func (a *TranscriptionAgent) RunTimed(ctx context.Context, in TranscribeInput) ([]TimedUnit, error) {
 	if config.IsExternalSpeechModel(a.Deps.ModelName) {
 		return a.runExternalSpeech(ctx, in)
 	}
+	if a.Deps.ModelName != config.DefaultTranscriptionModel {
+		return nil, fmt.Errorf("%s does not return timed transcription units", a.Deps.ModelName)
+	}
+	resp, logger, err := a.createTranscription(ctx, in)
+	if err != nil {
+		return nil, err
+	}
+	var offsetMS int64
+	if in.ChunkInfo != nil {
+		offsetMS = int64(in.ChunkInfo.StartMS)
+	}
+	units, err := transcribeWordUnits(resp, offsetMS)
+	if errors.Is(err, ErrNoWordAnnotations) {
+		if text := strings.TrimSpace(resp.Text()); text != "" {
+			logger.Warn("Gemini returned transcript text without requested word timestamps")
+			return []TimedUnit{{
+				Text:    "[word timestamps unavailable] " + text,
+				Speaker: untranscribedSpeaker, StartMS: offsetMS, EndMS: offsetMS,
+				Turn: true, Untimed: true,
+			}}, nil
+		}
+		logger.Warn("Gemini returned no transcript text or word annotations")
+	}
+	if err != nil {
+		return nil, fmt.Errorf("parse transcript output: %w", err)
+	}
+	return units, nil
+}
+
+// createTranscription uploads the audio when needed and runs one Gemini
+// transcription interaction.
+func (a *TranscriptionAgent) createTranscription(ctx context.Context, in TranscribeInput) (*gemini.Interaction, *slog.Logger, error) {
 	if in.AudioPath == "" {
-		return nil, fmt.Errorf("audio path is required")
+		return nil, nil, fmt.Errorf("audio path is required")
 	}
 	if a.Deps.ModelName == config.DefaultTranscriptionModel {
 		duration := in.AudioDurationSeconds
@@ -132,7 +198,7 @@ func (a *TranscriptionAgent) Run(ctx context.Context, in TranscribeInput) ([]mod
 			duration = max(duration, float64(in.ChunkInfo.DurationMS)/1000)
 		}
 		if duration > 1800 {
-			return nil, fmt.Errorf("gemini-3.5-transcribe supports at most 30 minutes with timestamps and diarization; reduce chunk duration")
+			return nil, nil, fmt.Errorf("gemini-3.5-transcribe supports at most 30 minutes with timestamps and diarization; reduce chunk duration")
 		}
 	}
 	logger := obs.LoggerFrom(ctx).With("component", "transcription", "model", a.Deps.ModelName)
@@ -145,7 +211,7 @@ func (a *TranscriptionAgent) Run(ctx context.Context, in TranscribeInput) ([]mod
 		var err error
 		file, err = a.Client.UploadFile(ctx, in.AudioPath)
 		if err != nil {
-			return nil, fmt.Errorf("upload audio: %w", err)
+			return nil, nil, fmt.Errorf("upload audio: %w", err)
 		}
 		ownedUpload = true
 	}
@@ -192,48 +258,23 @@ func (a *TranscriptionAgent) Run(ctx context.Context, in TranscribeInput) ([]mod
 		req.ResponseFormat = nil
 		req.ServiceTier = ""
 		req.GenerationConfig = &gemini.InteractionGenerationConfig{
-			TranscriptionConfig: &gemini.TranscriptionConfig{Mode: gemini.TranscriptionMode{
-				Type: "verbatim", DiarizationMode: "speaker", TimestampGranularities: []string{"word"},
-			}},
+			TranscriptionConfig: &gemini.TranscriptionConfig{
+				Mode: gemini.TranscriptionMode{
+					Type: "verbatim", DiarizationMode: "speaker", TimestampGranularities: []string{"word"},
+				},
+				LanguageCodes: a.Deps.LanguageCodes,
+			},
 		}
 	}
 
 	resp, err := a.Client.CreateInteraction(ctx, req)
 	if err != nil {
-		return nil, fmt.Errorf("create transcription interaction: %w", err)
+		return nil, nil, fmt.Errorf("create transcription interaction: %w", err)
 	}
 	if err := resp.ValidateStatus(); err != nil {
-		return nil, fmt.Errorf("transcription interaction: %w", err)
+		return nil, nil, fmt.Errorf("transcription interaction: %w", err)
 	}
-	var segments []models.TranscriptSegment
-	if a.Deps.ModelName == config.DefaultTranscriptionModel {
-		segments, err = parseTranscribeSegments(resp)
-		if errors.Is(err, ErrNoWordAnnotations) {
-			if text := strings.TrimSpace(resp.Text()); text != "" {
-				logger.Warn("Gemini returned transcript text without requested word timestamps")
-				segments = []models.TranscriptSegment{{
-					Timestamp: "[00:00:00]", Speaker: "Untranscribed",
-					Text: "[word timestamps unavailable] " + text,
-				}}
-				err = nil
-			} else {
-				logger.Warn("Gemini returned no transcript text or word annotations")
-			}
-		}
-	} else {
-		segments, err = parseSegments(resp.Text())
-	}
-	if err != nil {
-		return nil, fmt.Errorf("parse transcript output: %w", err)
-	}
-
-	if in.ChunkInfo != nil && in.ChunkInfo.StartMS > 0 {
-		offset := float64(in.ChunkInfo.StartMS) / 1000.0
-		for i := range segments {
-			segments[i].Timestamp = models.AdjustTimestamp(segments[i].Timestamp, offset)
-		}
-	}
-	return segments, nil
+	return resp, logger, nil
 }
 
 // BuildTranscriptionPrompt assembles the user-facing transcription prompt.
@@ -351,10 +392,22 @@ func interactionAudioMIME(path, uploadedMIME string) string {
 	if strings.EqualFold(filepath.Ext(path), ".m4a") {
 		return "audio/m4a"
 	}
-	if mimeType := strings.TrimSpace(uploadedMIME); mimeType != "" {
+	// The Files API may report aliases such as audio/x-wav or audio/x-flac,
+	// which the Interactions AudioContent enum rejects; fall back to the
+	// extension-derived type for anything outside that enum.
+	if mimeType := strings.ToLower(strings.TrimSpace(uploadedMIME)); interactionAudioMIMETypes[mimeType] {
 		return mimeType
 	}
 	return guessMIMEFromPath(path)
+}
+
+// interactionAudioMIMETypes is the AudioContent.mime_type enum from the
+// Interactions OpenAPI schema (checked 2026-10-13).
+var interactionAudioMIMETypes = map[string]bool{
+	"audio/wav": true, "audio/mp3": true, "audio/aiff": true, "audio/aac": true,
+	"audio/ogg": true, "audio/flac": true, "audio/mpeg": true, "audio/m4a": true,
+	"audio/l16": true, "audio/opus": true, "audio/alaw": true, "audio/mulaw": true,
+	"audio/webm": true,
 }
 
 // MergeChunks merges per-chunk transcripts dropping duplicated overlap segments.
@@ -527,12 +580,8 @@ func MapSpeakersToContext(segments []models.TranscriptSegment, speakerNames []st
 				mapped = speakerNames[n-1]
 			}
 		}
-		out[i] = models.TranscriptSegment{
-			Timestamp:  seg.Timestamp,
-			Speaker:    mapped,
-			Text:       seg.Text,
-			Confidence: seg.Confidence,
-		}
+		seg.Speaker = mapped
+		out[i] = seg
 	}
 	return out
 }
@@ -566,12 +615,8 @@ func EnsureSpeakerConsistency(segments []models.TranscriptSegment, preserveNames
 			}
 			normalized = speakerMap[speaker]
 		}
-		out[i] = models.TranscriptSegment{
-			Timestamp:  seg.Timestamp,
-			Speaker:    normalized,
-			Text:       seg.Text,
-			Confidence: seg.Confidence,
-		}
+		seg.Speaker = normalized
+		out[i] = seg
 	}
 	return out
 }

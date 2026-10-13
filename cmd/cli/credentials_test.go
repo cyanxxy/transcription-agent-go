@@ -56,7 +56,7 @@ func TestApplyStoredCredentialsRespectsEnvironment(t *testing.T) {
 
 	t.Setenv("GEMINI_API_KEY", "env-gemini")
 	gemini := os.Getenv("GEMINI_API_KEY")
-	if err := applyStoredCredentials(config.DefaultTranscriptionModel, &gemini); err != nil {
+	if err := applyStoredCredentials(config.DefaultTranscriptionModel, &gemini, true); err != nil {
 		t.Fatal(err)
 	}
 	if gemini != "env-gemini" {
@@ -64,7 +64,7 @@ func TestApplyStoredCredentialsRespectsEnvironment(t *testing.T) {
 	}
 
 	t.Setenv("META_API_KEY", "")
-	if err := applyStoredCredentials(config.MetaTranscriptionModel, &gemini); err != nil {
+	if err := applyStoredCredentials(config.MetaTranscriptionModel, &gemini, false); err != nil {
 		t.Fatal(err)
 	}
 	if got := os.Getenv("META_API_KEY"); got != "saved-meta" {
@@ -73,7 +73,7 @@ func TestApplyStoredCredentialsRespectsEnvironment(t *testing.T) {
 
 	t.Setenv("AZURE_SPEECH_KEY", "env-azure")
 	t.Setenv("AZURE_SPEECH_ENDPOINT", "")
-	if err := applyStoredCredentials(config.MicrosoftTranscriptionModel, &gemini); err != nil {
+	if err := applyStoredCredentials(config.MicrosoftTranscriptionModel, &gemini, false); err != nil {
 		t.Fatal(err)
 	}
 	if got := os.Getenv("AZURE_SPEECH_KEY"); got != "env-azure" {
@@ -101,5 +101,20 @@ func TestAzureEndpointValidation(t *testing.T) {
 	}
 	if credentials.AzureSpeechKey != "saved-key" || credentials.AzureSpeechEndpoint != "https://speech.example.com" {
 		t.Fatalf("Microsoft credentials were not saved correctly")
+	}
+}
+
+func TestStoredGeminiKeyLoadsForReviewedSpeechModel(t *testing.T) {
+	t.Setenv("TRANSCRIBER_CREDENTIALS_FILE", filepath.Join(t.TempDir(), "credentials.json"))
+	if _, err := saveCredentials(cliCredentials{GeminiAPIKey: "saved-gemini", MetaAPIKey: "saved-meta"}); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("META_API_KEY", "")
+	gemini := ""
+	if err := applyStoredCredentials(config.MetaTranscriptionModel, &gemini, true); err != nil {
+		t.Fatal(err)
+	}
+	if gemini != "saved-gemini" || os.Getenv("META_API_KEY") != "saved-meta" {
+		t.Fatalf("gemini=%q meta=%q; reviewing a Meta transcript needs both keys", gemini, os.Getenv("META_API_KEY"))
 	}
 }

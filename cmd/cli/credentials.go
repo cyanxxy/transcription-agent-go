@@ -104,7 +104,25 @@ func saveCredentials(credentials cliCredentials) (string, error) {
 	return path, nil
 }
 
-func applyStoredCredentials(model string, apiKey *string) error {
+// applyStoredCredentials fills missing provider credentials for model from
+// the saved credentials file, and the Gemini key when needsGemini is set.
+// Environment values always win.
+func applyStoredCredentials(model string, apiKey *string, needsGemini bool) error {
+	if err := applyStoredSpeechCredentials(model); err != nil {
+		return err
+	}
+	if !needsGemini || strings.TrimSpace(*apiKey) != "" {
+		return nil
+	}
+	credentials, err := loadCredentials()
+	if err != nil {
+		return err
+	}
+	*apiKey = credentials.GeminiAPIKey
+	return nil
+}
+
+func applyStoredSpeechCredentials(model string) error {
 	if model == config.MetaTranscriptionModel {
 		if os.Getenv("META_API_KEY") != "" {
 			return nil
@@ -136,14 +154,6 @@ func applyStoredCredentials(model string, apiKey *string) error {
 		}
 		return nil
 	}
-	if strings.TrimSpace(*apiKey) != "" {
-		return nil
-	}
-	credentials, err := loadCredentials()
-	if err != nil {
-		return err
-	}
-	*apiKey = credentials.GeminiAPIKey
 	return nil
 }
 
@@ -255,7 +265,7 @@ func normalizeAzureEndpoint(raw string) (string, error) {
 	parsed, err := url.Parse(strings.TrimSpace(raw))
 	if err != nil || parsed.Scheme != "https" || parsed.Host == "" || parsed.User != nil ||
 		(parsed.Path != "" && parsed.Path != "/") || parsed.RawQuery != "" || parsed.Fragment != "" {
-		return "", errors.New("Azure Speech endpoint must be an HTTPS resource origin without a path or query")
+		return "", errors.New("the Azure Speech endpoint must be an HTTPS resource origin without a path or query")
 	}
 	return strings.TrimSuffix(parsed.String(), "/"), nil
 }

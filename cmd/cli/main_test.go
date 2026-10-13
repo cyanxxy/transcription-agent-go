@@ -24,7 +24,7 @@ func TestTranscriptFilenamePreservesRelativeBasename(t *testing.T) {
 func TestTranscriptionOptionsWireRunBudgets(t *testing.T) {
 	opts := transcriptionOptions(cliOptions{
 		model:            "gemini-3.8-flash",
-		judgeModel:       "gemini-3.1-flash-lite",
+		judgeModel:       "gemini-3.5-flash-lite",
 		strategy:         "single_gemini",
 		thinking:         "high",
 		judgeThinking:    "medium",

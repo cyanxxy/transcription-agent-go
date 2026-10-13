@@ -339,8 +339,10 @@ func (s *server) createStagedJob(id, requestID, idempotencyHash string, r multip
 	return jb, nil
 }
 
-func writeJSONAtomic(path string, value any, mode os.FileMode) error {
-	return writeJSONAtomicWithSync(path, value, mode, syncDirectory)
+// writeJSONAtomic durably replaces path with value. Every file it writes holds
+// job data or credentials, so it is always owner-only.
+func writeJSONAtomic(path string, value any) error {
+	return writeJSONAtomicWithSync(path, value, 0o600, syncDirectory)
 }
 
 type committedWriteError struct {

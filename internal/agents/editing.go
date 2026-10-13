@@ -48,12 +48,8 @@ func AutoFormatTranscript(deps config.EditingDeps, segs []models.TranscriptSegme
 			text = ApplyReplacements(text, deps.Replacements)
 		}
 
-		out = append(out, models.TranscriptSegment{
-			Timestamp:  seg.Timestamp,
-			Speaker:    seg.Speaker,
-			Text:       text,
-			Confidence: seg.Confidence,
-		})
+		seg.Text = text
+		out = append(out, seg)
 	}
 	changes := make([]string, 0, len(changesSet))
 	for c := range changesSet {
@@ -221,12 +217,8 @@ func FindAndReplace(segs []models.TranscriptSegment, find, replace string, caseS
 		if len(matches) > 0 {
 			total += len(matches)
 			affected = append(affected, i)
-			out[i] = models.TranscriptSegment{
-				Timestamp:  seg.Timestamp,
-				Speaker:    seg.Speaker,
-				Text:       re.ReplaceAllStringFunc(seg.Text, func(string) string { return replace }),
-				Confidence: seg.Confidence,
-			}
+			seg.Text = re.ReplaceAllStringFunc(seg.Text, func(string) string { return replace })
+			out[i] = seg
 		} else {
 			out[i] = seg
 		}
@@ -245,12 +237,8 @@ func FixCapitalization(segs []models.TranscriptSegment) []models.TranscriptSegme
 	for i, seg := range segs {
 		text := ApplySentenceCase(seg.Text)
 		text = CapitalizeProperNouns(text)
-		out[i] = models.TranscriptSegment{
-			Timestamp:  seg.Timestamp,
-			Speaker:    seg.Speaker,
-			Text:       text,
-			Confidence: seg.Confidence,
-		}
+		seg.Text = text
+		out[i] = seg
 	}
 	return out
 }

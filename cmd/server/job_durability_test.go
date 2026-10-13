@@ -36,7 +36,7 @@ func writeCommittedJob(t *testing.T, id string, committed int, journal string) s
 		Request:        jobRequest{Filename: "a.wav", AudioFile: "audio.bin"},
 		JournalVersion: 1, JournalEventCount: committed,
 	}
-	if err := writeJSONAtomic(filepath.Join(dir, "job.json"), snapshot, 0o600); err != nil {
+	if err := writeJSONAtomic(filepath.Join(dir, "job.json"), snapshot); err != nil {
 		t.Fatal(err)
 	}
 	if journal != "" {

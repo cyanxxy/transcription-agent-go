@@ -4,7 +4,8 @@
 // Example:
 //
 //	transcriber-cli auth set gemini
-//	transcriber-cli -i meeting.m4a -format srt -o out.srt
+//	transcriber-cli -i meeting.m4a -o meeting.srt        # format from the extension
+//	transcriber-cli -i meeting.m4a -format docx -o notes.docx
 //
 // SIGINT/SIGTERM cancel the in-flight transcription cleanly. Structured logs
 // go to stderr (set LOG_FORMAT=text for a friendlier console view).
@@ -25,6 +26,7 @@ import (
 
 	"github.com/cyanxxy/transcription-agent-go/internal/agents"
 	"github.com/cyanxxy/transcription-agent-go/internal/config"
+	"github.com/cyanxxy/transcription-agent-go/internal/export"
 	"github.com/cyanxxy/transcription-agent-go/internal/models"
 	"github.com/cyanxxy/transcription-agent-go/internal/obs"
 	"github.com/cyanxxy/transcription-agent-go/internal/skills"
@@ -63,6 +65,7 @@ type cliOptions struct {
 	thinking         string
 	judgeThinking    string
 	useJudge         bool
+	speechReview     bool
 	agenticMode      bool
 	autoFormat       bool
 	removeFillers    bool
@@ -84,6 +87,7 @@ func transcriptionOptions(o cliOptions) []config.TranscriptionOption {
 		config.WithServiceTier(o.serviceTier),
 		config.WithThinkingLevels(o.thinking, o.judgeThinking),
 		config.WithUseJudgePipeline(o.useJudge),
+		config.WithSpeechReview(o.speechReview),
 		config.WithAgenticMode(o.agenticMode),
 		config.WithAutoFormat(o.autoFormat),
 		config.WithRemoveFillers(o.removeFillers),
@@ -113,7 +117,8 @@ func run() error {
 		apiKey             = flag.String("api-key", os.Getenv("GEMINI_API_KEY"), "Gemini API key (or GEMINI_API_KEY env or saved credentials)")
 		input              = flag.String("i", "", "Audio file path (required)")
 		output             = flag.String("o", "", "Output file path (default stdout)")
-		format             = flag.String("format", "txt", "Output format: txt, srt, json")
+		format             = flag.String("format", "txt", "Output format: txt, md, docx, srt, vtt, csv, json (default: from the -o extension, else txt)")
+		timestamps         = flag.Bool("timestamps", true, "Include timestamps in txt, md, and docx output")
 		model              = flag.String("model", config.DefaultTranscriptionModel, "Transcription model (Gemini, Muse Voice Transcribe, or MAI-Transcribe-2)")
 		judgeModel         = flag.String("judge-model", config.DefaultJudgeModel, "Judge Gemini model")
 		strategy           = flag.String("strategy", "dual_gemini", "Candidate strategy")
@@ -125,9 +130,11 @@ func run() error {
 		terms              = flag.String("terms", "", "Optional technical terms (comma-separated)")
 		keywords           = flag.String("keywords", "", "Optional verification keywords (comma-separated)")
 		languageHints      = flag.String("language-hints", "", "Optional language or accent hints")
+		languageCodes      = flag.String("language-codes", "", "Optional comma-separated BCP-47 language codes, e.g. en-US,nl-NL (sent to Gemini 3.5 Transcribe; a single code forces the MAI-Transcribe-2 locale)")
 		customInstructions = flag.String("instructions", "", "Optional custom instructions")
 		expectedFormat     = flag.String("expected-format", "", "Optional expected format: meeting, interview, lecture, podcast, legal, medical, technical")
 		useJudge           = flag.Bool("judge", true, "Enable judge pipeline")
+		speechReview       = flag.Bool("speech-review", false, "Send a speech model's transcript through the review pipeline (judge, extra candidates, global review); needs a Gemini key")
 		agenticMode        = flag.Bool("agentic", true, "Enable adaptive evidence planning and global review routing")
 		autoFormat         = flag.Bool("auto-format", true, "Enable auto-formatting")
 		removeFillers      = flag.Bool("remove-fillers", false, "Remove filler words")
@@ -148,14 +155,32 @@ func run() error {
 		fmt.Println(version)
 		return nil
 	}
-	if err := applyStoredCredentials(*model, apiKey); err != nil {
+	if err := applyStoredCredentials(*model, apiKey, !config.IsExternalSpeechModel(*model) || *speechReview); err != nil {
 		return err
 	}
-	if strings.TrimSpace(*apiKey) == "" && !config.IsExternalSpeechModel(*model) {
-		return fmt.Errorf("missing API key (run 'transcriber-cli auth set gemini', pass --api-key, or set GEMINI_API_KEY)")
+	if strings.TrimSpace(*apiKey) == "" && (!config.IsExternalSpeechModel(*model) || *speechReview) {
+		return fmt.Errorf("missing Gemini API key (run 'transcriber-cli auth set gemini', pass --api-key, or set GEMINI_API_KEY)")
 	}
 	if strings.TrimSpace(*input) == "" {
 		return fmt.Errorf("--i is required")
+	}
+	formatSet := false
+	flag.Visit(func(f *flag.Flag) { formatSet = formatSet || f.Name == "format" })
+	if !formatSet && *output != "" {
+		if info, err := export.Lookup(filepath.Ext(*output)); err == nil {
+			*format = string(info.Format)
+		}
+	}
+	exportInfo, err := export.Lookup(*format)
+	if err != nil {
+		return fmt.Errorf("-format: %w", err)
+	}
+	if exportInfo.Binary && *output == "" {
+		return fmt.Errorf("-format %s writes a binary file; set -o", exportInfo.Format)
+	}
+	parsedLanguageCodes, err := models.ParseLanguageCodes(*languageCodes)
+	if err != nil {
+		return fmt.Errorf("--language-codes: %w", err)
 	}
 
 	// Logging defaults to text in the CLI so output is friendly. Set
@@ -175,6 +200,7 @@ func run() error {
 		thinking:         *thinking,
 		judgeThinking:    *judgeThinking,
 		useJudge:         *useJudge,
+		speechReview:     *speechReview,
 		agenticMode:      *agenticMode,
 		autoFormat:       *autoFormat,
 		removeFillers:    *removeFillers,
@@ -218,6 +244,7 @@ func run() error {
 		CustomInstructions: *customInstructions,
 		ExpectedFormat:     *expectedFormat,
 		LanguageHints:      *languageHints,
+		LanguageCodes:      parsedLanguageCodes,
 	}
 	if *speakers != "" {
 		for _, s := range strings.Split(*speakers, ",") {
@@ -241,7 +268,7 @@ func run() error {
 		}
 	}
 	if userCtx.Topic == "" && userCtx.CustomInstructions == "" && userCtx.ExpectedFormat == "" &&
-		userCtx.LanguageHints == "" && len(userCtx.SpeakerNames) == 0 && len(userCtx.TechnicalTerms) == 0 && len(userCtx.Keywords) == 0 {
+		userCtx.LanguageHints == "" && len(userCtx.LanguageCodes) == 0 && len(userCtx.SpeakerNames) == 0 && len(userCtx.TechnicalTerms) == 0 && len(userCtx.Keywords) == 0 {
 		userCtx = nil
 	}
 
@@ -263,7 +290,10 @@ func run() error {
 		return err
 	}
 
-	rendered, err := workflow.ExportTranscript(result, *format)
+	exportOpts := export.DefaultOptions()
+	exportOpts.IncludeTimestamps = *timestamps
+	exportOpts.Title = strings.TrimSuffix(transcriptFilename(*input), filepath.Ext(*input))
+	rendered, err := export.Render(result, exportInfo.Format, exportOpts)
 	if err != nil {
 		return err
 	}
@@ -277,11 +307,8 @@ func run() error {
 		defer f.Close()
 		out = f
 	}
-	if _, err := io.WriteString(out, rendered); err != nil {
+	if _, err := out.Write(rendered); err != nil {
 		return err
-	}
-	if *output == "" {
-		fmt.Fprintln(out)
 	}
 	return nil
 }

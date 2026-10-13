@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/cyanxxy/transcription-agent-go/internal/config"
+	"github.com/cyanxxy/transcription-agent-go/internal/models"
 	"github.com/cyanxxy/transcription-agent-go/internal/workflow"
 )
 
@@ -204,7 +205,7 @@ func TestLoadJobMigratesLegacyJournalBeforeMutation(t *testing.T) {
 		ID: "legacy", Status: jobSucceeded, CreatedAt: now, UpdatedAt: now,
 		FinishedAt: now,
 	}
-	if err := writeJSONAtomic(filepath.Join(dir, "job.json"), legacy, 0o600); err != nil {
+	if err := writeJSONAtomic(filepath.Join(dir, "job.json"), legacy); err != nil {
 		t.Fatal(err)
 	}
 	event := []byte("{\"id\":1,\"name\":\"result\",\"data\":\"{}\"}\n")
@@ -977,4 +978,96 @@ func multipartJobRequest(t *testing.T, path, idempotencyKey string) *http.Reques
 	req.Header.Set("Content-Type", writer.FormDataContentType())
 	req.Header.Set("Idempotency-Key", idempotencyKey)
 	return req
+}
+
+func TestCreateJobRejectsInvalidLanguageCodes(t *testing.T) {
+	s := newTestServer("k", 1)
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	part, err := writer.CreateFormFile("audio", "a.wav")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = part.Write([]byte("not a real wav"))
+	_ = writer.WriteField("language_codes", "en-US, Dutch please")
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/jobs", &body)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	rec := httptest.NewRecorder()
+	s.routes().ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "language") {
+		t.Fatalf("create = %d body=%s, want 400 naming the language codes", rec.Code, rec.Body.String())
+	}
+}
+
+func TestUserContextCarriesLanguageCodes(t *testing.T) {
+	ctx := buildUserContextFromValues(map[string]string{"language_codes": "en-us nl_nl"})
+	if ctx == nil || strings.Join(ctx.LanguageCodes, ",") != "en-US,nl-NL" {
+		t.Fatalf("context = %#v", ctx)
+	}
+}
+
+func TestExportJobRendersFinishedTranscript(t *testing.T) {
+	s := newTestServer("k", 1)
+	start, end := 1.25, 2.5
+	jb := &job{id: "exported", status: jobSucceeded, request: jobRequest{Filename: "Team Sync.m4a"}}
+	_ = jb.push("result", map[string]any{"result": models.TranscriptResult{Segments: []models.TranscriptSegment{
+		{Timestamp: "[00:00:01]", Speaker: "Speaker 1", Text: "Hello.", Start: &start, End: &end},
+	}}})
+	jb.close()
+	s.jobs.Store(jb.id, jb)
+
+	rec := httptest.NewRecorder()
+	s.handleJob(rec, httptest.NewRequest(http.MethodGet, "/api/jobs/exported/export?format=vtt&speaker=Speaker%201%3DAlice", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get("Content-Disposition"); got != `attachment; filename="Team Sync.vtt"` {
+		t.Errorf("Content-Disposition = %q", got)
+	}
+	if got := rec.Header().Get("Content-Type"); !strings.HasPrefix(got, "text/vtt") {
+		t.Errorf("Content-Type = %q", got)
+	}
+	if want := "00:00:01.250 --> 00:00:02.500\n<v Alice>Hello."; !strings.Contains(rec.Body.String(), want) {
+		t.Errorf("body = %q, want it to contain %q", rec.Body.String(), want)
+	}
+
+	rec = httptest.NewRecorder()
+	s.handleJob(rec, httptest.NewRequest(http.MethodGet, "/api/jobs/exported/export?format=pdf", nil))
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("unknown format status = %d", rec.Code)
+	}
+}
+
+func TestExportJobRequiresResult(t *testing.T) {
+	s := newTestServer("k", 1)
+	jb := &job{id: "pending", status: jobRunning}
+	s.jobs.Store(jb.id, jb)
+	rec := httptest.NewRecorder()
+	s.handleJob(rec, httptest.NewRequest(http.MethodGet, "/api/jobs/pending/export?format=srt", nil))
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409", rec.Code)
+	}
+}
+
+func TestTranscriptTitle(t *testing.T) {
+	for in, want := range map[string]string{"Team Sync.m4a": "Team Sync", "a/b\\c:d.mp3": "bcd", "": "Transcript", "audio.bin": "Transcript", "x\"y.wav": "xy"} {
+		if got := transcriptTitle(in); got != want {
+			t.Errorf("transcriptTitle(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestValidateJobOptionsRequiresGeminiKeyForSpeechReview(t *testing.T) {
+	t.Setenv("META_API_KEY", "meta")
+	meta := config.WithModelName(config.MetaTranscriptionModel)
+	if err := validateJobOptions("", []config.TranscriptionOption{meta}); err != nil {
+		t.Fatalf("direct Meta run should not need a Gemini key: %v", err)
+	}
+	err := validateJobOptions("", []config.TranscriptionOption{meta, config.WithSpeechReview(true)})
+	if err == nil || !strings.Contains(err.Error(), "Gemini judge") {
+		t.Fatalf("err = %v, want the review pipeline to require a Gemini key", err)
+	}
 }

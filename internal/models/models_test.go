@@ -1,6 +1,9 @@
 package models
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestParseTimestampSeconds(t *testing.T) {
 	tests := []struct {
@@ -201,5 +204,26 @@ func TestFormattedText(t *testing.T) {
 	want := "[00:00:00] Alice: Hello\n[00:00:05] Bob: Hi"
 	if got != want {
 		t.Errorf("FormattedText() =\n%q\nwant\n%q", got, want)
+	}
+}
+
+func TestParseLanguageCodes(t *testing.T) {
+	got, err := ParseLanguageCodes(" en-us, nl_NL;cmn-hans-cn es-419 EN-US ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "en-US,nl-NL,cmn-Hans-CN,es-419"; strings.Join(got, ",") != want {
+		t.Fatalf("codes = %v, want %s", got, want)
+	}
+	if got, err := ParseLanguageCodes(""); err != nil || len(got) != 0 {
+		t.Fatalf("empty = %v, %v", got, err)
+	}
+	for _, bad := range []string{"English", "en-US-x", "e", "en--US", "Dutch and English"} {
+		if _, err := ParseLanguageCodes(bad); err == nil {
+			t.Errorf("ParseLanguageCodes(%q) accepted free text", bad)
+		}
+	}
+	if _, err := ParseLanguageCodes("en fr de es it pt nl sv da no fi"); err == nil {
+		t.Error("accepted more than MaxLanguageCodes codes")
 	}
 }

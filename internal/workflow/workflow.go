@@ -2,9 +2,7 @@
 package workflow
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -18,6 +16,7 @@ import (
 	"github.com/cyanxxy/transcription-agent-go/internal/agents"
 	"github.com/cyanxxy/transcription-agent-go/internal/audio"
 	"github.com/cyanxxy/transcription-agent-go/internal/config"
+	"github.com/cyanxxy/transcription-agent-go/internal/export"
 	"github.com/cyanxxy/transcription-agent-go/internal/gemini"
 	"github.com/cyanxxy/transcription-agent-go/internal/models"
 	"github.com/cyanxxy/transcription-agent-go/internal/obs"
@@ -169,14 +168,34 @@ func (w *Workflow) Transcribe(ctx context.Context, in TranscribeInput) (*models.
 		w.setStatus(models.StatusError, in.Filename)
 		return nil, err
 	}
+	// The container duration is an estimate for some inputs (VBR MP3 without
+	// a Xing header can be off by minutes), so decode once for the exact
+	// length and, for adaptive chunking, the silence map in the same pass.
+	analysis, err := audio.Analyze(ctx, tempPath, runDeps.ChunkStrategy == audio.ChunkStrategyAdaptive)
+	if err != nil {
+		w.setStatus(models.StatusError, in.Filename)
+		return nil, err
+	}
+	probe.DurationMS = analysis.DurationMS
 	if probe.DurationMS > 34200000 {
 		w.setStatus(models.StatusError, in.Filename)
 		return nil, errors.New("audio exceeds Gemini's 9.5 hour per-prompt limit")
 	}
 	needsChunking := probe.DurationMS > runDeps.ChunkDurationMS
 	chunkCount := 1
+	var chunkPlan []audio.Chunk
 	if needsChunking {
-		chunkCount = audio.ChunkPlanCount(probe.DurationMS, runDeps.ChunkDurationMS, runDeps.ChunkOverlapMS)
+		chunkPlan, err = audio.PlanAdaptiveChunks(probe.DurationMS, audio.ChunkPlanOptions{
+			DurationMS:   runDeps.ChunkDurationMS,
+			OverlapMS:    runDeps.ChunkOverlapMS,
+			Strategy:     runDeps.ChunkStrategy,
+			SilenceSpans: analysis.Silences,
+		})
+		if err != nil {
+			w.setStatus(models.StatusError, in.Filename)
+			return nil, err
+		}
+		chunkCount = len(chunkPlan)
 	}
 	metadata := audio.Metadata(probe, in.Filename, needsChunking, chunkCount, runDeps.ChunkStrategy)
 
@@ -219,7 +238,7 @@ func (w *Workflow) Transcribe(ctx context.Context, in TranscribeInput) (*models.
 		}
 		if strings.TrimSpace(cur) == "" {
 			routerModel := runDeps.ModelName
-			if routerModel == config.DefaultTranscriptionModel {
+			if config.IsDirectSpeechModel(routerModel) {
 				routerModel = runDeps.JudgeModelName
 			}
 			router := skills.NewRouter(reg, w.Client, routerModel)
@@ -240,6 +259,7 @@ func (w *Workflow) Transcribe(ctx context.Context, in TranscribeInput) (*models.
 	if userCtx != nil {
 		contextPrompt = agents.BuildContextPromptWithSkills(*userCtx, reg)
 		speakerNames = append(speakerNames, userCtx.SpeakerNames...)
+		runDeps.LanguageCodes = append([]string(nil), userCtx.LanguageCodes...)
 	}
 	customPrompt := in.CustomPrompt
 	if contextPrompt != "" {
@@ -266,7 +286,7 @@ func (w *Workflow) Transcribe(ctx context.Context, in TranscribeInput) (*models.
 	if runDeps.UseJudgePipeline {
 		finalSegments, quality, timestampsCorrected, chunkMetadata, candidates,
 			selectedCandidateIDs, judgeNotes, judgeToolUsage, resultEdited, err = w.runJudgePipeline(
-			ctx, runDeps, tempPath, metadata, customPrompt, speakerNames, in.Progress,
+			ctx, runDeps, tempPath, metadata, chunkPlan, customPrompt, speakerNames, in.Progress,
 		)
 		if err != nil {
 			w.setStatus(models.StatusError, in.Filename)
@@ -274,7 +294,7 @@ func (w *Workflow) Transcribe(ctx context.Context, in TranscribeInput) (*models.
 		}
 	} else {
 		finalSegments, chunkMetadata, err = w.runDirectPipeline(
-			ctx, runDeps, tempPath, metadata, customPrompt, speakerNames, in.Progress,
+			ctx, runDeps, tempPath, metadata, chunkPlan, customPrompt, speakerNames, in.Progress,
 		)
 		if err != nil {
 			w.setStatus(models.StatusError, in.Filename)
@@ -358,7 +378,7 @@ func (w *Workflow) Transcribe(ctx context.Context, in TranscribeInput) (*models.
 // guarantee a run will use the entire remaining budget; failing it means the
 // configured run is impossible and should not spend any Gemini quota.
 func validateMinimumAudioTokenBudget(durationMS, chunkCount int, deps *config.TranscriptionDeps, specs []config.CandidateSpec) error {
-	if deps != nil && config.IsExternalSpeechModel(deps.ModelName) {
+	if deps != nil && config.IsExternalSpeechModel(deps.ModelName) && !deps.UseJudgePipeline {
 		return nil
 	}
 	if deps == nil || durationMS <= 0 || deps.AgentMaxTokens <= 0 {
@@ -556,6 +576,7 @@ func (w *Workflow) runJudgePipeline(
 	deps *config.TranscriptionDeps,
 	audioPath string,
 	metadata models.AudioMetadata,
+	chunkPlan []audio.Chunk,
 	customPrompt string,
 	speakerNames []string,
 	progress ProgressFn,
@@ -576,7 +597,7 @@ func (w *Workflow) runJudgePipeline(
 	}
 	var units []audio.Chunk
 	if metadata.NeedsChunking {
-		units, err = chunkifyForDeps(ctx, deps, audioPath)
+		units, err = audio.ExtractChunks(ctx, audioPath, deps.TempDir, chunkPlan)
 		if err != nil {
 			return nil, models.TranscriptQuality{}, false, nil, nil, nil, nil, nil, false, err
 		}
@@ -957,7 +978,9 @@ func bestValidCandidate(candidates []models.TranscriptCandidate) models.Transcri
 }
 
 func validateSegmentsForChunk(segments []models.TranscriptSegment, unit audio.Chunk) error {
-	start := float64(unit.StartMS) / 1000
+	// Segment timestamps are truncated to whole seconds, while adaptive
+	// boundaries sit at silence midpoints with fractional starts.
+	start := float64(unit.StartMS / 1000)
 	end := float64(unit.EndMS)/1000 + 5
 	previous := -1.0
 	for index, segment := range segments {
@@ -1361,6 +1384,20 @@ func (w *Workflow) runCandidateSpec(
 			segments = segs
 			notes = append(notes, "Generated by "+spec.ModelName)
 		}
+	case "speech":
+		agent := agents.NewTranscriptionAgent(deps.WithModel(spec.ModelName), w.Client)
+		segs, err := agent.Run(ctx, agents.TranscribeInput{
+			AudioPath:            audioPath,
+			ChunkInfo:            chunkInfo,
+			SpeakerNames:         speakerNames,
+			AudioDurationSeconds: audioDuration,
+		})
+		if err != nil {
+			notes = append(notes, fmt.Sprintf("%s failed: %v", spec.Label, err))
+		} else {
+			segments = segs
+			notes = append(notes, "Generated by "+spec.ModelName)
+		}
 	case "parakeet":
 		if w.Parakeet == nil {
 			notes = append(notes, spec.Label+" unavailable: parakeet sidecar not configured")
@@ -1519,12 +1556,8 @@ func (w *Workflow) applyOutputCleanup(deps *config.TranscriptionDeps, segs []mod
 			cleaned := agents.RemoveFillerWords(seg.Text, w.Deps.Editing.FillerWords)
 			if cleaned != "" && cleaned != seg.Text {
 				changed = true
-				out[i] = models.TranscriptSegment{
-					Timestamp:  seg.Timestamp,
-					Speaker:    seg.Speaker,
-					Text:       cleaned,
-					Confidence: seg.Confidence,
-				}
+				seg.Text = cleaned
+				out[i] = seg
 				continue
 			}
 			out[i] = seg
@@ -1539,6 +1572,7 @@ func (w *Workflow) runDirectPipeline(
 	deps *config.TranscriptionDeps,
 	audioPath string,
 	metadata models.AudioMetadata,
+	chunkPlan []audio.Chunk,
 	customPrompt string,
 	speakerNames []string,
 	progress ProgressFn,
@@ -1565,7 +1599,7 @@ func (w *Workflow) runDirectPipeline(
 	if progress != nil {
 		progress("Splitting audio into chunks...", 0.3)
 	}
-	chunks, err := chunkifyForDeps(ctx, deps, audioPath)
+	chunks, err := audio.ExtractChunks(ctx, audioPath, deps.TempDir, chunkPlan)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -1579,19 +1613,23 @@ func (w *Workflow) runDirectPipeline(
 			recorder.mu.Unlock()
 		}
 		all, err := parallelMapOrdered(ctx, chunks, deps.ChunkConcurrency,
-			func(ctx context.Context, _ int, chunk audio.Chunk) ([]models.TranscriptSegment, error) {
-				segs, err := agents.NewTranscriptionAgent(deps, w.Client).Run(ctx, agents.TranscribeInput{
+			func(ctx context.Context, _ int, chunk audio.Chunk) ([]agents.TimedUnit, error) {
+				units, err := agents.NewTranscriptionAgent(deps, w.Client).RunTimed(ctx, agents.TranscribeInput{
 					AudioPath:            chunk.Path,
 					ChunkInfo:            &agents.ChunkInfo{Index: chunk.Index, StartMS: chunk.StartMS, EndMS: chunk.EndMS, DurationMS: chunk.DurationMS},
 					AudioDurationSeconds: float64(chunk.DurationMS) / 1000,
 				})
 				if errors.Is(err, agents.ErrNoWordAnnotations) {
-					return []models.TranscriptSegment{buildGapMarker(
-						&agents.ChunkInfo{StartMS: chunk.StartMS},
-						fmt.Sprintf("chunk %d of %d", chunk.Index+1, len(chunks)),
+					// A chunk of silence legitimately has no speech; only flag
+					// chunks with audible content that produced no transcript.
+					if silent, serr := audio.IsSilent(ctx, chunk.Path); serr == nil && silent {
+						return nil, nil
+					}
+					return []agents.TimedUnit{agents.GapMarker(
+						int64(chunk.StartMS), fmt.Sprintf("chunk %d of %d", chunk.Index+1, len(chunks)),
 					)}, nil
 				}
-				return segs, err
+				return units, err
 			}, func(completed int) {
 				if progress != nil {
 					progress(fmt.Sprintf("Transcribed %d/%d chunks...", completed, len(chunks)), 0.3+0.4*float64(completed)/float64(len(chunks)))
@@ -1600,7 +1638,14 @@ func (w *Workflow) runDirectPipeline(
 		if err != nil {
 			return nil, nil, err
 		}
-		return agents.MergeChunks(all), chunkMetadata, nil
+		segs, err := agents.StitchChunkSegments(all, directChunkSpans(chunks))
+		if err != nil {
+			return nil, nil, fmt.Errorf("stitch chunk transcripts: %w", err)
+		}
+		if len(speakerNames) > 0 {
+			segs = agents.MapSpeakersToContext(segs, speakerNames)
+		}
+		return segs, chunkMetadata, nil
 	}
 	all := make([][]models.TranscriptSegment, 0, len(chunks))
 	previous := ""
@@ -1636,11 +1681,25 @@ func (w *Workflow) runDirectPipeline(
 	return merged, chunkMetadata, nil
 }
 
-func chunkifyForDeps(ctx context.Context, deps *config.TranscriptionDeps, audioPath string) ([]audio.Chunk, error) {
-	if deps.ChunkStrategy == "adaptive" {
-		return audio.ChunkifyAdaptive(ctx, audioPath, deps.TempDir, deps.ChunkDurationMS, deps.ChunkOverlapMS)
+// directChunkSpans assigns each chunk the part of the timeline it is
+// authoritative for. Seams at a silence boundary cut at the chunk end, which
+// is the silence midpoint; fixed seams cut halfway through the overlap so
+// neither chunk contributes speech it only heard at its clipped edge.
+func directChunkSpans(chunks []audio.Chunk) []agents.ChunkSpan {
+	spans := make([]agents.ChunkSpan, len(chunks))
+	for i, chunk := range chunks {
+		spans[i] = agents.ChunkSpan{StartMS: int64(chunk.StartMS), EndMS: int64(chunk.EndMS)}
 	}
-	return audio.Chunkify(ctx, audioPath, deps.TempDir, deps.ChunkDurationMS, deps.ChunkOverlapMS)
+	for i := 1; i < len(chunks); i++ {
+		prev, cur := chunks[i-1], chunks[i]
+		cut := prev.EndMS
+		if prev.BoundaryType != audio.BoundarySilence && cur.StartMS < prev.EndMS {
+			cut = cur.StartMS + (prev.EndMS-cur.StartMS)/2
+		}
+		spans[i-1].KeepUntilMS = int64(cut)
+		spans[i].KeepFromMS = int64(cut)
+	}
+	return spans
 }
 
 func chunkBoundarySeconds(chunks []audio.Chunk) []float64 {
@@ -1870,119 +1929,16 @@ func sanitizeFilename(name string) string {
 	return result
 }
 
-// ExportTranscript renders the result in the requested format.
+// ExportTranscript renders the result as text in the requested format with
+// default options. Binary formats such as docx are rejected; use export.Render.
 func ExportTranscript(result *models.TranscriptResult, format string) (string, error) {
-	switch strings.ToLower(format) {
-	case "txt":
-		return result.FormattedText(), nil
-	case "json":
-		var buf bytes.Buffer
-		enc := json.NewEncoder(&buf)
-		enc.SetIndent("", "  ")
-		if err := enc.Encode(result); err != nil {
-			return "", err
-		}
-		return buf.String(), nil
-	case "srt":
-		return exportAsSRT(result.Segments, 42), nil
-	default:
-		return "", fmt.Errorf("unsupported export format: %s", format)
+	info, err := export.Lookup(format)
+	if err != nil {
+		return "", err
 	}
-}
-
-func exportAsSRT(segs []models.TranscriptSegment, maxLineLength int) string {
-	var sb strings.Builder
-	previousStart := ""
-	for i, seg := range segs {
-		startTime := convertToSRTTime(seg.Timestamp)
-		if previousStart != "" {
-			startSec := srtTimeToSeconds(startTime)
-			prevSec := srtTimeToSeconds(previousStart)
-			if startSec <= prevSec {
-				startTime = addSecondsToSRTTime(previousStart, 0.1)
-			}
-		}
-		previousStart = startTime
-		endTime := ""
-		if i+1 < len(segs) {
-			nextStart := convertToSRTTime(segs[i+1].Timestamp)
-			if srtTimeToSeconds(nextStart) <= srtTimeToSeconds(startTime) {
-				endTime = addSecondsToSRTTime(startTime, 2)
-			} else {
-				endTime = nextStart
-			}
-		} else {
-			endTime = addSecondsToSRTTime(startTime, 3)
-		}
-		text := seg.Text
-		if len(text) > maxLineLength {
-			text = wrapToLines(text, maxLineLength)
-		}
-		fmt.Fprintf(&sb, "%d\n", i+1)
-		sb.WriteString(startTime + " --> " + endTime + "\n")
-		fmt.Fprintf(&sb, "%s: %s\n\n", seg.Speaker, text)
+	if info.Binary {
+		return "", fmt.Errorf("%s is a binary format; use export.Render", info.Format)
 	}
-	return sb.String()
-}
-
-func convertToSRTTime(ts string) string {
-	stripped := strings.Trim(ts, "[]")
-	return stripped + ",000"
-}
-
-func addSecondsToSRTTime(ts string, seconds float64) string {
-	parts := strings.SplitN(ts, ",", 2)
-	timePart := parts[0]
-	ms := 0
-	if len(parts) == 2 {
-		_, _ = fmt.Sscanf(parts[1], "%d", &ms) // best effort; ms stays 0 on parse failure
-	}
-	h, m, s := 0, 0, 0
-	_, _ = fmt.Sscanf(timePart, "%d:%d:%d", &h, &m, &s) // best effort; fields stay 0 on parse failure
-	totalMs := (h*3600+m*60+s)*1000 + ms
-	deltaMs := int(seconds * 1000)
-	totalMs += deltaMs
-	if totalMs < 0 {
-		totalMs = 0
-	}
-	nh := totalMs / 3600000
-	nm := (totalMs % 3600000) / 60000
-	ns := (totalMs % 60000) / 1000
-	nms := totalMs % 1000
-	return fmt.Sprintf("%02d:%02d:%02d,%03d", nh, nm, ns, nms)
-}
-
-func srtTimeToSeconds(ts string) float64 {
-	parts := strings.SplitN(ts, ",", 2)
-	h, m, s := 0, 0, 0
-	_, _ = fmt.Sscanf(parts[0], "%d:%d:%d", &h, &m, &s) // best effort; fields stay 0 on parse failure
-	ms := 0
-	if len(parts) == 2 {
-		_, _ = fmt.Sscanf(parts[1], "%d", &ms) // best effort; ms stays 0 on parse failure
-	}
-	return float64(h*3600+m*60+s) + float64(ms)/1000.0
-}
-
-// wrapToLines greedily wraps text into lines no longer than maxLen. It never
-// drops words: long cues simply produce more than two lines, which mainstream
-// SRT players tolerate, rather than silently truncating transcript content.
-func wrapToLines(text string, maxLen int) string {
-	words := strings.Fields(text)
-	lines := make([]string, 0, 2)
-	current := make([]string, 0)
-	for _, w := range words {
-		joined := strings.Join(append(current, w), " ")
-		if len(joined) <= maxLen {
-			current = append(current, w)
-			continue
-		}
-		if len(current) > 0 {
-			lines = append(lines, strings.Join(current, " "))
-		}
-		current = []string{w}
-	}
-	if len(current) > 0 {
-		lines = append(lines, strings.Join(current, " "))
-	}
-	return strings.Join(lines, "\n")
+	out, err := export.Render(result, info.Format, export.DefaultOptions())
+	return string(out), err
 }

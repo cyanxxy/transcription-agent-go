@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"mime"
 	"mime/multipart"
 	"net/http"
 	"os"
@@ -16,6 +17,8 @@ import (
 
 	"github.com/cyanxxy/transcription-agent-go/internal/agents"
 	"github.com/cyanxxy/transcription-agent-go/internal/config"
+	"github.com/cyanxxy/transcription-agent-go/internal/export"
+	"github.com/cyanxxy/transcription-agent-go/internal/models"
 	"github.com/cyanxxy/transcription-agent-go/internal/obs"
 )
 
@@ -156,6 +159,11 @@ func (s *server) createJobHTTP(w http.ResponseWriter, r *http.Request) {
 		respondError(w, r, http.StatusBadRequest, "invalid configuration", err)
 		return
 	}
+	if err := validateJobForm(jb.request.Form); err != nil {
+		_ = os.RemoveAll(jb.dir)
+		respondError(w, r, http.StatusBadRequest, "invalid language_codes: use comma-separated BCP-47 codes such as en-US, nl-NL", err)
+		return
+	}
 	s.jobs.Store(id, jb)
 	if err := jb.push("queued", map[string]any{"job_id": id, "status": jobQueued}); err != nil {
 		s.jobs.Delete(id)
@@ -232,6 +240,12 @@ func validateJobOptions(apiKey string, opts []config.TranscriptionOption) error 
 		return err
 	}
 	defer func() { _ = deps.Cleanup() }()
+	if deps.NeedsGeminiKey() && strings.TrimSpace(apiKey) == "" {
+		if config.IsExternalSpeechModel(deps.ModelName) {
+			return errors.New("the review pipeline uses a Gemini judge; add a Gemini API key")
+		}
+		return errors.New("add a Gemini API key to use Gemini models")
+	}
 	return agents.ValidateSpeechCredentials(deps)
 }
 
@@ -266,6 +280,9 @@ func (s *server) routeJobHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		case "review":
 			s.withAuth(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { s.reviewJobHTTP(w, r, jb) })).ServeHTTP(w, r)
+			return
+		case "export":
+			s.exportJobHTTP(w, r, jb)
 			return
 		}
 	}
@@ -401,4 +418,108 @@ func parseEventCursor(r *http.Request) int64 {
 		return 0
 	}
 	return cursor
+}
+
+// Bounds on export query parameters.
+const (
+	maxExportSpeakerNames = 64
+	maxExportSpeakerChars = 120
+)
+
+// exportJobHTTP renders a finished job's transcript as a downloadable file.
+// Like the job snapshot, it is protected by the unguessable job ID.
+//
+//	GET /api/jobs/{id}/export?format=srt&timestamps=false&speaker=Speaker%201=Alice
+func (s *server) exportJobHTTP(w http.ResponseWriter, r *http.Request, jb *job) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		respondError(w, r, http.StatusMethodNotAllowed, "method not allowed", nil)
+		return
+	}
+	query := r.URL.Query()
+	formatName := query.Get("format")
+	if formatName == "" {
+		formatName = string(export.TXT)
+	}
+	info, err := export.Lookup(formatName)
+	if err != nil {
+		respondError(w, r, http.StatusBadRequest, err.Error(), nil)
+		return
+	}
+	result, ok := jb.latestResult()
+	if !ok {
+		respondError(w, r, http.StatusConflict, "transcript is not ready", nil)
+		return
+	}
+	opts := export.DefaultOptions()
+	opts.IncludeTimestamps = parseBool(query.Get("timestamps"), true)
+	opts.Title = transcriptTitle(jb.request.Filename)
+	opts.SpeakerNames = map[string]string{}
+	speakers := query["speaker"]
+	if len(speakers) > maxExportSpeakerNames {
+		respondError(w, r, http.StatusBadRequest, fmt.Sprintf("at most %d speaker names", maxExportSpeakerNames), nil)
+		return
+	}
+	for _, pair := range speakers {
+		from, to, found := strings.Cut(pair, "=")
+		if !found || strings.TrimSpace(from) == "" || len(from) > maxExportSpeakerChars || len(to) > maxExportSpeakerChars {
+			respondError(w, r, http.StatusBadRequest, "speaker must be <label>=<name>", nil)
+			return
+		}
+		opts.SpeakerNames[strings.TrimSpace(from)] = strings.TrimSpace(to)
+	}
+	body, err := export.Render(result, info.Format, opts)
+	if err != nil {
+		respondError(w, r, http.StatusInternalServerError, "export failed", err)
+		return
+	}
+	disposition := mime.FormatMediaType("attachment", map[string]string{"filename": opts.Title + "." + info.Extension})
+	w.Header().Set("Content-Type", info.ContentType)
+	w.Header().Set("Content-Disposition", disposition)
+	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(http.StatusOK)
+	if r.Method != http.MethodHead {
+		_, _ = w.Write(body)
+	}
+}
+
+// transcriptTitle names exports after the uploaded file, without its
+// extension or characters that are unsafe in a download name.
+func transcriptTitle(filename string) string {
+	base := strings.TrimSuffix(filepath.Base(filename), filepath.Ext(filename))
+	base = strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f || strings.ContainsRune(`/\:*?"<>|`, r) {
+			return -1
+		}
+		return r
+	}, base)
+	base = strings.TrimSpace(base)
+	if base == "" || base == "." || base == "audio" {
+		return "Transcript"
+	}
+	return base
+}
+
+// latestResult decodes the transcript from the job's most recent result
+// event, if the job produced one.
+func (j *job) latestResult() (*models.TranscriptResult, bool) {
+	j.mu.Lock()
+	var data string
+	for i := len(j.events) - 1; i >= 0; i-- {
+		if j.events[i].Name == "result" {
+			data = j.events[i].Data
+			break
+		}
+	}
+	j.mu.Unlock()
+	if data == "" {
+		return nil, false
+	}
+	var payload struct {
+		Result *models.TranscriptResult `json:"result"`
+	}
+	if err := json.Unmarshal([]byte(data), &payload); err != nil || payload.Result == nil {
+		return nil, false
+	}
+	return payload.Result, true
 }

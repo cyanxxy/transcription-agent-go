@@ -7,8 +7,11 @@ package audio
 
 import (
 	"context"
+	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -167,46 +170,99 @@ type ChunkPlanOptions struct {
 	SilenceSpans []SilenceSpan
 }
 
+// Analysis is the result of fully decoding the audio once.
+type Analysis struct {
+	// DurationMS is the decoded audio length. Unlike the container duration
+	// reported by ffprobe, it is exact for VBR MP3 files without a Xing/Info
+	// header, where ffprobe estimates from bitrate and can be off by minutes.
+	DurationMS int
+	// Silences is populated only when silence detection was requested.
+	Silences []SilenceSpan
+}
+
+// Analyze decodes the first audio stream once to measure its exact duration
+// and, when detectSilence is set, find quiet regions in the same pass.
+func Analyze(ctx context.Context, path string, detectSilence bool) (*Analysis, error) {
+	args := []string{"-hide_banner", "-nostdin", "-nostats", "-loglevel", "info", "-i", path, "-vn", "-map", "0:a:0"}
+	if detectSilence {
+		args = append(args, "-af", "silencedetect=n=-35dB:d=0.4")
+	}
+	args = append(args, "-f", "null", "-", "-progress", "pipe:1")
+	cmd := exec.CommandContext(ctx, "ffmpeg", args...)
+	var stderr strings.Builder
+	cmd.Stderr = &stderr
+	stdout, err := cmd.Output()
+	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
+		return nil, fmt.Errorf("ffmpeg decode: %w: %s", err, lastLines(stderr.String(), 5))
+	}
+	durationMS := parseProgressDurationMS(stdout)
+	if durationMS <= 0 {
+		return nil, fmt.Errorf("ffmpeg decoded no audio from %s", filepath.Base(path))
+	}
+	analysis := &Analysis{DurationMS: durationMS}
+	if detectSilence {
+		analysis.Silences = ParseSilenceDetectOutput([]byte(stderr.String()))
+	}
+	return analysis, nil
+}
+
+var progressTimeRE = regexp.MustCompile(`(?m)^out_time_us=(\d+)\s*$`)
+
+// parseProgressDurationMS returns the largest out_time_us reported by
+// `ffmpeg -progress`, which after a full decode is the stream's end time.
+func parseProgressDurationMS(progress []byte) int {
+	maxUS := int64(0)
+	for _, match := range progressTimeRE.FindAllSubmatch(progress, -1) {
+		if us, err := strconv.ParseInt(string(match[1]), 10, 64); err == nil && us > maxUS {
+			maxUS = us
+		}
+	}
+	return int(maxUS / 1000)
+}
+
+func lastLines(s string, n int) string {
+	lines := strings.Split(strings.TrimSpace(s), "\n")
+	if len(lines) > n {
+		lines = lines[len(lines)-n:]
+	}
+	return strings.Join(lines, "\n")
+}
+
 // Chunkify splits the audio at `path` into overlapping chunks written under
-// dstDir. It produces wav files with the same sample rate as the source.
+// dstDir. It produces 16 kHz mono wav files.
 func Chunkify(ctx context.Context, path, dstDir string, durationMS, overlapMS int) ([]Chunk, error) {
-	probe, err := ProbeFile(ctx, path)
-	if err != nil {
-		return nil, err
-	}
-	plan, err := PlanAdaptiveChunks(probe.DurationMS, ChunkPlanOptions{
-		DurationMS: durationMS,
-		OverlapMS:  overlapMS,
-		Strategy:   ChunkStrategyFixed,
-	})
-	if err != nil {
-		return nil, err
-	}
-	return extractChunkPlan(ctx, path, dstDir, plan)
+	return chunkify(ctx, path, dstDir, durationMS, overlapMS, ChunkStrategyFixed)
 }
 
 // ChunkifyAdaptive splits audio using silence-aware boundaries when ffmpeg can
-// find useful quiet regions. It falls back to fixed windows on detection errors
-// or when no suitable silence is near a target boundary.
+// find useful quiet regions. It falls back to fixed windows when no suitable
+// silence is near a target boundary.
 func ChunkifyAdaptive(ctx context.Context, path, dstDir string, durationMS, overlapMS int) ([]Chunk, error) {
-	probe, err := ProbeFile(ctx, path)
+	return chunkify(ctx, path, dstDir, durationMS, overlapMS, ChunkStrategyAdaptive)
+}
+
+func chunkify(ctx context.Context, path, dstDir string, durationMS, overlapMS int, strategy string) ([]Chunk, error) {
+	analysis, err := Analyze(ctx, path, strategy == ChunkStrategyAdaptive)
 	if err != nil {
 		return nil, err
 	}
-	silences, _ := DetectSilence(ctx, path)
-	plan, err := PlanAdaptiveChunks(probe.DurationMS, ChunkPlanOptions{
+	plan, err := PlanAdaptiveChunks(analysis.DurationMS, ChunkPlanOptions{
 		DurationMS:   durationMS,
 		OverlapMS:    overlapMS,
-		Strategy:     ChunkStrategyAdaptive,
-		SilenceSpans: silences,
+		Strategy:     strategy,
+		SilenceSpans: analysis.Silences,
 	})
 	if err != nil {
 		return nil, err
 	}
-	return extractChunkPlan(ctx, path, dstDir, plan)
+	return ExtractChunks(ctx, path, dstDir, plan)
 }
 
-func extractChunkPlan(ctx context.Context, path, dstDir string, plan []Chunk) ([]Chunk, error) {
+// ExtractChunks writes each planned chunk under dstDir as 16 kHz mono PCM WAV.
+func ExtractChunks(ctx context.Context, path, dstDir string, plan []Chunk) ([]Chunk, error) {
 	chunks := make([]Chunk, 0, len(plan))
 	for _, planned := range plan {
 		out := filepath.Join(dstDir, fmt.Sprintf("chunk_%03d.wav", planned.Index))
@@ -361,8 +417,10 @@ func absInt(v int) int {
 }
 
 var (
-	silenceStartRE = regexp.MustCompile(`silence_start:\s*([0-9.]+)`)
-	silenceEndRE   = regexp.MustCompile(`silence_end:\s*([0-9.]+)`)
+	// silencedetect can report a slightly negative silence_start for audio
+	// that opens with silence; secondsStringToMS clamps it to zero.
+	silenceStartRE = regexp.MustCompile(`silence_start:\s*(-?[0-9.]+)`)
+	silenceEndRE   = regexp.MustCompile(`silence_end:\s*(-?[0-9.]+)`)
 )
 
 // DetectSilence asks ffmpeg for quiet regions that adaptive chunking can use.
@@ -406,7 +464,7 @@ func ParseSilenceDetectOutput(output []byte) []SilenceSpan {
 
 func secondsStringToMS(s string) int {
 	value, _ := strconv.ParseFloat(s, 64)
-	return int(value * 1000)
+	return max(0, int(value*1000))
 }
 
 // extractChunk shells out to ffmpeg to slice a wav segment.
@@ -429,7 +487,89 @@ func extractChunk(ctx context.Context, src, dst string, startMS, durationMS int)
 	if err != nil {
 		return fmt.Errorf("ffmpeg chunk: %w: %s", err, strings.TrimSpace(string(stderr)))
 	}
+	// ffmpeg exits 0 when seeking past the end of the stream and writes a
+	// header-only WAV. Surface that rather than uploading an empty chunk.
+	dataBytes, err := wavDataBytes(dst)
+	if err != nil {
+		return fmt.Errorf("inspect chunk: %w", err)
+	}
+	if dataBytes == 0 {
+		return fmt.Errorf("chunk at %ss produced no audio (planned beyond the decoded end of the source)", msToTimecode(startMS))
+	}
 	return nil
+}
+
+// wavDataBytes returns the size of the data chunk in a RIFF/WAVE file.
+func wavDataBytes(path string) (int64, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return 0, err
+	}
+	defer f.Close()
+	header := make([]byte, 12)
+	if _, err := io.ReadFull(f, header); err != nil {
+		return 0, fmt.Errorf("read WAV header: %w", err)
+	}
+	if string(header[:4]) != "RIFF" || string(header[8:12]) != "WAVE" {
+		return 0, fmt.Errorf("not a RIFF/WAVE file")
+	}
+	chunk := make([]byte, 8)
+	for {
+		if _, err := io.ReadFull(f, chunk); err != nil {
+			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+				return 0, nil
+			}
+			return 0, err
+		}
+		size := int64(binary.LittleEndian.Uint32(chunk[4:8]))
+		if string(chunk[:4]) == "data" {
+			// Streaming writers may leave the size unset; fall back to the
+			// bytes actually present after the chunk header.
+			if size == 0 || size == 0xFFFFFFFF {
+				pos, err := f.Seek(0, io.SeekCurrent)
+				if err != nil {
+					return 0, err
+				}
+				info, err := f.Stat()
+				if err != nil {
+					return 0, err
+				}
+				return max(0, info.Size()-pos), nil
+			}
+			return size, nil
+		}
+		if _, err := f.Seek(size+size%2, io.SeekCurrent); err != nil {
+			return 0, err
+		}
+	}
+}
+
+// silentMaxVolumeDB matches the silencedetect noise floor used for planning.
+const silentMaxVolumeDB = -35.0
+
+var maxVolumeRE = regexp.MustCompile(`max_volume:\s*(-?[0-9.]+|-inf) dB`)
+
+// IsSilent reports whether the loudest sample in path stays below the
+// silence threshold, so a chunk without speech can be told apart from a
+// failed transcription.
+func IsSilent(ctx context.Context, path string) (bool, error) {
+	cmd := exec.CommandContext(ctx, "ffmpeg", "-hide_banner", "-nostdin", "-nostats", "-i", path, "-vn", "-af", "volumedetect", "-f", "null", "-")
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return false, fmt.Errorf("ffmpeg volumedetect: %w: %s", err, lastLines(string(output), 5))
+	}
+	match := maxVolumeRE.FindSubmatch(output)
+	if match == nil {
+		return false, fmt.Errorf("ffmpeg volumedetect reported no max_volume")
+	}
+	if string(match[1]) == "-inf" {
+		return true, nil
+	}
+	db, err := strconv.ParseFloat(string(match[1]), 64)
+	if err != nil {
+		return false, fmt.Errorf("parse max_volume: %w", err)
+	}
+	return db < silentMaxVolumeDB, nil
 }
 
 func msToTimecode(ms int) string {

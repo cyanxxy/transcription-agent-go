@@ -38,6 +38,22 @@ func TestM4AUsesInteractionsAudioType(t *testing.T) {
 	}
 }
 
+func TestInteractionAudioMIMEReplacesNonEnumUploadTypes(t *testing.T) {
+	cases := []struct{ path, uploaded, want string }{
+		{"chunk_000.wav", "audio/x-wav", "audio/wav"},
+		{"chunk_000.wav", "audio/vnd.wave", "audio/wav"},
+		{"talk.flac", "audio/x-flac", "audio/flac"},
+		{"talk.mp3", "audio/mpeg", "audio/mpeg"},
+		{"talk.ogg", "Audio/OGG", "audio/ogg"},
+		{"talk.mp3", "", "audio/mp3"},
+	}
+	for _, tc := range cases {
+		if got := interactionAudioMIME(tc.path, tc.uploaded); got != tc.want {
+			t.Errorf("interactionAudioMIME(%q, %q) = %q, want %q", tc.path, tc.uploaded, got, tc.want)
+		}
+	}
+}
+
 func TestMergeChunksDropsOverlap(t *testing.T) {
 	left := []models.TranscriptSegment{
 		seg("[00:00:00]", "Speaker 1", "hello world"),

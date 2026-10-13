@@ -72,6 +72,7 @@ type server struct {
 	apiKey           string
 	apiKeyMu         sync.RWMutex
 	apiKeyFromEnv    bool
+	speechKeys       speechCredentials // saved in the UI; guarded by apiKeyMu
 	credentialsReady chan struct{}
 	credentialsOnce  sync.Once
 	authToken        string // optional shared bearer token required for POST /api/jobs
@@ -182,10 +183,16 @@ func main() {
 		}
 		s.apiKey = key
 	}
+	speechKeys, err := loadSavedSpeechCredentials(s.jobDir)
+	if err != nil {
+		logger.Error("load saved speech credentials", "error", err)
+		os.Exit(1)
+	}
+	s.speechKeys = speechKeys
 	if s.hasProviderCredentials() {
 		s.credentialsOnce.Do(func() { close(s.credentialsReady) })
 	} else {
-		logger.Warn("no provider credentials configured: open the local web page to add a Gemini API key")
+		logger.Warn("no provider credentials configured: open the local web page and add an API key under Keys")
 	}
 	s.startJobWorkers(recoverable)
 
@@ -285,6 +292,7 @@ func (s *server) routes() http.Handler {
 	mux.Handle("/api/jobs", s.withAuth(http.HandlerFunc(s.handleCreateJob)))
 	mux.HandleFunc("/api/config", s.handleConfig)
 	mux.Handle("/api/config/gemini-key", s.withAuth(http.HandlerFunc(s.handleGeminiKey)))
+	mux.Handle("/api/config/keys", s.withAuth(http.HandlerFunc(s.handleProviderKey)))
 	mux.HandleFunc("/api/jobs/", s.handleJob)
 	mux.HandleFunc("/healthz", s.handleHealthz)
 	mux.HandleFunc("/readyz", s.handleReadyz)
@@ -466,7 +474,7 @@ func (s *server) withSecurityHeaders(next http.Handler) http.Handler {
 		// Strict CSP: load nothing from third parties; allow inline styles
 		// because the dropzone hint relies on basic inline rules.
 		h.Set("Content-Security-Policy",
-			"default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'")
+			"default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; media-src 'self' blob:; connect-src 'self'; frame-ancestors 'none'")
 		next.ServeHTTP(w, r)
 	})
 }
@@ -638,7 +646,7 @@ func (s *server) buildOptions(r *http.Request) []config.TranscriptionOption {
 	values := map[string]string{}
 	for _, key := range []string{
 		"model_name", "judge_model_name", "candidate_strategy", "service_tier",
-		"transcription_thinking_level", "judge_thinking_level", "use_judge_pipeline",
+		"transcription_thinking_level", "judge_thinking_level", "use_judge_pipeline", "speech_review",
 		"auto_format", "remove_fillers", "chunk_strategy", "chunk_duration_ms",
 		"chunk_overlap_ms", "chunk_concurrency", "skill_router", "agentic_mode",
 	} {
@@ -652,6 +660,10 @@ func (s *server) buildOptions(r *http.Request) []config.TranscriptionOption {
 func (s *server) buildOptionsFromValues(values map[string]string) []config.TranscriptionOption {
 	opts := []config.TranscriptionOption{}
 	add := func(o config.TranscriptionOption) { opts = append(opts, o) }
+	if meta, azureKey, azureEndpoint := s.savedSpeechCredentials(); meta != "" || azureKey != "" {
+		add(config.WithMetaAPIKey(meta))
+		add(config.WithAzureSpeech(azureKey, azureEndpoint))
+	}
 	agentMaxTokens := s.agentMaxTokens
 	if agentMaxTokens == 0 {
 		agentMaxTokens = defaultAgentMaxTokens
@@ -687,6 +699,9 @@ func (s *server) buildOptionsFromValues(values map[string]string) []config.Trans
 	}
 	if v := values["use_judge_pipeline"]; v != "" {
 		add(config.WithUseJudgePipeline(parseBool(v, true)))
+	}
+	if v := values["speech_review"]; v != "" {
+		add(config.WithSpeechReview(parseBool(v, false)))
 	}
 	if v := values["auto_format"]; v != "" {
 		add(config.WithAutoFormat(parseBool(v, true)))
@@ -728,12 +743,21 @@ func (s *server) buildOptionsFromValues(values map[string]string) []config.Trans
 
 func buildUserContext(r *http.Request) *models.TranscriptContext {
 	values := map[string]string{}
-	for _, key := range []string{"topic", "custom_instructions", "language_hints", "expected_format", "speakers", "technical_terms", "keywords"} {
+	for _, key := range []string{"topic", "custom_instructions", "language_hints", "language_codes", "expected_format", "speakers", "technical_terms", "keywords"} {
 		if value := r.FormValue(key); value != "" {
 			values[key] = value
 		}
 	}
 	return buildUserContextFromValues(values)
+}
+
+// validateJobForm rejects user context fields that would otherwise fail the
+// provider request after the job was accepted.
+func validateJobForm(values map[string]string) error {
+	if _, err := models.ParseLanguageCodes(values["language_codes"]); err != nil {
+		return fmt.Errorf("language_codes: %w", err)
+	}
+	return nil
 }
 
 func buildUserContextFromValues(values map[string]string) *models.TranscriptContext {
@@ -746,6 +770,11 @@ func buildUserContextFromValues(values map[string]string) *models.TranscriptCont
 	}
 	if v := values["language_hints"]; v != "" {
 		ctx.LanguageHints = v
+	}
+	if v := values["language_codes"]; v != "" {
+		// Validated at submission by validateJobForm; a stored value that no
+		// longer parses is dropped rather than failing the queued job.
+		ctx.LanguageCodes, _ = models.ParseLanguageCodes(v)
 	}
 	if v := values["expected_format"]; v != "" {
 		ctx.ExpectedFormat = v
@@ -760,7 +789,7 @@ func buildUserContextFromValues(values map[string]string) *models.TranscriptCont
 		ctx.Keywords = splitCSV(v)
 	}
 	if len(ctx.SpeakerNames) == 0 && ctx.Topic == "" && ctx.CustomInstructions == "" &&
-		len(ctx.TechnicalTerms) == 0 && ctx.LanguageHints == "" && ctx.ExpectedFormat == "" && len(ctx.Keywords) == 0 {
+		len(ctx.TechnicalTerms) == 0 && ctx.LanguageHints == "" && len(ctx.LanguageCodes) == 0 && ctx.ExpectedFormat == "" && len(ctx.Keywords) == 0 {
 		return nil
 	}
 	return &ctx

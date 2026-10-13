@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -243,5 +244,96 @@ func TestDetectSilenceAndChunkifyAdaptive(t *testing.T) {
 	}
 	if chunks[0].BoundaryType != BoundarySilence {
 		t.Fatalf("first adaptive boundary = %q, want %q; spans=%#v chunks=%#v", chunks[0].BoundaryType, BoundarySilence, spans, chunks)
+	}
+}
+
+func requireFFmpeg(t *testing.T) {
+	t.Helper()
+	for _, tool := range []string{"ffmpeg", "ffprobe"} {
+		if _, err := exec.LookPath(tool); err != nil {
+			t.Skipf("%s not found in PATH", tool)
+		}
+	}
+}
+
+func generateAudio(t *testing.T, path string, args ...string) {
+	t.Helper()
+	cmd := exec.Command("ffmpeg", append([]string{"-hide_banner", "-loglevel", "error", "-y"}, append(args, path)...)...)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("generate audio: %v: %s", err, output)
+	}
+}
+
+func TestParseSilenceDetectOutputClampsNegativeStart(t *testing.T) {
+	got := ParseSilenceDetectOutput([]byte("[silencedetect @ 0x1] silence_start: -0.0213\n[silencedetect @ 0x1] silence_end: 1.5 | silence_duration: 1.52\n"))
+	if len(got) != 1 || got[0].StartMS != 0 || got[0].EndMS != 1500 {
+		t.Fatalf("spans = %#v, want leading silence 0-1500ms", got)
+	}
+}
+
+func TestParseProgressDurationMS(t *testing.T) {
+	progress := []byte("out_time_us=N/A\nprogress=continue\nout_time_us=1500000\nout_time_us=302027755\nprogress=end\n")
+	if got := parseProgressDurationMS(progress); got != 302027 {
+		t.Fatalf("duration = %d, want 302027", got)
+	}
+}
+
+// A VBR MP3 without a Xing header makes ffprobe estimate the duration from
+// the first frames' bitrate. Chunk planning must use the decoded length.
+func TestAnalyzeMeasuresDecodedDurationOfVBRWithoutXing(t *testing.T) {
+	requireFFmpeg(t)
+	if out, err := exec.Command("ffmpeg", "-hide_banner", "-encoders").Output(); err != nil || !strings.Contains(string(out), "libmp3lame") {
+		t.Skip("ffmpeg lacks libmp3lame")
+	}
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "vbr.mp3")
+	generateAudio(t, path,
+		"-f", "lavfi", "-i", "sine=f=440:d=30,apad=pad_dur=2",
+		"-f", "lavfi", "-i", "anoisesrc=d=30:a=0.3",
+		"-filter_complex", "[0][1]concat=n=2:v=0:a=1",
+		"-c:a", "libmp3lame", "-q:a", "4", "-write_xing", "0")
+	analysis, err := Analyze(ctx, path, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if analysis.DurationMS < 61500 || analysis.DurationMS > 62500 {
+		t.Fatalf("decoded duration = %dms, want ~62000ms", analysis.DurationMS)
+	}
+	if len(analysis.Silences) == 0 {
+		t.Fatal("expected the 2s pad to be detected as silence in the same pass")
+	}
+	chunks, err := Chunkify(ctx, path, t.TempDir(), 20000, 2000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if last := chunks[len(chunks)-1]; last.EndMS != analysis.DurationMS {
+		t.Fatalf("last chunk ends at %dms, want the decoded end %dms", last.EndMS, analysis.DurationMS)
+	}
+}
+
+func TestExtractChunksRejectsChunkPastEnd(t *testing.T) {
+	requireFFmpeg(t)
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "short.wav")
+	generateAudio(t, path, "-f", "lavfi", "-i", "sine=f=440:sample_rate=16000:d=5")
+	plan := []Chunk{{Index: 0, StartMS: 10000, EndMS: 20000, DurationMS: 10000}}
+	if _, err := ExtractChunks(ctx, path, t.TempDir(), plan); err == nil || !strings.Contains(err.Error(), "produced no audio") {
+		t.Fatalf("err = %v, want an empty-chunk error", err)
+	}
+}
+
+func TestIsSilent(t *testing.T) {
+	requireFFmpeg(t)
+	ctx := context.Background()
+	dir := t.TempDir()
+	quiet := filepath.Join(dir, "quiet.wav")
+	tone := filepath.Join(dir, "tone.wav")
+	generateAudio(t, quiet, "-f", "lavfi", "-i", "anullsrc=channel_layout=mono:sample_rate=16000", "-t", "3")
+	generateAudio(t, tone, "-f", "lavfi", "-i", "sine=f=440:sample_rate=16000:d=3")
+	if silent, err := IsSilent(ctx, quiet); err != nil || !silent {
+		t.Fatalf("IsSilent(quiet) = %v, %v", silent, err)
+	}
+	if silent, err := IsSilent(ctx, tone); err != nil || silent {
+		t.Fatalf("IsSilent(tone) = %v, %v", silent, err)
 	}
 }

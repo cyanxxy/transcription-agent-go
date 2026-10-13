@@ -50,6 +50,10 @@ func BuildContextPromptWithSkills(ctx models.TranscriptContext, reg *skills.Regi
 	if strings.TrimSpace(ctx.LanguageHints) != "" {
 		parts = append(parts, "LANGUAGE/ACCENT INFO: "+ctx.LanguageHints)
 	}
+	if len(ctx.LanguageCodes) > 0 {
+		parts = append(parts, "EXPECTED LANGUAGES (BCP-47): "+strings.Join(ctx.LanguageCodes, ", "))
+		parts = append(parts, "Transcribe each language as spoken; do not translate.")
+	}
 	if len(ctx.Keywords) > 0 {
 		parts = append(parts, "KEYWORDS TO VERIFY: "+strings.Join(ctx.Keywords, ", "))
 	}

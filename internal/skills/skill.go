@@ -45,6 +45,11 @@ func (s Skill) candidatePlan(primaryModel, parakeetModel string) []config.Candid
 		}
 		if kind == "gemini" {
 			model = config.NormalizeGeminiModelName(model)
+			// @model resolves to Meta or Microsoft when a speech model is
+			// reviewed; those run as speech candidates, not Gemini ones.
+			if config.IsExternalSpeechModel(model) {
+				kind = "speech"
+			}
 		}
 		spec := config.CandidateSpec{Kind: kind, ModelName: model}
 		switch kind {

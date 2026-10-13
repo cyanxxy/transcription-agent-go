@@ -74,11 +74,24 @@ type AudioChunkMetadata struct {
 }
 
 // TranscriptSegment is one utterance with timestamp, speaker, and text.
+// Start and End are precise offsets in seconds when the provider reported
+// word or turn timing; Timestamp is always present at whole-second precision.
 type TranscriptSegment struct {
 	Timestamp  string   `json:"timestamp"`
 	Speaker    string   `json:"speaker"`
 	Text       string   `json:"text"`
 	Confidence *float64 `json:"confidence,omitempty"`
+	Start      *float64 `json:"start,omitempty"`
+	End        *float64 `json:"end,omitempty"`
+}
+
+// StartSeconds returns the precise start when known, else the timestamp.
+func (s TranscriptSegment) StartSeconds() float64 {
+	if s.Start != nil {
+		return *s.Start
+	}
+	seconds, _ := ParseTimestampSeconds(s.Timestamp)
+	return seconds
 }
 
 // timestampRE accepts the canonical [HH:MM:SS] form, but allows hours to grow
@@ -240,8 +253,48 @@ type TranscriptContext struct {
 	TechnicalTerms     []string `json:"technical_terms,omitempty"`
 	CustomInstructions string   `json:"custom_instructions,omitempty"`
 	LanguageHints      string   `json:"language_hints,omitempty"`
+	LanguageCodes      []string `json:"language_codes,omitempty"`
 	ExpectedFormat     string   `json:"expected_format,omitempty"`
 	Keywords           []string `json:"keywords,omitempty"`
+}
+
+// MaxLanguageCodes bounds user-supplied language hints.
+const MaxLanguageCodes = 10
+
+// languageCodeRE accepts BCP-47 language[-script][-region] tags such as
+// en, en-US, es-419, and cmn-Hans-CN.
+var languageCodeRE = regexp.MustCompile(`^([A-Za-z]{2,3})(?:-([A-Za-z]{4}))?(?:-([A-Za-z]{2}|[0-9]{3}))?$`)
+
+// ParseLanguageCodes splits a comma- or whitespace-separated list of BCP-47
+// language codes, canonicalizes their case (en-us -> en-US, cmn-hans-cn ->
+// cmn-Hans-CN), and drops duplicates. Any malformed entry is an error so a
+// typo is reported up front instead of failing the provider request.
+func ParseLanguageCodes(raw string) ([]string, error) {
+	fields := strings.FieldsFunc(raw, func(r rune) bool { return r == ',' || r == ';' || r == ' ' || r == '\t' || r == '\n' })
+	codes := make([]string, 0, len(fields))
+	seen := map[string]bool{}
+	for _, field := range fields {
+		match := languageCodeRE.FindStringSubmatch(strings.ReplaceAll(field, "_", "-"))
+		if match == nil {
+			return nil, fmt.Errorf("invalid language code %q (use BCP-47 codes such as en-US or nl-NL)", field)
+		}
+		code := strings.ToLower(match[1])
+		if match[2] != "" {
+			code += "-" + strings.ToUpper(match[2][:1]) + strings.ToLower(match[2][1:])
+		}
+		if match[3] != "" {
+			code += "-" + strings.ToUpper(match[3])
+		}
+		if seen[code] {
+			continue
+		}
+		seen[code] = true
+		codes = append(codes, code)
+	}
+	if len(codes) > MaxLanguageCodes {
+		return nil, fmt.Errorf("at most %d language codes are supported", MaxLanguageCodes)
+	}
+	return codes, nil
 }
 
 // AgentRunStatus describes the lifecycle of the adaptive transcription run.
