@@ -521,13 +521,13 @@ func TestParakeetAlignRejectsContentMutation(t *testing.T) {
 
 func TestParseCommandArgsSupportsQuotesEscapesAndEmptyArguments(t *testing.T) {
 	command := `"/tmp/sidecar tools/python" --model 'nemo model' plain\ value prefix" suffix" "" --pattern "\\d+"`
-	got, err := parseCommandArgs(command)
+	got, err := parseCommandArgsFor(command, false)
 	if err != nil {
 		t.Fatalf("parseCommandArgs: %v", err)
 	}
 	want := []string{"/tmp/sidecar tools/python", "--model", "nemo model", "plain value", "prefix suffix", "", "--pattern", `\d+`}
 	if len(got) != len(want) {
-		t.Fatalf("parseCommandArgs(%q) = %#v, want %#v", command, got, want)
+		t.Fatalf("parseCommandArgsFor(%q, posix) = %#v, want %#v", command, got, want)
 	}
 	for i := range want {
 		if got[i] != want[i] {
@@ -538,8 +538,8 @@ func TestParseCommandArgsSupportsQuotesEscapesAndEmptyArguments(t *testing.T) {
 
 func TestParseCommandArgsRejectsMalformedQuotes(t *testing.T) {
 	for _, command := range []string{`sidecar "unterminated`, `sidecar 'unterminated`, `sidecar trailing\`} {
-		if _, err := parseCommandArgs(command); err == nil {
-			t.Errorf("parseCommandArgs(%q) succeeded, want error", command)
+		if _, err := parseCommandArgsFor(command, false); err == nil {
+			t.Errorf("parseCommandArgsFor(%q, posix) succeeded, want error", command)
 		}
 	}
 }

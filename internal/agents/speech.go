@@ -168,6 +168,10 @@ func transcribeSpeechUnits(ctx context.Context, d *config.TranscriptionDeps, pat
 		req.Header.Set("Content-Type", writer.FormDataContentType())
 		req.Header.Set(header, auth+key)
 		res, err := httpClient.Do(req)
+		// The transport normally closes the body, but close it explicitly so
+		// the temporary request file can always be removed (Windows refuses
+		// to delete open files).
+		_ = file.Close()
 		if err != nil {
 			if ctx.Err() != nil {
 				return nil, ctx.Err()

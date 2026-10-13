@@ -1057,7 +1057,7 @@ func TestExportJobRequiresResult(t *testing.T) {
 }
 
 func TestTranscriptTitle(t *testing.T) {
-	for in, want := range map[string]string{"Team Sync.m4a": "Team Sync", "a/b\\c:d.mp3": "bcd", "": "Transcript", "audio.bin": "Transcript", "x\"y.wav": "xy"} {
+	for in, want := range map[string]string{"Team Sync.m4a": "Team Sync", "a/b\\c:d.mp3": "cd", "": "Transcript", "audio.bin": "Transcript", "x\"y.wav": "xy"} {
 		if got := transcriptTitle(in); got != want {
 			t.Errorf("transcriptTitle(%q) = %q, want %q", in, got, want)
 		}

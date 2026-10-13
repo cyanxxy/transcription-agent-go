@@ -186,6 +186,7 @@ func TestMicrosoftSpeechForcesSingleLocaleOnly(t *testing.T) {
 		}
 		var locales any
 		client := &http.Client{Transport: speechTransport(func(r *http.Request) (*http.Response, error) {
+			defer r.Body.Close()
 			var definition map[string]any
 			_ = json.Unmarshal([]byte(r.FormValue("definition")), &definition)
 			locales = definition["locales"]

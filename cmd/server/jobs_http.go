@@ -486,7 +486,9 @@ func (s *server) exportJobHTTP(w http.ResponseWriter, r *http.Request, jb *job) 
 // transcriptTitle names exports after the uploaded file, without its
 // extension or characters that are unsafe in a download name.
 func transcriptTitle(filename string) string {
-	base := strings.TrimSuffix(filepath.Base(filename), filepath.Ext(filename))
+	// Browsers may send either separator, so strip both on every platform.
+	name := filename[strings.LastIndexAny(filename, `/\`)+1:]
+	base := strings.TrimSuffix(name, filepath.Ext(name))
 	base = strings.Map(func(r rune) rune {
 		if r < 0x20 || r == 0x7f || strings.ContainsRune(`/\:*?"<>|`, r) {
 			return -1
