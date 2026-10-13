@@ -36,6 +36,9 @@ type TimedUnit struct {
 const (
 	segmentPauseMS  = 2000
 	segmentLengthMS = 20000
+	// segmentOverlapToleranceMS absorbs provider timing granularity (about
+	// 100 ms) when deciding whether a speaker was still talking.
+	segmentOverlapToleranceMS = 250
 )
 
 // labelSpeakersInOrder maps provider labels to "Speaker N" in order of first
@@ -64,48 +67,77 @@ func labelSpeakersInOrder(units []TimedUnit) []TimedUnit {
 // segmentsFromUnits groups labeled units into speaker turns, splitting on
 // speaker changes, pauses, long utterances, sentence endings, and provider
 // turn boundaries. Timestamps are formatted once from absolute milliseconds.
+//
+// Each speaker has its own open segment. A speaker's segment closes once
+// someone else speaks after they have fallen silent, but stays open while
+// another speaker talks over them, so overlapping speech becomes one segment
+// per speaker (with overlapping Start/End) instead of alternating one-word
+// fragments. Segments are emitted in the order they started.
 func segmentsFromUnits(units []TimedUnit) ([]models.TranscriptSegment, error) {
-	var segments []models.TranscriptSegment
-	var words []string
-	var speaker string
-	var start, end, previousEnd int64
-	var timed bool
-	flush := func() {
-		if len(words) == 0 {
-			return
+	type pending struct {
+		words      []string
+		speaker    string
+		start, end int64
+		timed      bool
+	}
+	var done []*pending
+	var open []*pending // open segments, at most one per speaker
+	closeWhere := func(match func(*pending) bool) {
+		kept := open[:0]
+		for _, seg := range open {
+			if !match(seg) {
+				kept = append(kept, seg)
+			}
 		}
-		segment := models.TranscriptSegment{
-			Timestamp: models.FormatTimestamp(float64(start) / 1000),
-			Speaker:   speaker,
-			Text:      strings.Join(words, " "),
-		}
-		if timed {
-			startSeconds, endSeconds := float64(start)/1000, float64(max(end, start))/1000
-			segment.Start, segment.End = &startSeconds, &endSeconds
-		}
-		segments = append(segments, segment)
-		words = nil
+		clear(open[len(kept):])
+		open = kept
 	}
 	for _, unit := range units {
 		text := strings.TrimSpace(unit.Text)
 		if text == "" {
 			continue
 		}
-		if len(words) > 0 && (unit.Speaker != speaker || unit.Untimed ||
-			unit.StartMS-previousEnd > segmentPauseMS || unit.StartMS-start >= segmentLengthMS) {
-			flush()
+		if unit.Untimed {
+			closeWhere(func(*pending) bool { return true })
+			done = append(done, &pending{words: []string{text}, speaker: unit.Speaker, start: unit.StartMS, end: unit.StartMS})
+			continue
 		}
-		if len(words) == 0 {
-			start, end, speaker, timed = unit.StartMS, unit.StartMS, unit.Speaker, !unit.Untimed
+		var seg *pending
+		closeWhere(func(other *pending) bool {
+			if other.speaker != unit.Speaker {
+				// Silent before this unit began: the turn passed to unit.Speaker.
+				return unit.StartMS > other.end+segmentOverlapToleranceMS
+			}
+			if unit.StartMS-other.end > segmentPauseMS || unit.StartMS-other.start >= segmentLengthMS {
+				return true
+			}
+			seg = other
+			return false
+		})
+		if seg == nil {
+			seg = &pending{speaker: unit.Speaker, start: unit.StartMS, end: unit.StartMS, timed: true}
+			open = append(open, seg)
+			done = append(done, seg)
 		}
-		words = append(words, text)
-		end = max(end, unit.EndMS, unit.StartMS)
-		previousEnd = max(previousEnd, unit.EndMS, unit.StartMS)
-		if unit.Turn || unit.Untimed || endsSentence(text) {
-			flush()
+		seg.words = append(seg.words, text)
+		seg.end = max(seg.end, unit.EndMS, unit.StartMS)
+		if unit.Turn || endsSentence(text) {
+			closeWhere(func(other *pending) bool { return other == seg })
 		}
 	}
-	flush()
+	segments := make([]models.TranscriptSegment, 0, len(done))
+	for _, seg := range done {
+		segment := models.TranscriptSegment{
+			Timestamp: models.FormatTimestamp(float64(seg.start) / 1000),
+			Speaker:   seg.speaker,
+			Text:      strings.Join(seg.words, " "),
+		}
+		if seg.timed {
+			startSeconds, endSeconds := float64(seg.start)/1000, float64(max(seg.end, seg.start))/1000
+			segment.Start, segment.End = &startSeconds, &endSeconds
+		}
+		segments = append(segments, segment)
+	}
 	return validateAndCleanSegments(segments)
 }
 

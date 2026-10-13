@@ -144,6 +144,58 @@ func TestSegmentsFromUnitsFormatsAbsoluteTimestampOnce(t *testing.T) {
 	}
 }
 
+func segmentLines(t *testing.T, units []TimedUnit) []string {
+	t.Helper()
+	segments, err := segmentsFromUnits(units)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := make([]string, 0, len(segments))
+	for _, segment := range segments {
+		out = append(out, segment.Speaker+": "+segment.Text)
+	}
+	return out
+}
+
+// Word timings from a real recording where two people spoke at once; grouping
+// by speaker change alone produced seven one- and two-word segments.
+func TestSegmentsFromUnitsGroupsOverlappingSpeechBySpeaker(t *testing.T) {
+	unit := func(speaker string, start, end int64, text string) TimedUnit {
+		return TimedUnit{Text: text, Speaker: speaker, StartMS: start, EndMS: end}
+	}
+	got := segmentLines(t, []TimedUnit{
+		unit("Speaker 5", 692221, 692321, "Or"),
+		unit("Speaker 5", 692321, 692421, "is"),
+		unit("Speaker 1", 692321, 692421, "You"),
+		unit("Speaker 5", 692421, 692521, "the"),
+		unit("Speaker 1", 692421, 692521, "mean"),
+		unit("Speaker 5", 692521, 692721, "quantity"),
+		unit("Speaker 1", 692521, 692821, "the"),
+		unit("Speaker 1", 692821, 693121, "content?"),
+		unit("Speaker 5", 693321, 693621, "fixed?"),
+		unit("Speaker 5", 694021, 694321, "Yeah,"),
+	})
+	want := []string{"Speaker 5: Or is the quantity fixed?", "Speaker 1: You mean the content?", "Speaker 5: Yeah,"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("segments = %q, want %q", got, want)
+	}
+}
+
+func TestSegmentsFromUnitsKeepsTurnTakingAndBackchannels(t *testing.T) {
+	// Speakers who take turns without overlapping keep separate segments.
+	turns := append(append(words("A", 0, "so"), words("B", 600, "right")...), words("A", 1200, "anyway")...)
+	if got, want := segmentLines(t, turns), []string{"A: so", "B: right", "A: anyway"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("turns = %q, want %q", got, want)
+	}
+	// A backchannel spoken over a sentence no longer splits that sentence.
+	sentence := words("A", 0, "we fix the price on the spot every month")
+	backchannel := TimedUnit{Text: "Yeah.", Speaker: "B", StartMS: 1000, EndMS: 1200}
+	units := append(append(append([]TimedUnit(nil), sentence[:4]...), backchannel), sentence[4:]...)
+	if got, want := segmentLines(t, units), []string{"A: we fix the price on the spot every month", "B: Yeah."}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("backchannel = %q, want %q", got, want)
+	}
+}
+
 func TestTranscribeSendsLanguageCodes(t *testing.T) {
 	var got any
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
