@@ -23,3 +23,7 @@ go.work.sum
 
 # Runtime job storage (uploads, journals, and generated results)
 /data/
+
+# Local agent instructions
+AGENTS.md
+CLAUDE.md
