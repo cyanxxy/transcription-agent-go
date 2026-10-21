@@ -18,7 +18,7 @@
 - **Who said what, and when.** Speaker labels and timestamps on every line, with a timeline you can click to play any moment.
 - **Long recordings just work.** Audio is split at pauses, transcribed in parallel, and stitched back together without repeated text.
 - **Export anywhere.** Word, Markdown, text, SRT, WebVTT, CSV, or JSON — rename speakers at export time.
-- **Your choice of model.** Gemini 3.5 Transcribe by default, or Microsoft MAI-Transcribe-2, Meta Muse Voice, and Gemini Flash with a review judge.
+- **Your choice of model.** Gemini 3.5 Transcribe by default, or Microsoft MAI-Transcribe-2, Meta Muse Voice, and Gemini 3.8 Flash, 3.5 Flash-Lite, or 4 Argon with a review judge.
 - **Built to run.** A web app (Transcription Studio) and a single-binary CLI; jobs survive restarts; runs on Linux, macOS, Windows, and Docker.
 
 ## Quickstart
@@ -82,8 +82,9 @@ Keys are stored on the server with owner-only permissions and never reach the br
 | `muse-voice-transcribe-1.0` | Meta speech-to-text |
 | `gemini-3.8-flash` | Hard audio: compares candidates and judges each section |
 | `gemini-3.5-flash-lite` | The same review pipeline at lower cost |
+| `gemini-4-argon` | The review pipeline with Gemini's deepest reasoning; slowest and most expensive, with no free tier |
 
-Speech models can also opt into the judge with **Double-check with a judge** (`--speech-review`).
+Speech models can also opt into the judge with **Double-check with a judge** (`--speech-review`). Gemini 3.8 Flash, 3.5 Flash-Lite, and 4 Argon can each be the judge (`--judge-model`); Argon takes `low`, `medium`, or `high` thinking.
 
 ## CLI
 

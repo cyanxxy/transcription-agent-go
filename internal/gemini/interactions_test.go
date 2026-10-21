@@ -611,6 +611,15 @@ func TestGemini38UsesBetaInteractions(t *testing.T) {
 	}
 }
 
+// Gemini 4 Argon's Interactions support is in preview, served from v1beta.
+func TestGemini4ArgonUsesBetaInteractions(t *testing.T) {
+	for _, tier := range []string{"", "standard", "flex", "priority"} {
+		if got := interactionAPIVersion("gemini-4-argon", tier); got != "v1beta" {
+			t.Errorf("tier %q uses %s", tier, got)
+		}
+	}
+}
+
 func TestCurrentInteractionDiagnostics(t *testing.T) {
 	var response Interaction
 	if err := json.Unmarshal([]byte(`{"status":"failed","errors":[{"code":"quota_exceeded","message":"try later"}]}`), &response); err != nil {

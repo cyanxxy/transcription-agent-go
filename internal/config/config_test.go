@@ -32,6 +32,36 @@ func TestGemini38ThinkingLevels(t *testing.T) {
 	}
 }
 
+func TestGemini4ArgonThinkingLevels(t *testing.T) {
+	for _, level := range []string{"minimal", "low", "medium", "high"} {
+		deps, err := NewTranscriptionDeps("test", WithModelName("gemini-4-argon"), WithJudgeModelName("gemini-4-argon"), WithThinkingLevels(level, level))
+		if deps != nil {
+			deps.Cleanup()
+		}
+		if (err != nil) != (level == "minimal") {
+			t.Errorf("level=%s error=%v", level, err)
+		}
+	}
+}
+
+func TestCappedOutputTokens(t *testing.T) {
+	cases := []struct {
+		model             string
+		configured, limit int
+		want              int
+	}{
+		{"gemini-3.8-flash", 65536, 4096, 4096},
+		{"gemini-4-argon", 65536, 4096, 32768},
+		{"gemini-4-argon", 16384, 4096, 16384},
+		{"gemini-3.8-flash", 2048, 4096, 2048},
+	}
+	for _, c := range cases {
+		if got := CappedOutputTokens(c.model, c.configured, c.limit); got != c.want {
+			t.Errorf("CappedOutputTokens(%q, %d, %d) = %d, want %d", c.model, c.configured, c.limit, got, c.want)
+		}
+	}
+}
+
 func TestNormalizeGeminiModelName(t *testing.T) {
 	cases := map[string]string{
 		"gemini-3.8-flash":                  "gemini-3.8-flash",

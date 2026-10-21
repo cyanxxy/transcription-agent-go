@@ -38,6 +38,7 @@ var SupportedGeminiModels = map[string]struct{}{
 	DefaultTranscriptionModel: {},
 	"gemini-3.5-flash-lite":   {},
 	"gemini-3.8-flash":        {},
+	"gemini-4-argon":          {},
 }
 
 // GeminiModelAliases redirects deprecated model names to their current ones.
@@ -52,12 +53,28 @@ var GeminiModelLabels = map[string]string{
 	DefaultTranscriptionModel: "Gemini 3.5 Transcribe",
 	"gemini-3.5-flash-lite":   "Gemini 3.5 Flash-Lite",
 	"gemini-3.8-flash":        "Gemini 3.8 Flash",
+	"gemini-4-argon":          "Gemini 4 Argon",
 }
 
 // GeminiModelThinkingLevels lists the legal thinking levels per model.
 var GeminiModelThinkingLevels = map[string]map[string]struct{}{
 	"gemini-3.5-flash-lite": {"minimal": {}, "low": {}, "medium": {}, "high": {}},
 	"gemini-3.8-flash":      {"low": {}, "medium": {}, "high": {}},
+	"gemini-4-argon":        {"low": {}, "medium": {}, "high": {}},
+}
+
+// GeminiModelMinOutputTokens raises small per-request output caps for models
+// whose thinking counts against max_output_tokens and runs long. Google
+// recommends at least 32,768 for Gemini 4 Argon so reasoning does not crowd
+// out the answer.
+var GeminiModelMinOutputTokens = map[string]int{
+	"gemini-4-argon": 32768,
+}
+
+// CappedOutputTokens applies a request-specific output cap without dropping
+// below the model's minimum, and never exceeds the configured maximum.
+func CappedOutputTokens(model string, configured, limit int) int {
+	return min(configured, max(limit, GeminiModelMinOutputTokens[model]))
 }
 
 // SupportedCandidateStrategies is the allow-list of candidate plans.

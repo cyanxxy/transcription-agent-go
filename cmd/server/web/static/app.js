@@ -10,6 +10,7 @@
     'muse-voice-transcribe-1.0': { label: 'Meta Muse Voice', provider: 'meta', direct: true, languages: false },
     'gemini-3.8-flash': { label: 'Gemini 3.8 Flash', provider: 'gemini', direct: false, languages: true },
     'gemini-3.5-flash-lite': { label: 'Gemini 3.5 Flash-Lite', provider: 'gemini', direct: false, languages: true },
+    'gemini-4-argon': { label: 'Gemini 4 Argon', provider: 'gemini', direct: false, languages: true },
   };
   const PROVIDERS = { gemini: 'Gemini', microsoft: 'Microsoft', meta: 'Meta' };
 

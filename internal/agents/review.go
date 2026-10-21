@@ -75,7 +75,7 @@ func (a *GlobalReviewAgent) Run(ctx context.Context, spans []models.SpanRun) (*m
 			},
 		}},
 		GenerationConfig: &gemini.InteractionGenerationConfig{
-			MaxOutputTokens: min(a.Deps.Transcription.MaxOutputTokens, 4096),
+			MaxOutputTokens: config.CappedOutputTokens(a.Deps.Transcription.JudgeModelName, a.Deps.Transcription.MaxOutputTokens, 4096),
 			ThinkingLevel:   a.Deps.Transcription.JudgeThinkingLevel,
 		},
 		ResponseFormat: &gemini.InteractionResponseFormat{Type: "text", MIMEType: "application/json", Schema: globalReviewSchema},
