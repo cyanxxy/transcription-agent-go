@@ -1,9 +1,13 @@
 name: ci
 
+# Docs-only changes skip CI. .skills/*.md is runtime content, so it is not
+# ignored.
 on:
   push:
     branches: [main]
+    paths-ignore: [README.md, LICENSE, 'docs/**']
   pull_request:
+    paths-ignore: [README.md, LICENSE, 'docs/**']
   workflow_dispatch:
 
 permissions:
@@ -15,10 +19,11 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  linux:
-    name: linux · lint · test · build
+  # Static checks run beside the test jobs instead of before them.
+  lint:
+    name: lint · vet · vulncheck
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7.0.1
 
@@ -26,10 +31,6 @@ jobs:
         uses: actions/setup-go@v7.0.0
         with:
           go-version-file: go.mod
-          check-latest: true
-
-      - name: Install ffmpeg
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends ffmpeg
 
       - name: Verify formatting
         run: |
@@ -40,8 +41,23 @@ jobs:
             exit 1
           fi
 
-      - name: go vet
-        run: go vet ./...
+      - name: Verify go.mod and go.sum are tidy
+        run: go mod tidy -diff
+
+      - name: Verify Docker builder matches the go.mod toolchain
+        run: |
+          toolchain=$(sed -n 's/^toolchain go//p' go.mod)
+          if ! grep -q "^FROM golang:${toolchain}-" Dockerfile; then
+            echo "::error file=Dockerfile::builder image must use Go ${toolchain} (the go.mod toolchain)"
+            exit 1
+          fi
+
+      - name: Check web UI script syntax
+        run: node --check cmd/server/web/static/app.js
+
+      # golangci-lint runs govet for Linux; this keeps Windows-only code vetted.
+      - name: go vet (windows)
+        run: GOOS=windows go vet ./...
 
       - name: golangci-lint
         uses: golangci/golangci-lint-action@v9.3.0
@@ -53,13 +69,29 @@ jobs:
       - name: govulncheck
         run: go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
 
+  linux:
+    name: linux · test · build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - name: Set up Go
+        uses: actions/setup-go@v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: Install ffmpeg
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends ffmpeg
+
       - name: Unit tests (race detector)
         run: go test ./... -race -count=1
 
+      # No -trimpath, so the build reuses packages the tests already compiled.
       - name: Build binaries
         run: |
-          go build -trimpath -ldflags "-s -w -X main.version=ci" -o bin/transcription-server ./cmd/server
-          go build -trimpath -ldflags "-s -w -X main.version=ci" -o bin/transcriber-cli ./cmd/cli
+          go build -ldflags "-X main.version=ci" -o bin/transcription-server ./cmd/server
+          go build -ldflags "-X main.version=ci" -o bin/transcriber-cli ./cmd/cli
 
       - name: Server smoke test
         env:
@@ -89,21 +121,17 @@ jobs:
         uses: actions/setup-go@v7.0.0
         with:
           go-version-file: go.mod
-          check-latest: true
 
       - name: Install ffmpeg
         run: choco install ffmpeg --no-progress -y
-
-      - name: go vet
-        run: go vet ./...
 
       - name: Unit tests
         run: go test ./... -count=1
 
       - name: Build binaries
         run: |
-          go build -trimpath -ldflags "-s -w -X main.version=ci" -o bin/transcription-server.exe ./cmd/server
-          go build -trimpath -ldflags "-s -w -X main.version=ci" -o bin/transcriber-cli.exe ./cmd/cli
+          go build -ldflags "-X main.version=ci" -o bin/transcription-server.exe ./cmd/server
+          go build -ldflags "-X main.version=ci" -o bin/transcriber-cli.exe ./cmd/cli
 
       - name: Server smoke test
         shell: pwsh
