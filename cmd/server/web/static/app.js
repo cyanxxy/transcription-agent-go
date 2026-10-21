@@ -199,12 +199,34 @@
     return messageFrom(await response.text(), response.status);
   }
 
+  const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)');
+  const scrollBehavior = () => (reducedMotion.matches ? 'auto' : 'smooth');
+
+  // Show and hide with the CSS enter (@starting-style) and exit (.leaving)
+  // transitions. Showing mid-exit reverses the transition from where it is.
+  const leaveTimers = new WeakMap();
+  function showAnimated(node) {
+    window.clearTimeout(leaveTimers.get(node));
+    node.classList.remove('leaving');
+    node.hidden = false;
+  }
+  function hideAnimated(node, ms) {
+    if (node.hidden) return;
+    node.classList.add('leaving');
+    window.clearTimeout(leaveTimers.get(node));
+    leaveTimers.set(node, window.setTimeout(() => {
+      node.hidden = true;
+      node.classList.remove('leaving');
+    }, ms));
+  }
+  const isShown = (node) => !node.hidden && !node.classList.contains('leaving');
+
   let toastTimer = null;
   function toast(message) {
     toastEl.textContent = message;
-    toastEl.hidden = false;
+    showAnimated(toastEl);
     window.clearTimeout(toastTimer);
-    toastTimer = window.setTimeout(() => { toastEl.hidden = true; }, 2600);
+    toastTimer = window.setTimeout(() => hideAnimated(toastEl, 150), 2600);
   }
 
   function selectedModel() {
@@ -245,49 +267,109 @@
     renderHistory();
   }
 
+  // Per-provider dialog state. Key status itself comes from serverConfig.
+  const keyRows = new Map();
+  document.querySelectorAll('.key-row[data-provider]').forEach((row) => {
+    keyRows.set(row.dataset.provider, { row, editing: false, confirming: false, busy: false });
+  });
+  const tokenFeedback = $('token-feedback');
+
+  function keyStatus(provider) {
+    return ((serverConfig && serverConfig.providers) || {})[provider] || {};
+  }
+
+  function keyInputs(state) {
+    return [...state.row.querySelectorAll('input[data-field]')];
+  }
+
+  function keyInputsReady(state) {
+    return keyInputs(state).every((input) => input.value.trim() !== '');
+  }
+
+  function setRowFeedback(state, text, kind = '') {
+    const node = state.row.querySelector('[data-feedback]');
+    node.textContent = text;
+    node.dataset.state = kind;
+  }
+
+  function setPending(button, label) {
+    button.querySelector('.spinner').hidden = !label;
+    if (label) button.querySelector('[data-label]').textContent = label;
+  }
+
+  function concealKey(state) {
+    state.row.querySelector('input[data-field="api_key"]').type = 'password';
+    const toggle = state.row.querySelector('[data-action="reveal"]');
+    toggle.setAttribute('aria-pressed', 'false');
+    toggle.setAttribute('aria-label', 'Show key');
+  }
+
+  function resetKeyInputs(state) {
+    keyInputs(state).forEach((input) => { input.value = ''; });
+    concealKey(state);
+  }
+
+  function renderKeyRow(provider, state) {
+    const { row } = state;
+    const status = keyStatus(provider);
+    const fromEnv = status.source === 'environment';
+    const manageable = Boolean(serverConfig && serverConfig.can_manage_keys) && !fromEnv;
+    if (!manageable || !status.configured) {
+      state.editing = false;
+      state.confirming = false;
+    }
+    const badge = row.querySelector('[data-status]');
+    badge.dataset.state = status.source || 'missing';
+    badge.textContent = fromEnv ? 'Set by server' : status.configured ? 'Saved' : 'Not set';
+
+    row.querySelector('[data-summary]').hidden = !status.configured || state.editing || state.confirming || (!fromEnv && !manageable);
+    row.querySelector('[data-note]').textContent = fromEnv ? 'Set by an environment variable on the server.' : '';
+    row.querySelector('[data-action="edit"]').hidden = !manageable;
+    row.querySelector('[data-action="remove"]').hidden = !manageable;
+    row.querySelector('[data-confirm]').hidden = !state.confirming;
+    row.querySelector('[data-editor]').hidden = !manageable || (status.configured && !state.editing);
+    row.querySelector('[data-action="cancel-edit"]').hidden = !status.configured;
+
+    const save = row.querySelector('[data-action="save"]');
+    save.disabled = state.busy || !keyInputsReady(state);
+    if (!state.busy) {
+      setPending(save, null);
+      save.querySelector('[data-label]').textContent = status.configured ? 'Replace' : 'Save';
+      const confirm = row.querySelector('[data-action="confirm-remove"]');
+      setPending(confirm, null);
+      confirm.querySelector('[data-label]').textContent = 'Remove';
+    }
+    row.querySelector('[data-action="confirm-remove"]').disabled = state.busy;
+    row.setAttribute('aria-busy', String(state.busy));
+  }
+
   function renderKeys() {
-    const providers = (serverConfig && serverConfig.providers) || {};
     const canManage = Boolean(serverConfig && serverConfig.can_manage_keys);
     $('keys-intro').textContent = canManage
       ? 'Keys are stored on this server, never in your browser. Add a key for each provider you want to use.'
       : 'Keys are stored on the server. To add or change them, open this page on the server computer (localhost).';
-    document.querySelectorAll('.key-row[data-provider]').forEach((row) => {
-      const status = providers[row.dataset.provider] || {};
-      const fromEnv = status.source === 'environment';
-      const badge = row.querySelector('[data-status]');
-      badge.dataset.state = status.source || 'missing';
-      badge.textContent = fromEnv ? 'Set by server' : status.configured ? 'Saved' : 'Not set';
-      row.querySelectorAll('input').forEach((input) => {
-        if (!input.dataset.placeholder) input.dataset.placeholder = input.placeholder;
-        input.disabled = !canManage || fromEnv;
-        if (input.dataset.field === 'api_key') {
-          input.placeholder = status.configured ? 'Paste a new key to replace it' : input.dataset.placeholder;
-        }
-        if (input.dataset.field === 'endpoint' && status.endpoint && !input.value) input.value = status.endpoint;
-      });
-      const save = row.querySelector('[data-action="save"]');
-      save.disabled = !canManage || fromEnv;
-      save.textContent = status.configured ? 'Replace' : 'Save';
-      row.querySelector('[data-action="remove"]').hidden = !canManage || fromEnv || !status.configured;
-    });
+    keyRows.forEach((state, provider) => renderKeyRow(provider, state));
     const anyMissing = requiredProviders(selectedModel(), speechReview.checked).some((p) => !providerConfigured(p));
     $('keys-dot').dataset.state = serverConfig ? (anyMissing ? 'missing' : 'ok') : 'unknown';
   }
 
-  async function updateKey(row, remove) {
-    const provider = row.dataset.provider;
-    const body = { provider };
-    row.querySelectorAll('input[data-field]').forEach((input) => { body[input.dataset.field] = input.value.trim(); });
-    if (!remove && !body.api_key) {
-      keysStatus.textContent = `Paste a ${PROVIDERS[provider]} key first.`;
-      keysStatus.dataset.state = 'error';
-      row.querySelector('input[data-field="api_key"]').focus();
+  async function updateKey(provider, remove) {
+    const state = keyRows.get(provider);
+    if (state.busy) return;
+    if (!remove && !keyInputsReady(state)) {
+      setRowFeedback(state, provider === 'microsoft' ? 'Enter both the key and the endpoint.' : `Paste a ${PROVIDERS[provider]} key first.`, 'error');
+      const empty = keyInputs(state).find((input) => !input.value.trim());
+      if (empty) empty.focus();
       return;
     }
-    const buttons = row.querySelectorAll('button');
-    buttons.forEach((button) => { button.disabled = true; });
-    keysStatus.textContent = remove ? 'Removing…' : 'Saving…';
-    keysStatus.dataset.state = '';
+    const body = { provider };
+    keyInputs(state).forEach((input) => { body[input.dataset.field] = input.value.trim(); });
+    const button = state.row.querySelector(remove ? '[data-action="confirm-remove"]' : '[data-action="save"]');
+    state.busy = true;
+    setRowFeedback(state, '');
+    renderKeyRow(provider, state);
+    setPending(button, remove ? 'Removing…' : 'Saving…');
+    let focusAfter = null;
     try {
       const response = await fetch(remove ? `/api/config/keys?provider=${provider}` : '/api/config/keys', {
         method: remove ? 'DELETE' : 'POST',
@@ -295,43 +377,105 @@
         body: remove ? undefined : JSON.stringify(body),
       });
       if (!response.ok) throw new Error(await errorMessage(response));
-      row.querySelector('input[data-field="api_key"]').value = '';
+      state.editing = false;
+      state.confirming = false;
+      resetKeyInputs(state);
       await loadConfig();
-      keysStatus.textContent = remove ? `${PROVIDERS[provider]} key removed.` : `${PROVIDERS[provider]} key saved.`;
-      keysStatus.dataset.state = 'ok';
+      setRowFeedback(state, remove ? 'Key removed.' : 'Key saved.', 'ok');
+      focusAfter = remove ? '[data-editor] input[data-field="api_key"]' : '[data-action="edit"]';
     } catch (error) {
-      keysStatus.textContent = error.message;
-      keysStatus.dataset.state = 'error';
+      setRowFeedback(state, error.message, 'error');
     } finally {
-      buttons.forEach((button) => { button.disabled = false; });
+      state.busy = false;
       renderKeys();
     }
+    const target = focusAfter && state.row.querySelector(focusAfter);
+    if (target && target.offsetParent !== null) target.focus();
   }
 
-  document.querySelectorAll('.key-row[data-provider]').forEach((row) => {
-    row.querySelector('[data-action="save"]').addEventListener('click', () => updateKey(row, false));
-    row.querySelector('[data-action="remove"]').addEventListener('click', () => updateKey(row, true));
-    row.querySelectorAll('input').forEach((input) => input.addEventListener('keydown', (event) => {
-      if (event.key === 'Enter') {
-        event.preventDefault();
-        updateKey(row, false);
-      }
-    }));
+  function cancelKeyEdit(provider, state) {
+    state.editing = false;
+    resetKeyInputs(state);
+    renderKeyRow(provider, state);
+    state.row.querySelector('[data-action="edit"]').focus();
+  }
+
+  keyRows.forEach((state, provider) => {
+    const { row } = state;
+    const on = (action, handler) => row.querySelector(`[data-action="${action}"]`).addEventListener('click', handler);
+    on('save', () => updateKey(provider, false));
+    on('confirm-remove', () => updateKey(provider, true));
+    on('edit', () => {
+      state.editing = true;
+      setRowFeedback(state, '');
+      const endpoint = row.querySelector('input[data-field="endpoint"]');
+      if (endpoint) endpoint.value = keyStatus(provider).endpoint || '';
+      renderKeyRow(provider, state);
+      row.querySelector('input[data-field="api_key"]').focus();
+    });
+    on('cancel-edit', () => cancelKeyEdit(provider, state));
+    on('remove', () => {
+      state.confirming = true;
+      setRowFeedback(state, '');
+      renderKeyRow(provider, state);
+      row.querySelector('[data-action="cancel-remove"]').focus();
+    });
+    on('cancel-remove', () => {
+      state.confirming = false;
+      renderKeyRow(provider, state);
+      row.querySelector('[data-action="remove"]').focus();
+    });
+    on('reveal', () => {
+      const input = row.querySelector('input[data-field="api_key"]');
+      const show = input.type === 'password';
+      input.type = show ? 'text' : 'password';
+      const toggle = row.querySelector('[data-action="reveal"]');
+      toggle.setAttribute('aria-pressed', String(show));
+      toggle.setAttribute('aria-label', show ? 'Hide key' : 'Show key');
+    });
+    keyInputs(state).forEach((input) => {
+      input.addEventListener('input', () => {
+        if (row.querySelector('[data-feedback]').dataset.state === 'error') setRowFeedback(state, '');
+        renderKeyRow(provider, state);
+      });
+      input.addEventListener('keydown', (event) => {
+        if (event.key === 'Enter') {
+          event.preventDefault();
+          updateKey(provider, false);
+        } else if (event.key === 'Escape' && state.editing) {
+          // Back out of replacing a key instead of closing the whole dialog.
+          event.preventDefault();
+          cancelKeyEdit(provider, state);
+        }
+      });
+    });
   });
 
   function openKeys(provider) {
     keysStatus.textContent = '';
     keysStatus.dataset.state = '';
+    tokenFeedback.textContent = '';
+    keyRows.forEach((state) => {
+      if (state.busy) return;
+      state.editing = false;
+      state.confirming = false;
+      setRowFeedback(state, '');
+      concealKey(state);
+    });
     renderKeys();
     if (typeof keysDialog.showModal === 'function') keysDialog.showModal();
     else keysDialog.setAttribute('open', '');
-    const target = provider && keysDialog.querySelector(`.key-row[data-provider="${provider}"] input:not(:disabled)`);
+    // Land on the input that still needs a key rather than the close button.
+    const editable = '[data-editor]:not([hidden]) input[data-field="api_key"]:not(:disabled)';
+    const target = (provider && keysDialog.querySelector(`.key-row[data-provider="${provider}"] ${editable}`))
+      || keysDialog.querySelector(editable);
     if (target) target.focus();
+    else keysDialog.focus();
   }
 
   $('keys-button').addEventListener('click', () => openKeys());
   $('new-transcription').addEventListener('click', () => {
-    document.querySelector('.composer').scrollIntoView({ behavior: 'smooth', block: 'start' });
+    document.querySelector('.composer').scrollIntoView({ behavior: scrollBehavior(), block: 'start' });
   });
   $('empty-keys').addEventListener('click', () => openKeys('gemini'));
   $('key-callout-action').addEventListener('click', () => {
@@ -343,6 +487,14 @@
   });
   authToken.value = storage.get(sessionStorage, TOKEN_KEY, '');
   authToken.addEventListener('input', () => storage.set(sessionStorage, TOKEN_KEY, authToken.value.trim()));
+  authToken.addEventListener('keydown', (event) => {
+    // Enter would otherwise submit the method="dialog" form and close the dialog.
+    if (event.key !== 'Enter') return;
+    event.preventDefault();
+    storage.set(sessionStorage, TOKEN_KEY, authToken.value.trim());
+    tokenFeedback.textContent = authToken.value.trim() ? 'Token saved for this browser tab.' : 'Token cleared.';
+    tokenFeedback.dataset.state = 'ok';
+  });
 
   // ---- Form ---------------------------------------------------------------------
   function reviewEnabled() {
@@ -548,21 +700,22 @@
   }
 
   function closeHistory() {
-    historyPanel.hidden = true;
+    hideAnimated(historyPanel, 100);
     historyButton.setAttribute('aria-expanded', 'false');
   }
 
   historyButton.addEventListener('click', () => {
-    const open = historyPanel.hidden;
+    const open = !isShown(historyPanel);
     renderHistory();
-    historyPanel.hidden = !open;
+    if (open) showAnimated(historyPanel);
+    else hideAnimated(historyPanel, 100);
     historyButton.setAttribute('aria-expanded', String(open));
   });
   document.addEventListener('click', (event) => {
-    if (!historyPanel.hidden && !event.target.closest('.popover-anchor')) closeHistory();
+    if (isShown(historyPanel) && !event.target.closest('.popover-anchor')) closeHistory();
   });
   document.addEventListener('keydown', (event) => {
-    if (event.key === 'Escape' && !historyPanel.hidden) {
+    if (event.key === 'Escape' && isShown(historyPanel)) {
       closeHistory();
       historyButton.focus();
     }
@@ -621,7 +774,7 @@
 
   function setProgress(fraction) {
     const percent = Math.round(Math.min(1, Math.max(0, fraction)) * 100);
-    progressBar.style.width = `${percent}%`;
+    progressBar.style.transform = `translateX(${percent - 100}%)`;
     progress.setAttribute('aria-valuenow', String(percent));
   }
 
@@ -744,7 +897,7 @@
     startElapsed();
     setBusy(true, 'Uploading…');
     submitBtn.disabled = true;
-    if (window.matchMedia('(max-width: 960px)').matches) statusCard.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    if (window.matchMedia('(max-width: 960px)').matches) statusCard.scrollIntoView({ behavior: scrollBehavior(), block: 'start' });
 
     const data = new FormData(form);
     ['use_judge_pipeline', 'agentic_mode', 'auto_format', 'remove_fillers', 'speech_review'].forEach((name) => {
@@ -836,7 +989,7 @@
       setBusy(false);
       statusCard.hidden = true;
       if (!resumed) toast('Transcript ready');
-      resultCard.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      resultCard.scrollIntoView({ behavior: scrollBehavior(), block: 'start' });
     });
     stream.addEventListener('review-required', (event) => {
       const data = JSON.parse(event.data);
@@ -1184,7 +1337,7 @@
       applySearch();
     }
     activateTab(tabs[0]);
-    target.row.scrollIntoView({ block: 'center', behavior: 'smooth' });
+    target.row.scrollIntoView({ block: 'center', behavior: scrollBehavior() });
     target.row.classList.remove('flash');
     void target.row.offsetWidth;
     target.row.classList.add('flash');
@@ -1299,13 +1452,27 @@
   }
   searchInput.addEventListener('input', applySearch);
 
+  // timeupdate fires only ~4 times a second, so the playhead follows the audio
+  // every frame while playing. Moving it with transform avoids layout work.
+  function placePlayhead() {
+    if (timelineDuration <= 0) return;
+    const fraction = Math.min(1, audioPlayer.currentTime / timelineDuration);
+    playhead.style.transform = `translateX(${timelineLanes.offsetLeft + timelineLanes.offsetWidth * fraction}px)`;
+    playhead.hidden = false;
+  }
+  let playheadFrame = 0;
+  function followPlayhead() {
+    placePlayhead();
+    playheadFrame = audioPlayer.paused ? 0 : window.requestAnimationFrame(followPlayhead);
+  }
+  audioPlayer.addEventListener('play', () => {
+    window.cancelAnimationFrame(playheadFrame);
+    playheadFrame = window.requestAnimationFrame(followPlayhead);
+  });
+
   audioPlayer.addEventListener('timeupdate', () => {
     const now = audioPlayer.currentTime;
-    if (timelineDuration > 0) {
-      const fraction = Math.min(1, now / timelineDuration);
-      playhead.style.left = `${timelineLanes.offsetLeft + timelineLanes.offsetWidth * fraction}px`;
-      playhead.hidden = false;
-    }
+    placePlayhead();
     let current = rowAt(now);
     if (current && now > current.end + 2) current = null;
     const row = current ? current.row : null;
@@ -1314,7 +1481,7 @@
     activeRow = row;
     if (row) {
       row.classList.add('playing');
-      if (followAudio.checked && !audioPlayer.paused && !row.hidden) row.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+      if (followAudio.checked && !audioPlayer.paused && !row.hidden) row.scrollIntoView({ block: 'nearest', behavior: scrollBehavior() });
     }
   });
 

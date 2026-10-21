@@ -36,6 +36,11 @@
   --font-body: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
   --font-mono: "SF Mono", ui-monospace, Menlo, Consolas, monospace;
   --topbar-h: 56px;
+  --ease-out: cubic-bezier(0.23, 1, 0.32, 1);
+  --ease-in-out: cubic-bezier(0.77, 0, 0.175, 1);
+  --enter-y: 8px;
+  --enter-scale: 0.97;
+  --press-scale: 0.97;
 }
 
 @media (prefers-color-scheme: dark) {
@@ -214,7 +219,13 @@ button:disabled {
   border-radius: var(--r-sm);
   font-weight: 620;
   white-space: nowrap;
-  transition: background 120ms ease, border-color 120ms ease, opacity 120ms ease;
+  transition: background 120ms ease, border-color 120ms ease, opacity 120ms ease, transform 160ms var(--ease-out);
+}
+
+.button:active:not(:disabled),
+.icon-button:active,
+.chip:active {
+  transform: scale(var(--press-scale));
 }
 
 .button.small {
@@ -236,8 +247,10 @@ button:disabled {
   background: var(--primary);
 }
 
-.button.primary:hover:not(:disabled) {
-  opacity: 0.88;
+@media (hover: hover) and (pointer: fine) {
+  .button.primary:hover:not(:disabled) {
+    opacity: 0.88;
+  }
 }
 
 .button.ghost {
@@ -246,17 +259,24 @@ button:disabled {
   border-color: var(--line-strong);
 }
 
-.button.ghost:hover:not(:disabled) {
-  background: var(--raised);
+@media (hover: hover) and (pointer: fine) {
+  .button.ghost:hover:not(:disabled) {
+    background: var(--raised);
+  }
 }
 
 .topbar .button.ghost {
   border-color: transparent;
 }
 
-.topbar .button.ghost:hover,
 .topbar .button.ghost[aria-expanded="true"] {
   background: var(--sunken);
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .topbar .button.ghost:hover {
+    background: var(--sunken);
+  }
 }
 
 .button:disabled {
@@ -265,6 +285,7 @@ button:disabled {
 
 .link {
   padding: 0;
+  border-radius: 4px;
   color: var(--focus);
   background: none;
   border: 0;
@@ -274,8 +295,10 @@ button:disabled {
   text-underline-offset: 3px;
 }
 
-.link:hover {
-  text-decoration-color: currentColor;
+@media (hover: hover) and (pointer: fine) {
+  .link:hover {
+    text-decoration-color: currentColor;
+  }
 }
 
 .link.small {
@@ -296,11 +319,14 @@ button:disabled {
   background: none;
   border: 0;
   border-radius: var(--r-sm);
+  transition: color 120ms ease, background 120ms ease, transform 160ms var(--ease-out);
 }
 
-.icon-button:hover {
-  color: var(--ink);
-  background: var(--sunken);
+@media (hover: hover) and (pointer: fine) {
+  .icon-button:hover {
+    color: var(--ink);
+    background: var(--sunken);
+  }
 }
 
 .spinner {
@@ -384,10 +410,16 @@ button:disabled {
   transition: border-color 120ms ease, background 120ms ease;
 }
 
-.dropzone:hover,
 .dropzone.active {
   border-color: var(--ink-2);
   background: var(--sunken);
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .dropzone:hover {
+    border-color: var(--ink-2);
+    background: var(--sunken);
+  }
 }
 
 .dropzone:focus-within {
@@ -534,8 +566,10 @@ button:disabled {
   transition: border-color 120ms ease, background 120ms ease;
 }
 
-.model-option:hover {
-  background: var(--raised);
+@media (hover: hover) and (pointer: fine) {
+  .model-option:hover {
+    background: var(--raised);
+  }
 }
 
 .model-option:has(input:checked) {
@@ -717,7 +751,7 @@ select {
   background: #ffffff;
   border-radius: 50%;
   box-shadow: 0 1px 2px rgba(0, 0, 0, 0.25);
-  transition: transform 140ms ease;
+  transition: transform 140ms var(--ease-in-out);
 }
 
 .switch input:checked + .switch-track {
@@ -785,7 +819,7 @@ select {
   border-right: 1.8px solid var(--muted);
   border-bottom: 1.8px solid var(--muted);
   transform: rotate(45deg) translateY(-2px);
-  transition: transform 140ms ease;
+  transition: transform 140ms var(--ease-in-out);
 }
 
 .disclosure[open] > summary::after {
@@ -961,6 +995,10 @@ select {
 .stages li[data-state="active"] .stage-dot { border-color: var(--signal); box-shadow: 0 0 0 4px var(--signal-soft); animation: pulse 1.6s ease-in-out infinite; }
 .stages li[data-state="failed"] .stage-dot { border-color: var(--danger); background: var(--danger); }
 
+@keyframes pulse-fade {
+  50% { opacity: 0.45; }
+}
+
 @keyframes pulse {
   50% { box-shadow: 0 0 0 7px transparent; }
 }
@@ -973,11 +1011,12 @@ select {
 }
 
 .progress-bar {
-  width: 0%;
+  width: 100%;
   height: 100%;
   background: var(--ink);
   border-radius: inherit;
-  transition: width 320ms ease;
+  transform: translateX(-100%);
+  transition: transform 250ms var(--ease-out);
 }
 
 .run-foot {
@@ -1189,8 +1228,10 @@ pre.output {
   opacity: 0.85;
 }
 
-.bar:hover {
-  opacity: 1;
+@media (hover: hover) and (pointer: fine) {
+  .bar:hover {
+    opacity: 1;
+  }
 }
 
 .lane.gaps {
@@ -1232,6 +1273,7 @@ pre.output {
   position: absolute;
   top: -4px;
   bottom: 20px;
+  left: 0;
   width: 2px;
   margin-left: -1px;
   background: var(--signal);
@@ -1302,10 +1344,13 @@ pre.output {
   border-bottom: 2px solid transparent;
   font-size: 0.88rem;
   font-weight: 620;
+  transition: color 120ms ease, border-color 120ms ease;
 }
 
-.tab:hover {
-  color: var(--ink);
+@media (hover: hover) and (pointer: fine) {
+  .tab:hover {
+    color: var(--ink);
+  }
 }
 
 .tab.active {
@@ -1365,10 +1410,13 @@ pre.output {
   border-radius: 999px;
   font-size: 0.82rem;
   font-weight: 620;
+  transition: border-color 120ms ease, transform 160ms var(--ease-out);
 }
 
-.chip:hover {
-  border-color: var(--line-strong);
+@media (hover: hover) and (pointer: fine) {
+  .chip:hover {
+    border-color: var(--line-strong);
+  }
 }
 
 .chip::before {
@@ -1449,8 +1497,10 @@ pre.output {
   display: none;
 }
 
-.segment:hover {
-  background: var(--raised);
+@media (hover: hover) and (pointer: fine) {
+  .segment:hover {
+    background: var(--raised);
+  }
 }
 
 .segment.playing {
@@ -1491,9 +1541,11 @@ pre.output {
   text-align: left;
 }
 
-.segment-time:not(:disabled):hover {
-  color: var(--ink);
-  background: var(--sunken);
+@media (hover: hover) and (pointer: fine) {
+  .segment-time:not(:disabled):hover {
+    color: var(--ink);
+    background: var(--sunken);
+  }
 }
 
 .segment-time:disabled {
@@ -1569,8 +1621,10 @@ mark {
   text-align: left;
 }
 
-.format-option:hover {
-  background: var(--raised);
+@media (hover: hover) and (pointer: fine) {
+  .format-option:hover {
+    background: var(--raised);
+  }
 }
 
 .format-option.selected {
@@ -1627,6 +1681,21 @@ mark {
   border: 1px solid var(--line);
   border-radius: var(--r-md);
   box-shadow: var(--shadow-pop);
+  transform-origin: top right;
+  transition: opacity 150ms var(--ease-out), transform 150ms var(--ease-out);
+}
+
+@starting-style {
+  .popover {
+    opacity: 0;
+    transform: scale(var(--enter-scale));
+  }
+}
+
+.popover.leaving {
+  opacity: 0;
+  transform: scale(var(--enter-scale));
+  transition-duration: 100ms;
 }
 
 .popover-title {
@@ -1658,8 +1727,10 @@ mark {
   text-align: left;
 }
 
-.history-item:hover {
-  background: var(--raised);
+@media (hover: hover) and (pointer: fine) {
+  .history-item:hover {
+    background: var(--raised);
+  }
 }
 
 .history-item[aria-current="true"] {
@@ -1702,11 +1773,41 @@ mark {
   border: 1px solid var(--line);
   border-radius: var(--r-lg);
   box-shadow: var(--shadow-pop);
+  transition-property: opacity, transform, overlay, display;
+  transition-duration: 200ms;
+  transition-timing-function: var(--ease-out);
+  transition-behavior: allow-discrete;
+}
+
+.dialog:not([open]) {
+  opacity: 0;
+  transform: scale(var(--enter-scale));
+  transition-duration: 150ms;
 }
 
 .dialog::backdrop {
   background: rgba(10, 14, 19, 0.45);
   backdrop-filter: blur(2px);
+  transition-property: opacity, overlay, display;
+  transition-duration: 200ms;
+  transition-timing-function: var(--ease-out);
+  transition-behavior: allow-discrete;
+}
+
+.dialog:not([open])::backdrop {
+  opacity: 0;
+  transition-duration: 150ms;
+}
+
+@starting-style {
+  .dialog[open],
+  .dialog[open]::backdrop {
+    opacity: 0;
+  }
+
+  .dialog[open] {
+    transform: scale(var(--enter-scale));
+  }
 }
 
 .dialog-inner {
@@ -1716,10 +1817,21 @@ mark {
   padding: 18px 20px 20px;
 }
 
+/* The header stays put while the key list scrolls on short screens. */
 .dialog-head {
+  position: sticky;
+  top: 0;
+  z-index: 1;
   display: flex;
   align-items: center;
   justify-content: space-between;
+  margin: -18px -20px 0;
+  padding: 14px 20px 6px;
+  background: var(--surface);
+}
+
+.dialog:focus {
+  outline: none;
 }
 
 .dialog-head h2 {
@@ -1736,16 +1848,22 @@ mark {
 .key-row {
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: 10px;
   padding: 14px 0;
   border-top: 1px solid var(--line);
 }
 
 .key-row-head {
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   justify-content: space-between;
   gap: 10px;
+}
+
+.key-title {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
 }
 
 .key-name {
@@ -1753,12 +1871,12 @@ mark {
 }
 
 .key-use {
-  margin: -6px 0 0;
   color: var(--muted);
   font-size: 0.8rem;
 }
 
 .key-status {
+  margin-top: 1px;
   padding: 2px 9px;
   color: var(--muted);
   background: var(--sunken);
@@ -1766,6 +1884,7 @@ mark {
   font-size: 0.74rem;
   font-weight: 650;
   white-space: nowrap;
+  transition: color 150ms ease, background 150ms ease;
 }
 
 .key-status[data-state="saved"],
@@ -1774,16 +1893,121 @@ mark {
   background: var(--ok-soft);
 }
 
+.key-summary,
+.key-confirm,
+.key-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 14px;
+}
+
+.key-note {
+  color: var(--muted);
+  font-size: 0.8rem;
+}
+
+.key-confirm {
+  padding: 8px 8px 8px 12px;
+  background: var(--danger-soft);
+  border-radius: var(--r-sm);
+}
+
+.key-confirm-text {
+  margin-right: auto;
+  color: var(--danger);
+  font-size: 0.84rem;
+  font-weight: 600;
+}
+
+.key-editor {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+/* Panels that swap in (editor, remove confirmation) fade rather than pop. */
+.key-editor,
+.key-confirm {
+  transition: opacity 150ms var(--ease-out);
+}
+
+@starting-style {
+  .key-editor,
+  .key-confirm {
+    opacity: 0;
+  }
+}
+
 .key-inputs {
   display: flex;
   flex-direction: column;
   gap: 6px;
 }
 
-.key-actions {
-  display: flex;
-  align-items: center;
-  gap: 14px;
+.secret {
+  position: relative;
+}
+
+.secret input {
+  width: 100%;
+  padding-right: 40px;
+}
+
+.secret-toggle {
+  position: absolute;
+  top: 50%;
+  right: 4px;
+  display: grid;
+  place-items: center;
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  color: var(--muted);
+  background: none;
+  border: 0;
+  border-radius: var(--r-sm);
+  transform: translateY(-50%);
+  transition: color 120ms ease, background 120ms ease;
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .secret-toggle:hover {
+    color: var(--ink);
+    background: var(--sunken);
+  }
+}
+
+.secret-toggle[aria-pressed="false"] .eye-closed,
+.secret-toggle[aria-pressed="true"] .eye-open {
+  display: none;
+}
+
+.secret input:disabled + .secret-toggle {
+  display: none;
+}
+
+.button.danger {
+  color: var(--surface);
+  background: var(--danger);
+}
+
+.key-feedback {
+  margin: -2px 0 0;
+  font-size: 0.8rem;
+  font-weight: 560;
+}
+
+.key-feedback:empty {
+  display: none;
+}
+
+.key-feedback[data-state="error"] {
+  color: var(--danger);
+}
+
+.key-feedback[data-state="ok"] {
+  color: var(--ok);
 }
 
 .dialog-status {
@@ -1791,6 +2015,10 @@ mark {
   margin: 4px 0 0;
   font-size: 0.84rem;
   font-weight: 560;
+}
+
+.dialog-status:empty {
+  display: none;
 }
 
 .dialog-status[data-state="error"] {
@@ -1815,6 +2043,20 @@ mark {
   box-shadow: var(--shadow-pop);
   font-size: 0.88rem;
   font-weight: 560;
+  transition: opacity 200ms var(--ease-out), transform 200ms var(--ease-out);
+}
+
+@starting-style {
+  .toast {
+    opacity: 0;
+    transform: translate(-50%, var(--enter-y));
+  }
+}
+
+.toast.leaving {
+  opacity: 0;
+  transform: translate(-50%, calc(var(--enter-y) / 2));
+  transition-duration: 150ms;
 }
 
 /* ---- Responsive ------------------------------------------------------- */
@@ -1954,12 +2196,33 @@ mark {
 }
 
 @media (prefers-reduced-motion: reduce) {
+  :root {
+    --enter-y: 0px;
+    --enter-scale: 1;
+    --press-scale: 1;
+  }
+
   *,
   *::before,
   *::after {
     animation-duration: 0.01ms !important;
     animation-iteration-count: 1 !important;
     scroll-behavior: auto !important;
-    transition-duration: 0.01ms !important;
+  }
+
+  /* Loading feedback must keep moving: a slower spin and an opacity-only pulse. */
+  .spinner {
+    animation-duration: 1.5s !important;
+    animation-iteration-count: infinite !important;
+  }
+
+  .stages li[data-state="active"] .stage-dot {
+    animation: pulse-fade 1.6s ease-in-out infinite !important;
+  }
+
+  .switch-track::after,
+  .disclosure > summary::after,
+  .progress-bar {
+    transition: none;
   }
 }

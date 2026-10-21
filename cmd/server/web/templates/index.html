@@ -399,7 +399,7 @@
   </div>
 
   <!-- API keys -->
-  <dialog class="dialog" id="keys-dialog" aria-labelledby="keys-title">
+  <dialog class="dialog" id="keys-dialog" aria-labelledby="keys-title" tabindex="-1">
     <form method="dialog" class="dialog-inner" id="keys-form">
       <header class="dialog-head">
         <h2 id="keys-title">API keys</h2>
@@ -411,48 +411,102 @@
 
       <section class="key-row" data-provider="gemini">
         <div class="key-row-head">
-          <span class="key-name">Google Gemini</span>
+          <div class="key-title">
+            <span class="key-name">Google Gemini</span>
+            <span class="key-use">Gemini models, and the judge for every model</span>
+          </div>
           <span class="key-status" data-status></span>
         </div>
-        <p class="key-use">Gemini models, and the judge for every model</p>
-        <div class="key-inputs">
-          <input type="password" data-field="api_key" placeholder="Paste a Gemini API key" autocomplete="off" spellcheck="false" aria-label="Gemini API key" />
+        <div class="key-summary" data-summary hidden>
+          <span class="key-note" data-note></span>
+          <button type="button" class="link small" data-action="edit">Replace key</button>
+          <button type="button" class="link small danger" data-action="remove">Remove</button>
         </div>
-        <div class="key-actions">
-          <button type="button" class="button primary small" data-action="save">Save</button>
-          <button type="button" class="link small danger" data-action="remove" hidden>Remove</button>
+        <div class="key-confirm" data-confirm hidden>
+          <span class="key-confirm-text">Remove this key from the server?</span>
+          <button type="button" class="button danger small" data-action="confirm-remove"><span class="spinner" hidden></span><span data-label>Remove</span></button>
+          <button type="button" class="link small" data-action="cancel-remove">Cancel</button>
         </div>
+        <div class="key-editor" data-editor hidden>
+          <div class="key-inputs">
+            <div class="secret">
+              <input type="password" data-field="api_key" placeholder="Paste a Gemini API key" autocomplete="off" spellcheck="false" aria-label="Gemini API key" />
+              <button type="button" class="secret-toggle" data-action="reveal" aria-label="Show key" aria-pressed="false"><svg class="eye-open" viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7S2 12 2 12Z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/><circle cx="12" cy="12" r="3" fill="none" stroke="currentColor" stroke-width="1.8"/></svg><svg class="eye-closed" viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><path d="M3 3l18 18M10.6 5.1A9.9 9.9 0 0 1 12 5c6.4 0 10 7 10 7a17 17 0 0 1-3.3 4.2M6.6 6.6C3.7 8.5 2 12 2 12s3.6 7 10 7a9.6 9.6 0 0 0 4.4-1.1M9.9 9.9a3 3 0 0 0 4.2 4.2" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
+            </div>
+          </div>
+          <div class="key-actions">
+            <button type="button" class="button primary small" data-action="save" disabled><span class="spinner" hidden></span><span data-label>Save</span></button>
+            <button type="button" class="link small" data-action="cancel-edit" hidden>Cancel</button>
+          </div>
+        </div>
+        <p class="key-feedback" data-feedback role="status" aria-live="polite"></p>
       </section>
 
       <section class="key-row" data-provider="microsoft">
         <div class="key-row-head">
-          <span class="key-name">Microsoft Azure Speech</span>
+          <div class="key-title">
+            <span class="key-name">Microsoft Azure Speech</span>
+            <span class="key-use">MAI-Transcribe-2 · needs a Speech resource that supports it</span>
+          </div>
           <span class="key-status" data-status></span>
         </div>
-        <p class="key-use">MAI-Transcribe-2 · needs a Speech resource that supports it</p>
-        <div class="key-inputs">
-          <input type="password" data-field="api_key" placeholder="Speech resource key" autocomplete="off" spellcheck="false" aria-label="Azure Speech key" />
-          <input type="url" data-field="endpoint" placeholder="https://your-resource.cognitiveservices.azure.com" autocomplete="off" spellcheck="false" aria-label="Azure Speech endpoint" />
+        <div class="key-summary" data-summary hidden>
+          <span class="key-note" data-note></span>
+          <button type="button" class="link small" data-action="edit">Replace key</button>
+          <button type="button" class="link small danger" data-action="remove">Remove</button>
         </div>
-        <div class="key-actions">
-          <button type="button" class="button primary small" data-action="save">Save</button>
-          <button type="button" class="link small danger" data-action="remove" hidden>Remove</button>
+        <div class="key-confirm" data-confirm hidden>
+          <span class="key-confirm-text">Remove this key from the server?</span>
+          <button type="button" class="button danger small" data-action="confirm-remove"><span class="spinner" hidden></span><span data-label>Remove</span></button>
+          <button type="button" class="link small" data-action="cancel-remove">Cancel</button>
         </div>
+        <div class="key-editor" data-editor hidden>
+          <div class="key-inputs">
+            <div class="secret">
+              <input type="password" data-field="api_key" placeholder="Speech resource key" autocomplete="off" spellcheck="false" aria-label="Azure Speech key" />
+              <button type="button" class="secret-toggle" data-action="reveal" aria-label="Show key" aria-pressed="false"><svg class="eye-open" viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7S2 12 2 12Z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/><circle cx="12" cy="12" r="3" fill="none" stroke="currentColor" stroke-width="1.8"/></svg><svg class="eye-closed" viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><path d="M3 3l18 18M10.6 5.1A9.9 9.9 0 0 1 12 5c6.4 0 10 7 10 7a17 17 0 0 1-3.3 4.2M6.6 6.6C3.7 8.5 2 12 2 12s3.6 7 10 7a9.6 9.6 0 0 0 4.4-1.1M9.9 9.9a3 3 0 0 0 4.2 4.2" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
+            </div>
+            <input type="url" data-field="endpoint" placeholder="https://your-resource.cognitiveservices.azure.com" autocomplete="off" spellcheck="false" aria-label="Azure Speech endpoint" />
+          </div>
+          <div class="key-actions">
+            <button type="button" class="button primary small" data-action="save" disabled><span class="spinner" hidden></span><span data-label>Save</span></button>
+            <button type="button" class="link small" data-action="cancel-edit" hidden>Cancel</button>
+          </div>
+        </div>
+        <p class="key-feedback" data-feedback role="status" aria-live="polite"></p>
       </section>
 
       <section class="key-row" data-provider="meta">
         <div class="key-row-head">
-          <span class="key-name">Meta</span>
+          <div class="key-title">
+            <span class="key-name">Meta</span>
+            <span class="key-use">Muse Voice Transcribe</span>
+          </div>
           <span class="key-status" data-status></span>
         </div>
-        <p class="key-use">Muse Voice Transcribe</p>
-        <div class="key-inputs">
-          <input type="password" data-field="api_key" placeholder="Paste a Meta API key" autocomplete="off" spellcheck="false" aria-label="Meta API key" />
+        <div class="key-summary" data-summary hidden>
+          <span class="key-note" data-note></span>
+          <button type="button" class="link small" data-action="edit">Replace key</button>
+          <button type="button" class="link small danger" data-action="remove">Remove</button>
         </div>
-        <div class="key-actions">
-          <button type="button" class="button primary small" data-action="save">Save</button>
-          <button type="button" class="link small danger" data-action="remove" hidden>Remove</button>
+        <div class="key-confirm" data-confirm hidden>
+          <span class="key-confirm-text">Remove this key from the server?</span>
+          <button type="button" class="button danger small" data-action="confirm-remove"><span class="spinner" hidden></span><span data-label>Remove</span></button>
+          <button type="button" class="link small" data-action="cancel-remove">Cancel</button>
         </div>
+        <div class="key-editor" data-editor hidden>
+          <div class="key-inputs">
+            <div class="secret">
+              <input type="password" data-field="api_key" placeholder="Paste a Meta API key" autocomplete="off" spellcheck="false" aria-label="Meta API key" />
+              <button type="button" class="secret-toggle" data-action="reveal" aria-label="Show key" aria-pressed="false"><svg class="eye-open" viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7S2 12 2 12Z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/><circle cx="12" cy="12" r="3" fill="none" stroke="currentColor" stroke-width="1.8"/></svg><svg class="eye-closed" viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><path d="M3 3l18 18M10.6 5.1A9.9 9.9 0 0 1 12 5c6.4 0 10 7 10 7a17 17 0 0 1-3.3 4.2M6.6 6.6C3.7 8.5 2 12 2 12s3.6 7 10 7a9.6 9.6 0 0 0 4.4-1.1M9.9 9.9a3 3 0 0 0 4.2 4.2" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
+            </div>
+          </div>
+          <div class="key-actions">
+            <button type="button" class="button primary small" data-action="save" disabled><span class="spinner" hidden></span><span data-label>Save</span></button>
+            <button type="button" class="link small" data-action="cancel-edit" hidden>Cancel</button>
+          </div>
+        </div>
+        <p class="key-feedback" data-feedback role="status" aria-live="polite"></p>
       </section>
 
       <section class="key-row token-row">
@@ -460,6 +514,7 @@
           <span class="field-label">Server access token <span class="optional">only if your server requires one</span></span>
           <input type="password" id="auth-token" autocomplete="current-password" placeholder="Bearer token for this server" />
         </label>
+        <p class="key-feedback" id="token-feedback" role="status" aria-live="polite"></p>
       </section>
 
       <p class="dialog-status" id="keys-status" role="status" aria-live="polite"></p>
