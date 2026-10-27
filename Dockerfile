@@ -25,7 +25,7 @@ RUN CGO_ENABLED=0 GOOS=linux go build \
 # ---- Stage 2: runtime -------------------------------------------------------
 # We need ffmpeg/ffprobe at runtime for audio chunking, so we use a small
 # alpine base (distroless lacks them).
-FROM alpine:3.24.2
+FROM alpine:3.24.3
 
 RUN apk add --no-cache ffmpeg ca-certificates tini \
  && addgroup -S transcriber \
