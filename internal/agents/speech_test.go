@@ -249,8 +249,8 @@ func TestMicrosoftErrorHints(t *testing.T) {
 		attempts int
 		want     string
 	}{
-		{408, "The operation was timeout. secret-key", 2, "speaker labelling"},
-		{503, `{"error":{"code":"diarization_unavailable","message":"secret-key"}}`, 3, "speaker labelling"},
+		{408, "The operation was timeout. secret-key", 2, "speaker labeling"},
+		{503, `{"error":{"code":"diarization_unavailable","message":"secret-key"}}`, 3, "speaker labeling"},
 		{400, "Enhanced mode with model is currently not supported yet secret-key", 1, "westeurope"},
 		{403, "secret-key", 1, "Standard"},
 		{404, "secret-key", 1, "endpoint"},

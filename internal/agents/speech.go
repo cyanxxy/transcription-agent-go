@@ -231,7 +231,7 @@ func transcribeSpeechUnits(ctx context.Context, d *config.TranscriptionDeps, pat
 		if d.ModelName == config.MicrosoftTranscriptionModel {
 			switch {
 			case res.StatusCode == 408 || bytes.Contains(data, []byte("diarization_unavailable")):
-				hint = "Microsoft's speaker labelling is unavailable or timed out; retry later, use shorter chunks, or choose another model"
+				hint = "Microsoft's speaker labeling is unavailable or timed out; retry later, use shorter chunks, or choose another model"
 			case res.StatusCode == 400:
 				hint = "check that the Speech resource is in a region that supports MAI-Transcribe (" + microsoftRegions + ")"
 			case res.StatusCode == 403:
