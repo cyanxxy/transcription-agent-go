@@ -17,7 +17,7 @@ import (
 
 // InteractionRequest is the REST body for POST /{api_version}/interactions.
 // Models and features absent from the v1 schema use v1beta, including
-// Gemini 3.8 Flash and Gemini 3.5 Transcribe. Schema checked 2026-10-13:
+// the Gemini 4 models and Gemini 3.5 Transcribe. Schema checked 2026-11-25:
 // https://ai.google.dev/static/api/interactions.openapi.json
 // Store is a pointer because omitting it selects the API default (true).
 type InteractionRequest struct {

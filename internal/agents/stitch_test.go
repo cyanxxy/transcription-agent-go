@@ -228,7 +228,8 @@ func TestMicrosoftSpeechForcesSingleLocaleOnly(t *testing.T) {
 		codes []string
 		want  any
 	}{
-		{[]string{"nl-NL"}, []any{"nl-NL"}},
+		{[]string{"nl-NL"}, []any{"nl"}},
+		{[]string{"ga-IE"}, nil},
 		{[]string{"en-US", "nl-NL"}, nil},
 	} {
 		d := &config.TranscriptionDeps{ModelName: config.MicrosoftTranscriptionModel, AzureSpeechKey: "k", AzureSpeechEndpoint: "https://example.com", TempDir: t.TempDir(), LanguageCodes: tc.codes}

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/cyanxxy/transcription-agent-go/internal/config"
 	"github.com/cyanxxy/transcription-agent-go/internal/gemini"
 )
 
@@ -77,6 +78,13 @@ func (rt *Router) RouteFormat(ctx context.Context, hint string) (formatKey, skil
 		GenerationConfig: &gemini.InteractionGenerationConfig{
 			MaxOutputTokens: 1024,
 		},
+	}
+
+	// Thinking shares the output cap, so models that think at length need room
+	// to reach the call itself.
+	if minimum := config.GeminiModelMinOutputTokens[rt.model]; minimum > 0 {
+		req.GenerationConfig.MaxOutputTokens = minimum
+		req.GenerationConfig.ThinkingLevel = "low"
 	}
 
 	resp, err := rt.client.CreateInteraction(ctx, req)

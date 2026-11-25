@@ -137,7 +137,7 @@ func (j *JudgeAgent) Run(ctx context.Context, in JudgeInput) (*models.JudgeDecis
 		toolTracker.wrap(buildJudgeToolExecutors(j.Deps.Quality, in.Candidates, allowed)),
 		gemini.InteractionLoopLimits{
 			MaxToolTurns:    2,
-			MaxCallsPerTurn: 4,
+			MaxCallsPerTurn: 8,
 			MaxTotalCalls:   8,
 		},
 	)

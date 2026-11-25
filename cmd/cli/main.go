@@ -130,7 +130,7 @@ func run() error {
 		terms              = flag.String("terms", "", "Optional technical terms (comma-separated)")
 		keywords           = flag.String("keywords", "", "Optional verification keywords (comma-separated)")
 		languageHints      = flag.String("language-hints", "", "Optional language or accent hints")
-		languageCodes      = flag.String("language-codes", "", "Optional comma-separated BCP-47 language codes, e.g. en-US,nl-NL (sent to Gemini 3.5 Transcribe; a single code forces the MAI-Transcribe-2 locale)")
+		languageCodes      = flag.String("language-codes", "", "Optional comma-separated BCP-47 language codes, e.g. en-US,nl-NL (sent to Gemini 3.5 Transcribe; a single code forces the MAI-Transcribe-2 language)")
 		customInstructions = flag.String("instructions", "", "Optional custom instructions")
 		expectedFormat     = flag.String("expected-format", "", "Optional expected format: meeting, interview, lecture, podcast, legal, medical, technical")
 		useJudge           = flag.Bool("judge", true, "Enable judge pipeline")

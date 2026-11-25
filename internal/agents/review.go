@@ -91,7 +91,7 @@ func (a *GlobalReviewAgent) Run(ctx context.Context, spans []models.SpanRun) (*m
 		},
 	})
 	interaction, err := a.Client.RunInteractionWithTools(ctx, req, executors, gemini.InteractionLoopLimits{
-		MaxToolTurns: 2, MaxCallsPerTurn: 4, MaxTotalCalls: 8,
+		MaxToolTurns: 2, MaxCallsPerTurn: 8, MaxTotalCalls: 8,
 	})
 	if err != nil {
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {

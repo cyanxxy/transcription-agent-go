@@ -14,8 +14,8 @@ const untranscribedSpeaker = "Untranscribed"
 
 const unknownSpeaker = "Unknown speaker"
 
-// TimedUnit is one provider-timed word (Gemini) or speaker turn (Meta,
-// Microsoft). Offsets are absolute positions in the source recording once a
+// TimedUnit is one provider-timed word (Gemini, Microsoft) or speaker turn
+// (Meta). Offsets are absolute positions in the source recording once a
 // chunk offset has been applied.
 type TimedUnit struct {
 	Text string

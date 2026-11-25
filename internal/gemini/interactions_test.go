@@ -601,11 +601,10 @@ func TestInteractionObserverAccountsEveryTurn(t *testing.T) {
 	}
 }
 
-// The current v1 reference does not list Gemini 3.8 Flash; use beta even
-// though the model itself has a stable release name.
-func TestGemini38UsesBetaInteractions(t *testing.T) {
+// Google documents Gemini 4 Hydrogen's Interactions requests against v1beta.
+func TestGemini4HydrogenUsesBetaInteractions(t *testing.T) {
 	for _, tier := range []string{"", "standard", "flex", "priority"} {
-		if got := interactionAPIVersion("gemini-3.8-flash", tier); got != "v1beta" {
+		if got := interactionAPIVersion("gemini-4-hydrogen", tier); got != "v1beta" {
 			t.Errorf("tier %q uses %s", tier, got)
 		}
 	}

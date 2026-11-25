@@ -20,7 +20,7 @@ func IsDirectSpeechModel(model string) bool {
 	return model == DefaultTranscriptionModel || IsExternalSpeechModel(model)
 }
 
-const DefaultJudgeModel = "gemini-3.8-flash"
+const DefaultJudgeModel = "gemini-4-hydrogen"
 
 // Chunk durations used when a run does not set one. Gemini 3.5 Transcribe
 // accepts 30 minutes per request with diarization and word timestamps, and
@@ -37,13 +37,15 @@ const (
 var SupportedGeminiModels = map[string]struct{}{
 	DefaultTranscriptionModel: {},
 	"gemini-3.5-flash-lite":   {},
-	"gemini-3.8-flash":        {},
+	"gemini-4-hydrogen":       {},
 	"gemini-4-argon":          {},
 }
 
-// GeminiModelAliases redirects deprecated model names to their current ones.
+// GeminiModelAliases redirects retired model names to their replacements, so
+// saved settings and scripts keep working.
 var GeminiModelAliases = map[string]string{
-	"gemini-3-flash-preview":        "gemini-3.8-flash",
+	"gemini-3.8-flash":              "gemini-4-hydrogen",
+	"gemini-3-flash-preview":        "gemini-4-hydrogen",
 	"gemini-3.1-flash-lite":         "gemini-3.5-flash-lite",
 	"gemini-3.1-flash-lite-preview": "gemini-3.5-flash-lite",
 }
@@ -52,23 +54,40 @@ var GeminiModelAliases = map[string]string{
 var GeminiModelLabels = map[string]string{
 	DefaultTranscriptionModel: "Gemini 3.5 Transcribe",
 	"gemini-3.5-flash-lite":   "Gemini 3.5 Flash-Lite",
-	"gemini-3.8-flash":        "Gemini 3.8 Flash",
+	"gemini-4-hydrogen":       "Gemini 4 Hydrogen",
 	"gemini-4-argon":          "Gemini 4 Argon",
 }
 
 // GeminiModelThinkingLevels lists the legal thinking levels per model.
 var GeminiModelThinkingLevels = map[string]map[string]struct{}{
 	"gemini-3.5-flash-lite": {"minimal": {}, "low": {}, "medium": {}, "high": {}},
-	"gemini-3.8-flash":      {"low": {}, "medium": {}, "high": {}},
+	"gemini-4-hydrogen":     {"low": {}, "medium": {}, "high": {}, "xhigh": {}},
 	"gemini-4-argon":        {"low": {}, "medium": {}, "high": {}},
 }
 
+// ThinkingLevelFor returns the level to send to model. A run's level is
+// validated against its primary model, but the second candidate can support a
+// different range, so the closest level that model accepts is used.
+func ThinkingLevelFor(model, level string) string {
+	if _, ok := GeminiModelThinkingLevels[model][level]; ok {
+		return level
+	}
+	switch level {
+	case "minimal":
+		return "low"
+	case "xhigh":
+		return "high"
+	}
+	return level
+}
+
 // GeminiModelMinOutputTokens raises small per-request output caps for models
-// whose thinking counts against max_output_tokens and runs long. Google
-// recommends at least 32,768 for Gemini 4 Argon so reasoning does not crowd
-// out the answer.
+// whose thinking counts against max_output_tokens and runs long, so reasoning
+// does not crowd out the answer. Google recommends at least 32,768 for Gemini
+// 4 Argon and raising low caps to 65,536 for Gemini 4 Hydrogen.
 var GeminiModelMinOutputTokens = map[string]int{
-	"gemini-4-argon": 32768,
+	"gemini-4-hydrogen": 65536,
+	"gemini-4-argon":    32768,
 }
 
 // CappedOutputTokens applies a request-specific output cap without dropping
@@ -121,7 +140,7 @@ func FormatGeminiModelLabel(name string) string {
 // ResolveDualGeminiSecondaryModel picks the second model for dual-candidate.
 func ResolveDualGeminiSecondaryModel(primary string) string {
 	if primary == "gemini-3.5-flash-lite" {
-		return "gemini-3.8-flash"
+		return "gemini-4-hydrogen"
 	}
 	return "gemini-3.5-flash-lite"
 }
@@ -144,7 +163,7 @@ type TranscriptionDeps struct {
 	JudgeModelName      string
 	// LanguageCodes are per-run BCP-47 hints from the user's context. They
 	// are sent as transcription_config.language_codes to Gemini Transcribe
-	// and as the forced locale to MAI-Transcribe-2 when exactly one is set.
+	// and as the forced language to MAI-Transcribe-2 when exactly one is set.
 	LanguageCodes              []string
 	CandidateStrategy          string
 	MaxFileSizeMB              int
@@ -277,13 +296,19 @@ func NewTranscriptionDeps(apiKey string, opts ...TranscriptionOption) (*Transcri
 			return nil, fmt.Errorf("gemini-3.5-transcribe chunk_duration_ms must not exceed %d with %s chunking", maxChunkMS, d.ChunkStrategy)
 		}
 	}
-	if d.ModelName == MetaTranscriptionModel {
-		limit := 600000
+	if IsExternalSpeechModel(d.ModelName) {
+		// Meta documents 10 minutes per request. Microsoft publishes no number,
+		// but says diarization is limited to shorter recordings in preview and
+		// longer requests time out; failures are reported from 15 minutes.
+		provider, limit := "meta", 600000
+		if d.ModelName == MicrosoftTranscriptionModel {
+			provider = "microsoft"
+		}
 		if d.ChunkStrategy == "adaptive" {
 			limit -= 30000
 		}
 		if d.ChunkDurationMS > limit {
-			return nil, fmt.Errorf("meta chunk_duration_ms must not exceed %d with %s chunking", limit, d.ChunkStrategy)
+			return nil, fmt.Errorf("%s chunk_duration_ms must not exceed %d with %s chunking", provider, limit, d.ChunkStrategy)
 		}
 	}
 	if d.ChunkOverlapMS < 0 {

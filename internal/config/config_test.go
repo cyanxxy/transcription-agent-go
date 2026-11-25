@@ -20,9 +20,9 @@ func TestRemovedFlashModelsAreRejected(t *testing.T) {
 	}
 }
 
-func TestGemini38ThinkingLevels(t *testing.T) {
-	for _, level := range []string{"minimal", "low", "medium", "high"} {
-		deps, err := NewTranscriptionDeps("test", WithModelName("gemini-3.8-flash"), WithThinkingLevels(level, level))
+func TestGemini4HydrogenThinkingLevels(t *testing.T) {
+	for _, level := range []string{"minimal", "low", "medium", "high", "xhigh"} {
+		deps, err := NewTranscriptionDeps("test", WithModelName("gemini-4-hydrogen"), WithJudgeModelName("gemini-4-hydrogen"), WithThinkingLevels(level, level))
 		if deps != nil {
 			deps.Cleanup()
 		}
@@ -32,13 +32,29 @@ func TestGemini38ThinkingLevels(t *testing.T) {
 	}
 }
 
+// The second candidate inherits the run's level, which its model may reject.
+func TestThinkingLevelForOtherModels(t *testing.T) {
+	for _, c := range []struct{ model, level, want string }{
+		{"gemini-4-hydrogen", "xhigh", "xhigh"},
+		{"gemini-4-hydrogen", "minimal", "low"},
+		{"gemini-3.5-flash-lite", "xhigh", "high"},
+		{"gemini-3.5-flash-lite", "minimal", "minimal"},
+		{"gemini-4-argon", "xhigh", "high"},
+		{"gemini-4-argon", "medium", "medium"},
+	} {
+		if got := ThinkingLevelFor(c.model, c.level); got != c.want {
+			t.Errorf("ThinkingLevelFor(%q, %q) = %q, want %q", c.model, c.level, got, c.want)
+		}
+	}
+}
+
 func TestGemini4ArgonThinkingLevels(t *testing.T) {
-	for _, level := range []string{"minimal", "low", "medium", "high"} {
+	for _, level := range []string{"minimal", "low", "medium", "high", "xhigh"} {
 		deps, err := NewTranscriptionDeps("test", WithModelName("gemini-4-argon"), WithJudgeModelName("gemini-4-argon"), WithThinkingLevels(level, level))
 		if deps != nil {
 			deps.Cleanup()
 		}
-		if (err != nil) != (level == "minimal") {
+		if (err != nil) != (level == "minimal" || level == "xhigh") {
 			t.Errorf("level=%s error=%v", level, err)
 		}
 	}
@@ -50,10 +66,11 @@ func TestCappedOutputTokens(t *testing.T) {
 		configured, limit int
 		want              int
 	}{
-		{"gemini-3.8-flash", 65536, 4096, 4096},
+		{"gemini-4-hydrogen", 65536, 4096, 65536},
+		{"gemini-3.5-flash-lite", 65536, 4096, 4096},
 		{"gemini-4-argon", 65536, 4096, 32768},
 		{"gemini-4-argon", 16384, 4096, 16384},
-		{"gemini-3.8-flash", 2048, 4096, 2048},
+		{"gemini-4-hydrogen", 2048, 4096, 2048},
 	}
 	for _, c := range cases {
 		if got := CappedOutputTokens(c.model, c.configured, c.limit); got != c.want {
@@ -64,9 +81,11 @@ func TestCappedOutputTokens(t *testing.T) {
 
 func TestNormalizeGeminiModelName(t *testing.T) {
 	cases := map[string]string{
-		"gemini-3.8-flash":                  "gemini-3.8-flash",
-		"gemini-3-flash-preview":            "gemini-3.8-flash",
-		"google-gla:gemini-3-flash-preview": "gemini-3.8-flash",
+		"gemini-4-hydrogen":                 "gemini-4-hydrogen",
+		"gemini-3.8-flash":                  "gemini-4-hydrogen",
+		"google-gla:gemini-3.8-flash":       "gemini-4-hydrogen",
+		"gemini-3-flash-preview":            "gemini-4-hydrogen",
+		"google-gla:gemini-3-flash-preview": "gemini-4-hydrogen",
 		"gemini-3.1-flash-lite-preview":     "gemini-3.5-flash-lite",
 		"gemini-3.1-flash-lite":             "gemini-3.5-flash-lite",
 	}
@@ -80,7 +99,7 @@ func TestNormalizeGeminiModelName(t *testing.T) {
 
 func TestResolveCandidateSpecsDualGemini(t *testing.T) {
 	deps, err := NewTranscriptionDeps("test",
-		WithModelName("gemini-3.8-flash"),
+		WithModelName("gemini-4-hydrogen"),
 		WithCandidateStrategy("dual_gemini"),
 	)
 	if err != nil {
@@ -91,7 +110,7 @@ func TestResolveCandidateSpecsDualGemini(t *testing.T) {
 	if len(specs) != 2 {
 		t.Fatalf("expected 2 specs, got %d", len(specs))
 	}
-	if specs[0].ModelName != "gemini-3.8-flash" {
+	if specs[0].ModelName != "gemini-4-hydrogen" {
 		t.Errorf("primary model = %s", specs[0].ModelName)
 	}
 	if specs[1].ModelName != "gemini-3.5-flash-lite" {
@@ -109,7 +128,7 @@ func TestLegacyFlashPreviewAliasUsesCurrentGAReplacement(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer deps.Cleanup()
-	if deps.ModelName != "gemini-3.8-flash" || deps.JudgeModelName != "gemini-3.8-flash" {
+	if deps.ModelName != "gemini-4-hydrogen" || deps.JudgeModelName != "gemini-4-hydrogen" {
 		t.Fatalf("preview aliases not migrated: primary=%s judge=%s", deps.ModelName, deps.JudgeModelName)
 	}
 }
@@ -134,24 +153,24 @@ func TestSupportsStableGemini31FlashLite(t *testing.T) {
 
 func TestSupportsGemini38Flash(t *testing.T) {
 	deps, err := NewTranscriptionDeps("test",
-		WithModelName("gemini-3.8-flash"),
-		WithJudgeModelName("gemini-3.8-flash"),
+		WithModelName("gemini-4-hydrogen"),
+		WithJudgeModelName("gemini-4-hydrogen"),
 		WithCandidateStrategy("single_gemini"),
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer deps.Cleanup()
-	if deps.ModelName != "gemini-3.8-flash" {
+	if deps.ModelName != "gemini-4-hydrogen" {
 		t.Errorf("model = %s", deps.ModelName)
 	}
-	if deps.JudgeModelName != "gemini-3.8-flash" {
+	if deps.JudgeModelName != "gemini-4-hydrogen" {
 		t.Errorf("judge model = %s", deps.JudgeModelName)
 	}
 }
 
 func TestSupportsCurrentGeminiFlashModels(t *testing.T) {
-	for _, model := range []string{"gemini-3.8-flash", "gemini-3.5-flash-lite"} {
+	for _, model := range []string{"gemini-4-hydrogen", "gemini-3.5-flash-lite"} {
 		t.Run(model, func(t *testing.T) {
 			deps, err := NewTranscriptionDeps("test",
 				WithModelName(model),
@@ -169,9 +188,9 @@ func TestSupportsCurrentGeminiFlashModels(t *testing.T) {
 	}
 }
 
-func TestResolveCandidateSpecsDualGemini38Flash(t *testing.T) {
+func TestResolveCandidateSpecsDualGemini4Hydrogen(t *testing.T) {
 	deps, err := NewTranscriptionDeps("test",
-		WithModelName("gemini-3.8-flash"),
+		WithModelName("gemini-4-hydrogen"),
 		WithCandidateStrategy("dual_gemini"),
 	)
 	if err != nil {
@@ -182,10 +201,10 @@ func TestResolveCandidateSpecsDualGemini38Flash(t *testing.T) {
 	if len(specs) != 2 {
 		t.Fatalf("expected 2 specs, got %d", len(specs))
 	}
-	if specs[0].ModelName != "gemini-3.8-flash" {
+	if specs[0].ModelName != "gemini-4-hydrogen" {
 		t.Errorf("primary model = %s", specs[0].ModelName)
 	}
-	if specs[0].Label != "Gemini 3.8 Flash" {
+	if specs[0].Label != "Gemini 4 Hydrogen" {
 		t.Errorf("primary label = %s", specs[0].Label)
 	}
 	if specs[1].ModelName != "gemini-3.5-flash-lite" {
@@ -199,7 +218,7 @@ func TestDefaultsUseCurrentGeminiModels(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer deps.Cleanup()
-	if deps.ModelName != "gemini-3.5-transcribe" || deps.JudgeModelName != "gemini-3.8-flash" {
+	if deps.ModelName != "gemini-3.5-transcribe" || deps.JudgeModelName != "gemini-4-hydrogen" {
 		t.Fatalf("unexpected model defaults: primary=%s judge=%s", deps.ModelName, deps.JudgeModelName)
 	}
 	specs := deps.ResolveCandidateSpecs()
@@ -272,7 +291,7 @@ func TestAgentMaxWallTimeCanBeConfigured(t *testing.T) {
 }
 
 func TestResolveCandidateSpecsParakeet(t *testing.T) {
-	deps, err := NewTranscriptionDeps("test", WithModelName("gemini-3.8-flash"),
+	deps, err := NewTranscriptionDeps("test", WithModelName("gemini-4-hydrogen"),
 		WithCandidateStrategy("gemini_plus_parakeet"),
 	)
 	if err != nil {
@@ -310,7 +329,7 @@ func TestResolveCandidateSpecsSingleGemini(t *testing.T) {
 
 func TestResolveCandidateSpecsDualGeminiDistinct(t *testing.T) {
 	configuredPrimary := "gemini-3-flash-preview"
-	normalizedPrimary := "gemini-3.8-flash"
+	normalizedPrimary := "gemini-4-hydrogen"
 	deps, err := NewTranscriptionDeps("test",
 		WithModelName(configuredPrimary),
 		WithCandidateStrategy("dual_gemini"),
@@ -339,7 +358,7 @@ func TestResolveCandidateSpecsDualGeminiDistinct(t *testing.T) {
 }
 
 func TestResolveCandidateSpecsParakeetDetails(t *testing.T) {
-	deps, err := NewTranscriptionDeps("test", WithModelName("gemini-3.8-flash"),
+	deps, err := NewTranscriptionDeps("test", WithModelName("gemini-4-hydrogen"),
 		WithCandidateStrategy("gemini_plus_parakeet"),
 	)
 	if err != nil {
@@ -450,7 +469,7 @@ func TestRejectsUnsupportedModel(t *testing.T) {
 
 func TestRejectsBadThinkingLevel(t *testing.T) {
 	_, err := NewTranscriptionDeps("test",
-		WithModelName("gemini-3.8-flash"),
+		WithModelName("gemini-4-hydrogen"),
 		WithThinkingLevels("minimum", "high"),
 	)
 	if err == nil {
@@ -535,7 +554,7 @@ func TestExternalSpeechCapabilities(t *testing.T) {
 	}
 }
 
-func TestMetaChunkLimitIncludesAdaptiveExtension(t *testing.T) {
+func TestExternalChunkLimitIncludesAdaptiveExtension(t *testing.T) {
 	for _, tc := range []struct {
 		strategy string
 		duration int
@@ -543,12 +562,14 @@ func TestMetaChunkLimitIncludesAdaptiveExtension(t *testing.T) {
 	}{
 		{"fixed", 600000, true}, {"fixed", 600001, false}, {"adaptive", 570000, true}, {"adaptive", 570001, false},
 	} {
-		d, err := NewTranscriptionDeps("", WithModelName(MetaTranscriptionModel), WithChunkStrategy(tc.strategy), WithChunkDurationMS(tc.duration))
-		if d != nil {
-			d.Cleanup()
-		}
-		if (err == nil) != tc.valid {
-			t.Fatalf("%+v: %v", tc, err)
+		for _, model := range []string{MetaTranscriptionModel, MicrosoftTranscriptionModel} {
+			d, err := NewTranscriptionDeps("", WithModelName(model), WithChunkStrategy(tc.strategy), WithChunkDurationMS(tc.duration))
+			if d != nil {
+				d.Cleanup()
+			}
+			if (err == nil) != tc.valid {
+				t.Fatalf("%s %+v: %v", model, tc, err)
+			}
 		}
 	}
 }

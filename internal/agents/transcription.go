@@ -245,7 +245,7 @@ func (a *TranscriptionAgent) createTranscription(ctx context.Context, in Transcr
 		ServiceTier:       a.Deps.ServiceTier,
 		GenerationConfig: &gemini.InteractionGenerationConfig{
 			MaxOutputTokens: a.Deps.MaxOutputTokens,
-			ThinkingLevel:   a.Deps.TranscriptionThinkingLevel,
+			ThinkingLevel:   config.ThinkingLevelFor(a.Deps.ModelName, a.Deps.TranscriptionThinkingLevel),
 		},
 		ResponseFormat: &gemini.InteractionResponseFormat{
 			Type:     "text",
