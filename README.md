@@ -9,16 +9,17 @@
 [![Go](https://img.shields.io/badge/Go-1.26%2B-00ADD8?logo=go&logoColor=white)](go.mod)
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 
-<img src="docs/ui.png" alt="Transcription Studio: speaker timeline, transcript, and export panel" width="960" />
+<img src="docs/ui.png" alt="Transcription Studio: transcript with speakers, a waveform colored by speaker, and details" width="960" />
 
 </div>
 
 ## Why
 
-- **Who said what, and when.** Speaker labels and timestamps on every line, with a timeline you can click to play any moment.
-- **Long recordings just work.** Audio is split at pauses, transcribed in parallel, and stitched back together without repeated text.
-- **Export anywhere.** Word, Markdown, text, SRT, WebVTT, CSV, or JSON — rename speakers at export time.
-- **Your choice of model.** Gemini 3.5 Transcribe by default, or Microsoft MAI-Transcribe-2, Meta Muse Voice, and Gemini 3.8 Flash, 3.5 Flash-Lite, or 4 Argon with a review judge.
+- **Who said what, and when.** Speaker labels and timestamps on every line, with a waveform colored by speaker that you can click to play any moment.
+- **Long recordings just work.** Audio is split at pauses, transcribed in parallel, and stitched back into one transcript.
+- **Export anywhere.** Word, Markdown, text, SRT, WebVTT, CSV, or JSON — with the speaker names you choose.
+- **Your choice of model.** Gemini 3.5 Transcribe by default, or Microsoft MAI-Transcribe-2, Meta Muse Voice, and Gemini 4 Hydrogen, 3.5 Flash-Lite, or 4 Argon with a review judge.
+- **Fast to use.** Search transcripts and commands with ⌘K (Ctrl+K), and play, copy, or move between lines from the keyboard. Light and dark themes.
 - **Built to run.** A web app (Transcription Studio) and a single-binary CLI; jobs survive restarts; runs on Linux, macOS, Windows, and Docker.
 
 ## Quickstart
@@ -78,13 +79,13 @@ Keys are stored on the server with owner-only permissions and never reach the br
 | Model | Best for |
 |---|---|
 | `gemini-3.5-transcribe` | **Default.** Fast, accurate speech-to-text with word timing |
-| `MAI-Transcribe-2` | Microsoft speech-to-text |
+| `MAI-Transcribe-2` | Microsoft speech-to-text (preview); needs a Standard Speech resource in a [supported region](https://learn.microsoft.com/azure/ai-services/speech-service/regions) |
 | `muse-voice-transcribe-1.0` | Meta speech-to-text |
-| `gemini-3.8-flash` | Hard audio: compares candidates and judges each section |
+| `gemini-4-hydrogen` | Hard audio: compares candidates and judges each section |
 | `gemini-3.5-flash-lite` | The same review pipeline at lower cost |
 | `gemini-4-argon` | The review pipeline with Gemini's deepest reasoning; slowest and most expensive, with no free tier |
 
-Speech models can also opt into the judge with **Double-check with a judge** (`--speech-review`). Gemini 3.8 Flash, 3.5 Flash-Lite, and 4 Argon can each be the judge (`--judge-model`); Argon takes `low`, `medium`, or `high` thinking.
+Speech models can also opt into the judge with **Double-check with a judge** (`--speech-review`). Gemini 4 Hydrogen, 3.5 Flash-Lite, and 4 Argon can each be the judge (`--judge-model`). Argon takes `low`, `medium`, or `high` thinking; Hydrogen also takes `xhigh`. `gemini-3.8-flash` now selects Hydrogen.
 
 ## CLI
 
@@ -146,6 +147,7 @@ The server ships with retries, durable jobs, graceful shutdown, structured logs,
 ```bash
 make test-race   # tests with the race detector
 make lint        # golangci-lint
+make -B build    # rebuild after editing only web files
 ```
 
 CI runs lint, vulnerability scanning, and the test suite on Linux and Windows, and builds the Docker image. Code lives in `cmd/` (server, CLI) and `internal/` (workflow, providers, audio, exports).

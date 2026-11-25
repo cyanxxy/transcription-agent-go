@@ -8,23 +8,27 @@
     'gemini-3.5-transcribe': { label: 'Gemini 3.5 Transcribe', provider: 'gemini', direct: true, languages: true },
     'MAI-Transcribe-2': { label: 'Microsoft MAI-Transcribe-2', provider: 'microsoft', direct: true, languages: true },
     'muse-voice-transcribe-1.0': { label: 'Meta Muse Voice', provider: 'meta', direct: true, languages: false },
-    'gemini-3.8-flash': { label: 'Gemini 3.8 Flash', provider: 'gemini', direct: false, languages: true },
+    'gemini-4-hydrogen': { label: 'Gemini 4 Hydrogen', provider: 'gemini', direct: false, languages: true },
     'gemini-3.5-flash-lite': { label: 'Gemini 3.5 Flash-Lite', provider: 'gemini', direct: false, languages: true },
     'gemini-4-argon': { label: 'Gemini 4 Argon', provider: 'gemini', direct: false, languages: true },
   };
+  // Saved settings can name a model that was replaced.
+  const REPLACED_MODELS = { 'gemini-3.8-flash': 'gemini-4-hydrogen' };
+  // Thinking levels beyond low, medium, and high.
+  const EXTRA_THINKING = { 'gemini-3.5-flash-lite': ['minimal'], 'gemini-4-hydrogen': ['xhigh'] };
   const PROVIDERS = { gemini: 'Gemini', microsoft: 'Microsoft', meta: 'Meta' };
 
   const FORMATS = [
-    { id: 'docx', label: 'Word', ext: '.docx', use: 'Share and edit', timestamps: true, binary: true },
-    { id: 'txt', label: 'Text', ext: '.txt', use: 'Paste anywhere', timestamps: true },
-    { id: 'md', label: 'Markdown', ext: '.md', use: 'Notes and wikis', timestamps: true },
-    { id: 'srt', label: 'SubRip', ext: '.srt', use: 'Video subtitles' },
-    { id: 'vtt', label: 'WebVTT', ext: '.vtt', use: 'Web captions' },
-    { id: 'csv', label: 'CSV', ext: '.csv', use: 'Spreadsheets' },
-    { id: 'json', label: 'JSON', ext: '.json', use: 'Full data' },
+    { id: 'docx', label: 'Word', ext: '.docx', timestamps: true, binary: true },
+    { id: 'txt', label: 'Text', ext: '.txt', timestamps: true },
+    { id: 'md', label: 'Markdown', ext: '.md', timestamps: true },
+    { id: 'srt', label: 'SubRip', ext: '.srt' },
+    { id: 'vtt', label: 'WebVTT', ext: '.vtt' },
+    { id: 'csv', label: 'CSV', ext: '.csv' },
+    { id: 'json', label: 'JSON', ext: '.json' },
   ];
 
-  const SPEAKER_COLORS = ['#3b6fd8', '#d2543a', '#2e9d78', '#8e5bd0', '#c7881a', '#2b95b5', '#c24f8a', '#6f8a1f'];
+  const SPEAKER_COLORS = Array.from({ length: 8 }, (_, i) => `var(--sp-${i + 1})`);
   const GAP_SPEAKER = 'Untranscribed';
   const HISTORY_KEY = 'transcription-history';
   const ACTIVE_JOB_KEY = 'transcription-job-id';
@@ -39,16 +43,22 @@
   const formError = $('form-error');
   const dropzone = $('dropzone');
   const fileInput = $('audio-input');
-  const fileCard = $('file-card');
-  const dropzoneEmpty = $('dropzone-empty');
+  const fileTitle = $('composer-title');
+  const fileHint = $('file-hint');
   const keyCallout = $('key-callout');
   const thinkingSelect = form.elements.namedItem('transcription_thinking_level');
 
-  const emptyState = $('empty-state');
+  const compose = $('compose');
+  const workspace = $('workspace');
+  const navCompose = $('new-transcription');
+  const sidebar = $('sidebar');
+  const shell = $('shell');
   const statusCard = $('status-card');
   const resultCard = $('result-card');
   const progress = statusCard.querySelector('.progress');
   const progressBar = $('progress-bar');
+  const runTitle = $('run-title');
+  const runBack = $('run-back');
   const progressLabel = $('progress-label');
   const progressElapsed = $('progress-elapsed');
   const logEl = $('log');
@@ -66,7 +76,6 @@
   const rejectReview = $('reject-review');
 
   const timelineLanes = $('timeline-lanes');
-  const timelineAxis = $('timeline-axis');
   const timelineHint = $('timeline-hint');
   const playhead = $('playhead');
   const player = $('player');
@@ -75,19 +84,24 @@
   const transcriptView = $('transcript-view');
   const searchInput = $('transcript-search');
   const searchCount = $('search-count');
-  const speakerChips = $('speaker-chips');
-  const formatGrid = $('format-grid');
-  const timestampsOption = $('timestamps-option');
+  const speakerList = $('speaker-list');
+  const timeline = $('timeline');
+  const seek = $('seek');
+  const playToggle = $('play-toggle');
+  const playbackRate = $('playback-rate');
+  const playerCurrent = $('player-current');
+  const resultTitle = $('result-title');
+  const wave = $('wave');
+  const waveTip = $('wave-tip');
+  const resultScroll = $('result-scroll');
+  const palette = $('palette');
+  const paletteInput = $('palette-input');
+  const paletteList = $('palette-list');
   const exportTimestamps = $('export-timestamps');
-  const exportDownload = $('export-download');
-  const exportCopy = $('export-copy');
-  const exportStatus = $('export-status');
 
   const keysDialog = $('keys-dialog');
   const keysStatus = $('keys-status');
   const authToken = $('auth-token');
-  const historyButton = $('history-button');
-  const historyPanel = $('history-panel');
   const toastEl = $('toast');
 
   const tabs = [...document.querySelectorAll('.tab')];
@@ -109,7 +123,11 @@
   let awaitingReview = false;
   let reviewExpiresAt = null;
   let reviewTimer = null;
-  let checkingJobStatus = false;
+  const checkingStreams = new WeakSet();
+  // Changes whenever another job takes over the screen, so work that was
+  // awaiting a response can tell that it no longer owns the view.
+  let runToken = 0;
+  let uploading = '';
   // True while an upload or transcription is in progress. A transcript that
   // only awaits review is not busy, so a new job can start meanwhile.
   let busy = false;
@@ -119,7 +137,11 @@
   let segmentRows = [];
   let activeRow = null;
   let timelineDuration = 0;
-  let selectedFormat = 'docx';
+  let filePeaks = null; // waveform of the file selected for the next upload
+  let jobPeaks = null; // waveform behind the transcript on screen
+  let focusedRow = -1;
+  let liveFraction = 0;
+  let stageStarted = 0;
   let stageIndex = -1;
   const speakerNames = new Map();
   const speakerColors = new Map();
@@ -150,8 +172,8 @@
   }
 
   function formatBytes(bytes) {
-    if (bytes >= 1024 ** 3) return `${(bytes / 1024 ** 3).toFixed(1)} GB`;
-    if (bytes >= 1024 ** 2) return `${(bytes / 1024 ** 2).toFixed(1)} MB`;
+    if (bytes >= 1024 ** 3) return `${(bytes / 1024 ** 3).toFixed(1).replace(/\.0$/, '')} GB`;
+    if (bytes >= 1024 ** 2) return `${(bytes / 1024 ** 2).toFixed(1).replace(/\.0$/, '')} MB`;
     return `${Math.max(1, Math.round(bytes / 1024))} KB`;
   }
 
@@ -175,11 +197,40 @@
 
   function relativeTime(date) {
     const minutes = Math.round((Date.now() - date) / 60000);
-    if (minutes < 1) return 'just now';
-    if (minutes < 60) return `${minutes} min ago`;
+    if (minutes < 1) return 'now';
+    if (minutes < 60) return `${minutes}m`;
     const hours = Math.round(minutes / 60);
-    if (hours < 24) return `${hours} h ago`;
-    return new Date(date).toLocaleDateString();
+    return hours < 24 ? `${hours}h` : `${Math.round(hours / 24)}d`;
+  }
+
+  const SVG = 'http://www.w3.org/2000/svg';
+  function svgEl(tag, attributes) {
+    const node = document.createElementNS(SVG, tag);
+    Object.entries(attributes).forEach(([name, value]) => node.setAttribute(name, String(value)));
+    return node;
+  }
+
+  function icon(name) {
+    const svg = svgEl('svg', { class: 'i', 'aria-hidden': 'true' });
+    svg.append(svgEl('use', { href: `#i-${name}` }));
+    return svg;
+  }
+
+  // One small mark per job state; a running job shows its real progress.
+  const STATUS_LABELS = { running: 'Running', review: 'Needs review', done: 'Done', failed: 'Failed', canceled: 'Canceled', rejected: 'Rejected', expired: 'Expired' };
+  function statusIcon(status, fraction = 0) {
+    const svg = svgEl('svg', { class: 'status-icon', viewBox: '0 0 14 14', 'data-status': status, role: 'img', 'aria-label': STATUS_LABELS[status] || 'Unknown' });
+    if (status === 'done' || status === 'failed') {
+      svg.append(svgEl('circle', { cx: 7, cy: 7, r: 6, class: 'fill' }));
+      svg.append(svgEl('path', { d: status === 'done' ? 'M4.300 7.200 6.300 9.200 9.800 5.100' : 'M5 5l4 4M9 5l-4 4', class: 'mark' }));
+      return svg;
+    }
+    svg.append(svgEl('circle', { cx: 7, cy: 7, r: 5.25, class: 'ring' }));
+    if (status === 'running' || status === 'review') {
+      const part = status === 'review' ? 0.5 : Math.max(0.04, fraction);
+      svg.append(svgEl('circle', { cx: 7, cy: 7, r: 1.75, class: 'pie', pathLength: 1, 'stroke-dasharray': `${part} 1`, transform: 'rotate(-90 7 7)' }));
+    }
+    return svg;
   }
 
   function segmentStart(segment) {
@@ -220,7 +271,258 @@
       node.classList.remove('leaving');
     }, ms));
   }
-  const isShown = (node) => !node.hidden && !node.classList.contains('leaving');
+
+  // ---- Views ---------------------------------------------------------------------
+  function showView(view, focusTarget) {
+    const job = view === 'job';
+    compose.hidden = job;
+    workspace.hidden = !job;
+    // Only one player is on screen at a time.
+    (job ? previewAudio : audioPlayer).pause();
+    navCompose.toggleAttribute('aria-current', false);
+    if (!job) navCompose.setAttribute('aria-current', 'page');
+    closeSidebar();
+    renderHistory();
+    syncDocumentTitle();
+    if (focusTarget) focusTarget.focus({ preventScroll: true });
+  }
+
+  function syncDocumentTitle() {
+    const name = !workspace.hidden && currentJobName ? currentJobName : '';
+    document.title = busy && currentJobId
+      ? `${Math.round(liveFraction * 100)}% ${currentJobName || 'Transcribing'}`
+      : name || 'Transcription Studio';
+  }
+
+  function closeSidebar() {
+    sidebar.classList.remove('open');
+    $('scrim').hidden = true;
+  }
+
+  document.querySelectorAll('[data-sidebar-toggle]').forEach((button) => button.addEventListener('click', () => {
+    sidebar.classList.add('open');
+    $('scrim').hidden = false;
+    navCompose.focus();
+  }));
+  $('scrim').addEventListener('click', closeSidebar);
+  navCompose.addEventListener('click', () => showView('compose'));
+  runBack.addEventListener('click', () => showView('compose', fileTitle));
+
+  const DETAILS_KEY = 'transcription-details';
+  function setDetails(open) {
+    shell.classList.toggle('no-details', !open);
+    storage.set(localStorage, DETAILS_KEY, open ? 'open' : 'closed');
+    document.querySelectorAll('[data-details-toggle]').forEach((button) => button.setAttribute('aria-pressed', String(open)));
+  }
+  const toggleDetails = () => setDetails(shell.classList.contains('no-details'));
+  document.querySelectorAll('[data-details-toggle]').forEach((button) => button.addEventListener('click', toggleDetails));
+  setDetails(storage.get(localStorage, DETAILS_KEY, 'open') !== 'closed');
+
+  // ---- Theme -----------------------------------------------------------------------
+  const THEME_KEY = 'transcription-theme';
+  const THEMES = { system: 'System theme', light: 'Light theme', dark: 'Dark theme' };
+  function setTheme(theme) {
+    if (theme === 'system') delete document.documentElement.dataset.theme;
+    else document.documentElement.dataset.theme = theme;
+    if (theme === 'system') storage.remove(localStorage, THEME_KEY);
+    else storage.set(localStorage, THEME_KEY, theme);
+    $('theme-label').textContent = THEMES[theme];
+    themeChanged();
+  }
+  const currentTheme = () => document.documentElement.dataset.theme || 'system';
+  function nextTheme() {
+    const order = Object.keys(THEMES);
+    setTheme(order[(order.indexOf(currentTheme()) + 1) % order.length]);
+  }
+  $('theme-button').addEventListener('click', nextTheme);
+  $('theme-label').textContent = THEMES[currentTheme()];
+
+  // ---- Menus -----------------------------------------------------------------------
+  // Native popovers: the browser handles light dismiss, Escape and focus return.
+  function placeMenu(trigger, menu) {
+    const box = trigger.getBoundingClientRect();
+    const gap = 6;
+    const left = Math.min(Math.max(8, box.right - menu.offsetWidth), window.innerWidth - menu.offsetWidth - 8);
+    const below = box.bottom + gap + menu.offsetHeight <= window.innerHeight - 8;
+    const top = below ? box.bottom + gap : Math.max(8, box.top - gap - menu.offsetHeight);
+    menu.style.left = `${left}px`;
+    menu.style.top = `${top}px`;
+    menu.style.transformOrigin = below ? 'top right' : 'bottom right';
+  }
+
+  document.querySelectorAll('[data-menu]').forEach((trigger) => {
+    const menu = $(trigger.dataset.menu);
+    trigger.setAttribute('aria-haspopup', 'true');
+    trigger.setAttribute('aria-expanded', 'false');
+    trigger.setAttribute('aria-controls', menu.id);
+    trigger.popoverTargetElement = menu;
+    menu.addEventListener('toggle', (event) => {
+      const open = event.newState === 'open';
+      trigger.setAttribute('aria-expanded', String(open));
+      if (!open) return;
+      placeMenu(trigger, menu);
+    });
+    // Opening focuses the autofocus element at once, so fast typing lands.
+    menu.addEventListener('beforetoggle', (event) => {
+      if (event.newState !== 'open') return;
+      menu.querySelectorAll('[autofocus]').forEach((node) => node.removeAttribute('autofocus'));
+      const target = menu.querySelector('input[type="radio"]:checked, .menu-input, button.menu-item');
+      if (target) target.setAttribute('autofocus', '');
+    });
+    menu.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter' && event.target.matches('input[type="radio"], input.menu-input')) {
+        event.preventDefault();
+        menu.hidePopover();
+      }
+      if (!['ArrowDown', 'ArrowUp'].includes(event.key) || event.target.matches('textarea, input[type="radio"]')) return;
+      const items = [...menu.querySelectorAll('.menu-input, button.menu-item')].filter((item) => item.offsetParent !== null);
+      const index = items.indexOf(event.target);
+      if (index < 0) return;
+      event.preventDefault();
+      items[(index + (event.key === 'ArrowDown' ? 1 : -1) + items.length) % items.length].focus();
+    });
+  });
+  window.addEventListener('resize', () => document.querySelectorAll('.menu:popover-open').forEach((menu) => menu.hidePopover()));
+
+  // ---- Waveforms -------------------------------------------------------------------
+  // Decoding holds the whole file in memory, so long recordings use the plain
+  // speaker timeline instead.
+  const WAVE_MAX_SECONDS = 15 * 60;
+  const WAVE_MAX_BYTES = 80 * 1024 * 1024;
+
+  async function readPeaks(file) {
+    const context = new OfflineAudioContext(1, 1, 8000);
+    const audio = await context.decodeAudioData(await file.arrayBuffer());
+    const samples = audio.getChannelData(0);
+    const peaks = new Float32Array(1600);
+    const size = Math.max(1, samples.length / peaks.length);
+    let top = 0;
+    for (let i = 0; i < peaks.length; i += 1) {
+      let sum = 0;
+      let count = 0;
+      for (let j = Math.floor(i * size); j < Math.min(samples.length, (i + 1) * size); j += 1) {
+        sum += samples[j] * samples[j];
+        count += 1;
+      }
+      peaks[i] = count ? Math.sqrt(sum / count) : 0;
+      top = Math.max(top, peaks[i]);
+    }
+    return top > 0 ? peaks.map((peak) => peak / top) : null;
+  }
+
+  // Canvas needs resolved colors, not light-dark() or var() text.
+  const colorProbe = el('span', 'visually-hidden');
+  document.body.append(colorProbe);
+  function resolveColor(value) {
+    colorProbe.style.color = value;
+    return getComputedStyle(colorProbe).color;
+  }
+
+  const BAR = 2;
+  const STEP = 4;
+  function paintWave(canvas, peaks, colorAt, progress) {
+    const width = canvas.clientWidth;
+    const height = canvas.clientHeight;
+    if (!peaks || !width || !height) return;
+    const ratio = window.devicePixelRatio || 1;
+    if (canvas.width !== Math.round(width * ratio) || canvas.height !== Math.round(height * ratio)) {
+      canvas.width = Math.round(width * ratio);
+      canvas.height = Math.round(height * ratio);
+    }
+    const context = canvas.getContext('2d');
+    context.setTransform(ratio, 0, 0, ratio, 0, 0);
+    context.clearRect(0, 0, width, height);
+    const count = Math.floor(width / STEP);
+    const bucket = peaks.length / count;
+    for (let i = 0; i < count; i += 1) {
+      let peak = 0;
+      for (let j = Math.floor(i * bucket); j < Math.max((i + 1) * bucket, Math.floor(i * bucket) + 1); j += 1) peak = Math.max(peak, peaks[j] || 0);
+      const size = Math.max(2, peak ** 0.8 * height);
+      context.globalAlpha = (i + 0.5) / count <= progress ? 1 : 0.38;
+      context.fillStyle = colorAt(i, count);
+      context.beginPath();
+      context.roundRect(i * STEP, (height - size) / 2, BAR, size, 1);
+      context.fill();
+    }
+  }
+
+  const previewAudio = new Audio();
+  const previewWave = $('preview-wave');
+  const previewPlay = $('preview-play');
+  let previewInk = '';
+  function paintPreview() {
+    if (!filePeaks || compose.hidden) return;
+    previewInk = previewInk || resolveColor('var(--accent)');
+    paintWave(previewWave, filePeaks, () => previewInk, previewAudio.duration ? previewAudio.currentTime / previewAudio.duration : 0);
+  }
+  let previewFrame = 0;
+  function followPreview() {
+    paintPreview();
+    $('preview-time').textContent = formatClock(previewAudio.currentTime);
+    previewFrame = previewAudio.paused ? 0 : window.requestAnimationFrame(followPreview);
+  }
+  function syncPreview() {
+    previewPlay.classList.toggle('playing', !previewAudio.paused);
+    previewPlay.setAttribute('aria-label', previewAudio.paused ? 'Play recording' : 'Pause recording');
+    window.cancelAnimationFrame(previewFrame);
+    followPreview();
+  }
+  ['play', 'pause', 'ended', 'seeked'].forEach((name) => previewAudio.addEventListener(name, syncPreview));
+  function togglePreview() {
+    if (previewAudio.paused) void previewAudio.play().catch(() => toast('This browser cannot play the recording.'));
+    else previewAudio.pause();
+  }
+  previewPlay.addEventListener('click', togglePreview);
+  previewWave.addEventListener('click', (event) => {
+    if (!previewAudio.duration) return;
+    const box = previewWave.getBoundingClientRect();
+    previewAudio.currentTime = ((event.clientX - box.left) / box.width) * previewAudio.duration;
+  });
+  new ResizeObserver(paintPreview).observe(previewWave);
+
+  // The empty state's signal: a fixed, speech-like shape.
+  const idleWave = $('idle-wave');
+  const idlePeaks = Float32Array.from({ length: 105 }, (_, i) => {
+    const phrase = Math.max(0, Math.sin(i * 0.19) * Math.sin(i * 0.067 + 0.4));
+    return (0.14 + phrase * 0.86) * (0.55 + 0.45 * Math.abs(Math.sin(i * 1.7)));
+  });
+  function paintIdle() {
+    const ink = resolveColor('var(--accent)');
+    paintWave(idleWave, idlePeaks, () => ink, 1);
+  }
+  new ResizeObserver(paintIdle).observe(idleWave);
+
+  // Each bar takes the color of whoever is speaking at that moment.
+  let waveColors = [];
+  function colorWave(count) {
+    const segments = currentResult ? currentResult.result.segments || [] : [];
+    const quiet = resolveColor('var(--muted)');
+    const inks = new Map();
+    waveColors = new Array(count).fill(quiet);
+    segments.forEach((segment, index) => {
+      if (segment.speaker === GAP_SPEAKER) return;
+      if (!inks.has(segment.speaker)) inks.set(segment.speaker, resolveColor(colorFor(segment.speaker)));
+      const from = Math.max(0, Math.floor((segmentStart(segment) / timelineDuration) * count));
+      const to = Math.min(count - 1, Math.floor((segmentEnd(segments, index) / timelineDuration) * count));
+      for (let i = from; i <= to; i += 1) waveColors[i] = inks.get(segment.speaker);
+    });
+  }
+  function paintPlayer() {
+    if (!jobPeaks || wave.hidden) return;
+    const count = Math.floor(wave.clientWidth / STEP);
+    if (waveColors.length !== count) colorWave(count);
+    paintWave(wave, jobPeaks, (i) => waveColors[i], timelineDuration ? audioPlayer.currentTime / timelineDuration : 0);
+  }
+  new ResizeObserver(paintPlayer).observe(wave);
+
+  function themeChanged() {
+    previewInk = '';
+    waveColors = [];
+    paintIdle();
+    paintPreview();
+    paintPlayer();
+  }
+  window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', themeChanged);
 
   let toastTimer = null;
   function toast(message) {
@@ -231,12 +533,13 @@
   }
 
   function selectedModel() {
-    const checked = form.querySelector('input[name="model_name"]:checked');
-    return checked ? checked.value : 'gemini-3.5-transcribe';
+    return form.elements.namedItem('model_name').value;
   }
 
   function isTyping(target) {
-    return target instanceof HTMLElement && (target.isContentEditable || ['INPUT', 'TEXTAREA', 'SELECT'].includes(target.tagName));
+    if (!(target instanceof HTMLElement)) return false;
+    if (target.tagName === 'INPUT') return !['range', 'checkbox', 'radio', 'file'].includes(target.type);
+    return target.isContentEditable || ['TEXTAREA', 'SELECT'].includes(target.tagName);
   }
 
   // ---- Server configuration and keys -----------------------------------------
@@ -265,6 +568,7 @@
       keysStatus.dataset.state = 'error';
     }
     syncForm();
+    if (!fileInput.files || !fileInput.files.length) renderFileHint();
     renderHistory();
   }
 
@@ -475,10 +779,6 @@
   }
 
   $('keys-button').addEventListener('click', () => openKeys());
-  $('new-transcription').addEventListener('click', () => {
-    document.querySelector('.composer').scrollIntoView({ behavior: scrollBehavior(), block: 'start' });
-  });
-  $('empty-keys').addEventListener('click', () => openKeys('gemini'));
   $('key-callout-action').addEventListener('click', () => {
     const missing = requiredProviders(selectedModel(), speechReview.checked).filter((p) => !providerConfigured(p));
     openKeys(missing[0]);
@@ -519,19 +819,10 @@
     $('language-codes-field').hidden = !info.languages;
     form.elements.namedItem('language_codes').disabled = !info.languages;
 
-    const minimal = thinkingSelect.querySelector('[data-flash-lite-only]');
-    const allowMinimal = model === 'gemini-3.5-flash-lite';
-    minimal.disabled = !allowMinimal;
-    minimal.hidden = !allowMinimal;
-    if (!allowMinimal && thinkingSelect.value === 'minimal') thinkingSelect.value = 'low';
+    syncThinking(thinkingSelect, model);
+    syncThinking(form.elements.namedItem('judge_thinking_level'), form.elements.namedItem('judge_model_name').value);
 
-    // With no keys at all, one clear prompt beats a "Needs key" badge on every model.
     const noKeys = Boolean(serverConfig) && !Object.keys(PROVIDERS).some(providerConfigured);
-    document.querySelectorAll('[data-key-badge]').forEach((badge) => {
-      badge.hidden = !serverConfig || noKeys || providerConfigured(badge.dataset.keyBadge);
-    });
-    $('empty-keys').hidden = !noKeys;
-
     const missing = requiredProviders(model, speechReview.checked).filter((p) => !providerConfigured(p));
     keyCallout.hidden = missing.length === 0;
     if (missing.length) {
@@ -541,8 +832,58 @@
           ? `Add a ${PROVIDERS[info.provider]} API key to use ${info.label}.`
           : 'Double-checking with a judge needs a Gemini API key.';
     }
+    document.querySelectorAll('[data-key-badge]').forEach((badge) => {
+      badge.hidden = !serverConfig || noKeys || providerConfigured(badge.dataset.keyBadge);
+    });
+    renderSettingLabels();
     updateSubmitState();
     renderKeys();
+  }
+
+  // The settings rows show their current value, like the rest of the panel.
+  const languageInput = form.elements.namedItem('language_codes');
+  const speakerInput = form.elements.namedItem('speakers');
+  const languageButtons = [...document.querySelectorAll('#language-options [data-code]')];
+  const languageCodes = () => languageInput.value.split(/[\s,]+/).filter(Boolean);
+
+  function renderSettingLabels() {
+    const info = MODELS[selectedModel()] || MODELS['gemini-3.5-transcribe'];
+    $('model-label').textContent = info.label;
+    const codes = languageCodes();
+    $('language-label').textContent = codes.length ? codes.join(', ') : 'Detect';
+    languageButtons.forEach((button) => {
+      const on = codes.some((code) => code.toLowerCase() === button.dataset.code.toLowerCase());
+      button.setAttribute('aria-pressed', String(on));
+    });
+    const names = speakerInput.value.split('\n').map((name) => name.trim()).filter(Boolean);
+    $('speakers-label').textContent = names.length ? names.join(', ') : 'Detect';
+  }
+
+  languageButtons.forEach((button) => button.addEventListener('click', () => {
+    const { code } = button.dataset;
+    const codes = languageCodes();
+    const rest = codes.filter((item) => item.toLowerCase() !== code.toLowerCase());
+    languageInput.value = (rest.length === codes.length ? [...codes, code] : rest).join(', ');
+    languageInput.dispatchEvent(new Event('change', { bubbles: true }));
+    renderSettingLabels();
+  }));
+  [languageInput, speakerInput].forEach((input) => input.addEventListener('input', renderSettingLabels));
+  document.querySelectorAll('input[name="model_name"]').forEach((radio) => {
+    // A pointer choice closes the menu; arrow keys keep it open to compare.
+    radio.closest('.option').addEventListener('click', (event) => {
+      if (event.detail > 0 && event.target !== radio) window.setTimeout(() => $('model-menu').hidePopover(), 0);
+    });
+  });
+
+  // Offers only the levels a model accepts; a level it rejects falls back to
+  // the closest one.
+  function syncThinking(select, model) {
+    const extra = EXTRA_THINKING[model] || [];
+    select.querySelectorAll('[data-extra-thinking]').forEach((option) => {
+      option.hidden = !extra.includes(option.value);
+      option.disabled = option.hidden;
+      if (option.hidden && select.value === option.value) select.value = option.value === 'minimal' ? 'low' : 'high';
+    });
   }
 
   function updateSubmitState() {
@@ -553,7 +894,8 @@
   }
 
   form.addEventListener('change', (event) => {
-    if (event.target.name === 'model_name' || event.target === speechReview) syncForm();
+    if (['model_name', 'judge_model_name'].includes(event.target.name) || event.target === speechReview) syncForm();
+    if (!fileInput.files || !fileInput.files.length) showFormError('');
     saveSettings();
   });
 
@@ -583,6 +925,9 @@
     } catch (_) {
       return;
     }
+    ['model_name', 'judge_model_name'].forEach((name) => {
+      if (values[name] in REPLACED_MODELS) values[name] = REPLACED_MODELS[values[name]];
+    });
     REMEMBERED_FIELDS.forEach((name) => {
       const field = form.elements.namedItem(name);
       if (!field || !(name in values)) return;
@@ -605,49 +950,84 @@
     formError.hidden = !message;
   }
 
+  function renderFileHint() {
+    const limit = serverConfig && serverConfig.max_upload_bytes;
+    fileHint.textContent = `MP3, WAV, M4A, FLAC or OGG${limit ? `, up to ${formatBytes(limit)}` : ''}`;
+  }
+
   function setFile(file) {
     if (audioURL && audioURL !== jobAudioURL) URL.revokeObjectURL(audioURL);
     audioURL = null;
+    dropzone.classList.toggle('has-file', Boolean(file));
+    $('file-clear').hidden = !file;
+    $('file-choose').hidden = Boolean(file);
+    $('idle-wave').hidden = Boolean(file);
+    $('preview').hidden = !file;
+    filePeaks = null;
+    previewWave.hidden = true;
+    previewAudio.pause();
+    previewAudio.removeAttribute('src');
     if (!file) {
       fileInput.value = '';
-      fileCard.hidden = true;
-      dropzoneEmpty.hidden = false;
-      dropzone.classList.remove('has-file');
+      fileTitle.textContent = 'Drop a recording';
+      renderFileHint();
       showFormError('');
       return;
     }
     const limit = serverConfig && serverConfig.max_upload_bytes;
-    $('file-name').textContent = file.name;
-    $('file-detail').textContent = formatBytes(file.size);
-    fileCard.hidden = false;
-    dropzoneEmpty.hidden = true;
-    dropzone.classList.add('has-file');
+    fileTitle.textContent = file.name;
+    fileHint.textContent = formatBytes(file.size);
     showFormError(limit && file.size > limit ? `This file is ${formatBytes(file.size)}; the server accepts up to ${formatBytes(limit)}.` : '');
     audioURL = URL.createObjectURL(file);
+    const url = audioURL;
+    previewAudio.src = url;
+    $('preview-time').textContent = '0:00';
     const probe = new Audio();
     probe.preload = 'metadata';
     probe.addEventListener('loadedmetadata', () => {
-      if (Number.isFinite(probe.duration)) $('file-detail').textContent = `${formatClock(probe.duration)} · ${formatBytes(file.size)}`;
+      if (url !== audioURL || !Number.isFinite(probe.duration)) return;
+      fileHint.textContent = `${formatDuration(probe.duration)}, ${formatBytes(file.size)}`;
+      if (probe.duration > WAVE_MAX_SECONDS || file.size > WAVE_MAX_BYTES) return;
+      readPeaks(file).then((peaks) => {
+        // The upload may already be running, or another file chosen meanwhile.
+        if (url === jobAudioURL) {
+          jobPeaks = peaks;
+          if (currentResult) renderTimeline(currentResult.result);
+        }
+        if (url !== audioURL || !peaks) return;
+        filePeaks = peaks;
+        previewWave.hidden = false;
+        paintPreview();
+      }).catch(() => { /* not decodable in this browser: no waveform */ });
     }, { once: true });
     probe.src = audioURL;
   }
 
   fileInput.addEventListener('change', () => setFile(fileInput.files && fileInput.files[0]));
-  $('file-clear').addEventListener('click', () => setFile(null));
-  ['dragover', 'dragenter'].forEach((evt) => dropzone.addEventListener(evt, (event) => {
+  $('file-clear').addEventListener('click', () => {
+    setFile(null);
+    fileInput.focus();
+  });
+  // Drop a file anywhere in the app.
+  const dropOverlay = $('drop-overlay');
+  const hasFiles = (event) => Boolean(event.dataTransfer && [...event.dataTransfer.types].includes('Files'));
+  ['dragenter', 'dragover'].forEach((name) => document.addEventListener(name, (event) => {
+    if (!hasFiles(event)) return;
     event.preventDefault();
-    dropzone.classList.add('active');
+    dropOverlay.hidden = false;
   }));
-  ['dragleave', 'drop'].forEach((evt) => dropzone.addEventListener(evt, (event) => {
+  document.addEventListener('dragleave', (event) => {
+    if (!event.relatedTarget) dropOverlay.hidden = true;
+  });
+  document.addEventListener('drop', (event) => {
+    if (!hasFiles(event)) return;
     event.preventDefault();
-    dropzone.classList.remove('active');
-  }));
-  dropzone.addEventListener('drop', (event) => {
-    const files = event.dataTransfer && event.dataTransfer.files;
-    if (files && files.length) {
-      fileInput.files = files;
-      setFile(files[0]);
-    }
+    dropOverlay.hidden = true;
+    const { files } = event.dataTransfer;
+    if (!files.length) return;
+    fileInput.files = files;
+    setFile(files[0]);
+    showView('compose', fileTitle);
   });
 
   // ---- History --------------------------------------------------------------------
@@ -674,53 +1054,150 @@
     renderHistory();
   }
 
+  function updateJob(id, patch) {
+    const items = readHistory();
+    const item = items.find((entry) => entry.id === id);
+    if (!item) return;
+    Object.assign(item, patch);
+    if (isFinal(item.status) && !item.finishedAt) item.finishedAt = Date.now();
+    writeHistory(items);
+    renderHistory();
+  }
+
+  function isFinal(status) {
+    return ['done', 'failed', 'canceled', 'rejected', 'expired'].includes(status);
+  }
+
+  function isLive(item) {
+    return busy && item.id === currentJobId;
+  }
+
+  function jobStatus(item) {
+    if (isLive(item)) return 'running';
+    const status = item.status || 'done';
+    const ttl = (serverConfig && serverConfig.job_ttl_seconds) || 0;
+    // Retention starts when the job finishes. The server sweeps every quarter
+    // of it, so a transcript can stay available that much longer.
+    if (ttl > 0 && isFinal(status) && item.finishedAt && Date.now() - item.finishedAt > ttl * 1250) return 'expired';
+    return status;
+  }
+
+  function liveIcon(item) {
+    return statusIcon(jobStatus(item), isLive(item) ? liveFraction : 0);
+  }
+
+  function dayLabel(at) {
+    const day = (value) => new Date(value).setHours(0, 0, 0, 0);
+    const days = Math.round((day(Date.now()) - day(at)) / 86400000);
+    return days <= 0 ? 'Today' : days === 1 ? 'Yesterday' : 'Earlier';
+  }
+
+  // Rows are reused: replacing one between mousedown and mouseup would lose
+  // the click, and progress can arrive many times a second.
+  const historyRows = new Map();
+  let historyShape = '';
+
   function renderHistory() {
     const items = readHistory();
     const ttl = (serverConfig && serverConfig.job_ttl_seconds) || 0;
-    $('history-list').replaceChildren(...items.map((item) => {
-      const li = el('li');
-      const button = el('button', 'history-item');
-      button.type = 'button';
-      // Jobs expire a retention period after they finish; allow for run time.
-      const stale = ttl > 0 && Date.now() - item.at > ttl * 1000 * 2;
-      button.classList.toggle('expired', stale);
-      if (item.id === currentJobId) button.setAttribute('aria-current', 'true');
-      button.append(el('span', 'history-name', item.name || 'Recording'));
-      const model = MODELS[item.model] ? MODELS[item.model].label : item.model || '';
-      button.append(el('span', 'history-detail', [relativeTime(item.at), model, stale ? 'may have expired' : ''].filter(Boolean).join(' · ')));
-      button.addEventListener('click', () => {
-        closeHistory();
-        openJob(item.id, item.name);
-      });
-      li.append(button);
-      return li;
-    }));
+    const groups = new Map();
+    items.forEach((item) => {
+      const label = dayLabel(item.at);
+      if (!groups.has(label)) groups.set(label, []);
+      groups.get(label).push(item);
+    });
+    items.forEach(updateHistoryRow);
+    const shape = JSON.stringify([...groups].map(([label, entries]) => [label, entries.map((item) => item.id)]));
+    if (shape !== historyShape) {
+      historyShape = shape;
+      const ids = new Set(items.map((item) => item.id));
+      [...historyRows.keys()].forEach((id) => { if (!ids.has(id)) historyRows.delete(id); });
+      const list = $('history-list');
+      const focused = list.contains(document.activeElement) ? document.activeElement : null;
+      list.replaceChildren(...[...groups].map(([label, entries]) => {
+        const group = el('section', 'side-group');
+        group.append(el('h2', 'side-label', label));
+        const ul = el('ul');
+        ul.append(...entries.map((item) => historyRows.get(item.id).li));
+        group.append(ul);
+        return group;
+      }));
+      if (focused && focused.isConnected) focused.focus({ preventScroll: true });
+    }
     $('history-note').textContent = items.length === 0
       ? 'Transcripts you start in this browser appear here.'
-      : ttl ? `The server keeps each transcript for ${formatDuration(ttl)} after it finishes.` : '';
+      : ttl ? `Kept on the server for ${formatDuration(ttl)} after finishing.` : '';
   }
 
-  function closeHistory() {
-    hideAnimated(historyPanel, 100);
-    historyButton.setAttribute('aria-expanded', 'false');
+  function createHistoryRow(item) {
+    const li = el('li');
+    const button = el('button', 'side-link history-item');
+    button.type = 'button';
+    button.dataset.id = item.id;
+    const name = el('span', 'history-name');
+    const meta = el('span', 'side-meta tabular');
+    button.append(statusIcon('done'), name, meta);
+    li.append(button);
+    const row = { li, button, name, meta, item, icon: '' };
+    button.addEventListener('click', () => openFromHistory(row.item));
+    historyRows.set(item.id, row);
+    return row;
   }
 
-  historyButton.addEventListener('click', () => {
-    const open = !isShown(historyPanel);
-    renderHistory();
-    if (open) showAnimated(historyPanel);
-    else hideAnimated(historyPanel, 100);
-    historyButton.setAttribute('aria-expanded', String(open));
-  });
-  document.addEventListener('click', (event) => {
-    if (isShown(historyPanel) && !event.target.closest('.popover-anchor')) closeHistory();
-  });
-  document.addEventListener('keydown', (event) => {
-    if (event.key === 'Escape' && isShown(historyPanel)) {
-      closeHistory();
-      historyButton.focus();
+  function updateHistoryRow(item) {
+    const row = historyRows.get(item.id) || createHistoryRow(item);
+    const status = jobStatus(item);
+    row.item = item;
+    row.button.dataset.status = status;
+    const model = MODELS[item.model] ? MODELS[item.model].label : '';
+    const title = [item.name, STATUS_LABELS[status], model, item.duration ? formatDuration(item.duration) : ''].filter(Boolean).join('\n');
+    if (row.button.title !== title) row.button.title = title;
+    if (!workspace.hidden && item.id === currentJobId) row.button.setAttribute('aria-current', 'page');
+    else row.button.removeAttribute('aria-current');
+    const look = `${status} ${isLive(item) ? liveFraction : 0}`;
+    if (row.icon !== look) {
+      row.icon = look;
+      row.button.firstElementChild.replaceWith(liveIcon(item));
     }
-  });
+    const name = (item.name || 'Recording').replace(/\.[^.]+$/, '');
+    if (row.name.textContent !== name) row.name.textContent = name;
+    const when = relativeTime(item.at);
+    if (row.meta.textContent !== when) row.meta.textContent = when;
+  }
+
+  function openFromHistory(item) {
+    // Reopening the job on screen would lose its audio; just show it.
+    if (item.id === currentJobId && (currentResult || currentStream)) showView('job');
+    else openJob(item.id, item.name, item.model);
+  }
+
+  // Jobs whose outcome this browser has not seen: left running in the
+  // background, waiting for review, or finished while the page was closed.
+  let refreshing = false;
+  async function refreshStatuses() {
+    if (refreshing) return;
+    refreshing = true;
+    const known = { succeeded: 'done', failed: 'failed', canceled: 'canceled', awaiting_review: 'review', expired: 'expired' };
+    const open = readHistory().filter((item) => item.id !== currentJobId && !(isFinal(item.status) && item.finishedAt));
+    await Promise.all(open.map(async (item) => {
+      try {
+        const response = await fetch(`/api/jobs/${encodeURIComponent(item.id)}`);
+        const found = response.ok ? known[(await response.json()).status] || 'running' : '';
+        const status = response.status === 404 ? 'expired' : found;
+        // Once on screen, the job's own stream is the source of truth.
+        if (!status || item.id === currentJobId) return;
+        // The server records a rejected review as a failed job.
+        updateJob(item.id, { status: item.status === 'rejected' && status !== 'expired' ? 'rejected' : status });
+      } catch (_) { /* offline: keep the last known state */ }
+    }));
+    refreshing = false;
+  }
+  window.setInterval(() => {
+    if (document.hidden) return;
+    renderHistory();
+    void refreshStatuses();
+  }, 20000);
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) void refreshStatuses(); });
 
   // ---- Progress -----------------------------------------------------------------
   const STAGE_ORDER = ['upload', 'prepare', 'transcribe', 'review', 'finish'];
@@ -742,7 +1219,12 @@
     const index = STAGE_ORDER.indexOf(stage);
     if (index < 0) return;
     if (stage === 'review') stageItems[3].hidden = false;
+    const before = stageIndex;
     stageIndex = Math.max(stageIndex, index);
+    if (stageIndex !== before) {
+      if (before >= 0) stampStage(before);
+      stageStarted = Date.now();
+    }
     stageItems.forEach((item) => {
       const itemIndex = STAGE_ORDER.indexOf(item.dataset.stage);
       item.dataset.state = itemIndex < stageIndex ? 'done' : itemIndex === stageIndex ? 'active' : '';
@@ -752,7 +1234,13 @@
     });
   }
 
+  function stampStage(index) {
+    const item = stageItems.find((node) => node.dataset.stage === STAGE_ORDER[index]);
+    if (item && stageStarted) item.querySelector('.stage-time').textContent = formatDuration((Date.now() - stageStarted) / 1000);
+  }
+
   function finishStages(failed) {
+    if (failed) runBack.hidden = false;
     stageItems.forEach((item) => {
       const itemIndex = STAGE_ORDER.indexOf(item.dataset.stage);
       if (failed) {
@@ -769,14 +1257,32 @@
     stageItems.forEach((item) => {
       item.dataset.state = '';
       item.querySelector('.stage-detail').textContent = '';
+      item.querySelector('.stage-time').textContent = '';
     });
+    stageStarted = 0;
+    renderChunks(0, 0);
     stageItems[3].hidden = !showReview;
+  }
+
+  // One cell per chunk of audio.
+  function renderChunks(done, total) {
+    const chunks = $('chunks');
+    chunks.hidden = total < 2;
+    if (total < 2) return;
+    if (chunks.childElementCount !== Math.min(total, 120)) chunks.replaceChildren(...Array.from({ length: Math.min(total, 120) }, () => el('i')));
+    const filled = Math.round((done / total) * chunks.childElementCount);
+    [...chunks.children].forEach((cell, index) => cell.classList.toggle('done', index < filled));
   }
 
   function setProgress(fraction) {
     const percent = Math.round(Math.min(1, Math.max(0, fraction)) * 100);
-    progressBar.style.transform = `translateX(${percent - 100}%)`;
+    liveFraction = percent / 100;
+    $('progress-percent').textContent = `${percent}%`;
+    progressBar.style.transform = `scaleX(${percent / 100})`;
     progress.setAttribute('aria-valuenow', String(percent));
+    const row = historyRows.get(currentJobId);
+    if (row) updateHistoryRow(row.item);
+    syncDocumentTitle();
   }
 
   function setConnectionState(text, state = 'pending') {
@@ -785,7 +1291,7 @@
   }
 
   function setJobReference(jobId) {
-    jobReference.textContent = jobId ? `Job ${jobId}` : '';
+    jobReference.textContent = jobId ? jobId.slice(0, 12) : '';
     jobReference.hidden = !jobId;
   }
 
@@ -812,22 +1318,26 @@
 
   function appendLog(line) {
     const time = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
-    logEl.textContent += `${time}  ${line}\n`;
-    logEl.scrollTop = logEl.scrollHeight;
+    const item = el('li');
+    item.append(el('span', 'feed-text', friendlyStage(line)), el('span', 'feed-time tabular', time));
+    logEl.prepend(item);
   }
 
   function showRunView(name, model, review) {
-    $('app').classList.add('has-job');
-    emptyState.hidden = true;
+    audioPlayer.pause();
     statusCard.hidden = false;
     resultCard.hidden = true;
-    $('run-title').textContent = 'Transcribing';
-    $('run-subtitle').textContent = [name, MODELS[model] ? MODELS[model].label : ''].filter(Boolean).join(' · ');
-    logEl.textContent = '';
+    runBack.hidden = true;
+    cancelJob.hidden = true;
+    runTitle.textContent = 'Transcribing';
+    $('run-crumb').textContent = name || 'Transcript';
+    $('run-model').textContent = MODELS[model] ? MODELS[model].label : '';
+    logEl.replaceChildren();
     progressElapsed.textContent = '';
     setProgress(0);
     resetStages(review);
     setJobReference('');
+    showView('job', runTitle);
   }
 
   function setBusy(value, label) {
@@ -835,6 +1345,8 @@
     spinner.hidden = !value;
     submitLabel.textContent = label || 'Transcribe';
     updateSubmitState();
+    renderHistory();
+    syncDocumentTitle();
   }
 
   // ---- Submit -------------------------------------------------------------------
@@ -855,13 +1367,13 @@
 
   // The same Idempotency-Key makes a retry return the job the first attempt
   // may already have created.
-  async function createJob(formData, idempotencyKey, onProgress) {
+  async function createJob(formData, idempotencyKey, onProgress, onRetry) {
     for (let attempt = 0; attempt < 2; attempt += 1) {
       try {
         return await uploadJob(formData, idempotencyKey, onProgress);
       } catch (error) {
         if (attempt > 0) throw error;
-        progressLabel.textContent = 'Connection dropped; checking whether the upload arrived…';
+        onRetry();
         await new Promise((resolve) => window.setTimeout(resolve, 450));
       }
     }
@@ -881,6 +1393,10 @@
       return;
     }
     showFormError('');
+    runToken += 1;
+    const run = runToken;
+    const onScreen = () => run === runToken;
+    uploading = file.name;
     const model = selectedModel();
     if (currentStream) {
       currentStream.close();
@@ -888,8 +1404,11 @@
     }
     if (jobAudioURL && jobAudioURL !== audioURL) URL.revokeObjectURL(jobAudioURL);
     jobAudioURL = audioURL;
+    jobPeaks = filePeaks;
+    audioPlayer.currentTime = 0;
     clearReviewState();
     currentResult = null;
+    currentJobId = null;
     currentJobName = file.name;
     showRunView(file.name, model, reviewEnabled());
     setStage('upload', formatBytes(file.size));
@@ -898,7 +1417,6 @@
     startElapsed();
     setBusy(true, 'Uploading…');
     submitBtn.disabled = true;
-    if (window.matchMedia('(max-width: 960px)').matches) statusCard.scrollIntoView({ behavior: scrollBehavior(), block: 'start' });
 
     const data = new FormData(form);
     ['use_judge_pipeline', 'agentic_mode', 'auto_format', 'remove_fillers', 'speech_review'].forEach((name) => {
@@ -908,21 +1426,35 @@
 
     try {
       const response = await createJob(data, crypto.randomUUID(), (fraction) => {
+        if (!onScreen()) return;
         setStage('upload', `${Math.round(fraction * 100)}%`);
         setProgress(fraction * 0.08);
+      }, () => {
+        if (onScreen()) progressLabel.textContent = 'Connection dropped; checking whether the upload arrived…';
       });
       if (response.status < 200 || response.status >= 300) throw new Error(messageFrom(response.text, response.status));
       const started = JSON.parse(response.text);
+      const entry = { id: started.job_id, name: file.name, model, at: Date.now(), status: 'running' };
+      if (!onScreen()) {
+        // Another transcript is open: the job carries on in the sidebar.
+        rememberJob(entry);
+        toast(`${file.name} uploaded. Transcribing in the background.`);
+        return;
+      }
       currentJobId = started.job_id;
       setJobReference(currentJobId);
-      rememberJob({ id: currentJobId, name: file.name, model, at: Date.now() });
+      rememberJob(entry);
       if (started.idempotent_replay) appendLog('Recovered a submission the server had already accepted.');
       appendLog('Upload complete.');
       setStage('prepare');
       progressLabel.textContent = 'Waiting for a free worker…';
       setConnectionState('Queued', 'pending');
     } catch (error) {
-      $('run-title').textContent = 'Upload failed';
+      if (!onScreen()) {
+        toast(`Could not upload ${file.name}: ${error.message}`);
+        return;
+      }
+      runTitle.textContent = 'Upload failed';
       progressLabel.textContent = error.message;
       appendLog(`Error: ${error.message}`);
       setConnectionState('Failed', 'error');
@@ -931,12 +1463,17 @@
       stopElapsed();
       setBusy(false);
       return;
+    } finally {
+      if (onScreen()) uploading = '';
     }
     connectStream(currentJobId);
   });
 
   // ---- Live updates ------------------------------------------------------------------
-  function openJob(jobId, name) {
+  function openJob(jobId, name, model = '') {
+    runToken += 1;
+    if (uploading) toast(`${uploading} is still uploading. It will appear in the list.`);
+    uploading = '';
     if (currentStream) currentStream.close();
     currentStream = null;
     clearReviewState();
@@ -944,9 +1481,13 @@
     currentJobName = name || '';
     if (jobAudioURL && jobAudioURL !== audioURL) URL.revokeObjectURL(jobAudioURL);
     jobAudioURL = null;
-    showRunView(name, '', false);
+    jobPeaks = null;
+    currentJobId = jobId;
+    showRunView(name, model, false);
     progressLabel.textContent = 'Loading…';
     connectStream(jobId, true);
+    // The job that just left the screen no longer reports through its stream.
+    void refreshStatuses();
   }
 
   function connectStream(jobId, resumed = false) {
@@ -971,6 +1512,7 @@
       progressLabel.textContent = friendlyStage(data.stage);
       const stage = stageFor(data.stage);
       const counts = /(\d+)\/(\d+)/.exec(data.stage);
+      if (counts) renderChunks(Number(counts[1]), Number(counts[2]));
       if (stage) setStage(stage, counts ? `${counts[1]} of ${counts[2]}` : undefined);
       setConnectionState('Running', 'active');
       appendLog(data.stage);
@@ -981,24 +1523,25 @@
       renderResult(payload);
       const review = payload.result.agent_run && payload.result.agent_run.human_review;
       if (review && review.status === 'required') {
-        showReview(review.reasons || []);
+        showReview(jobId, review.reasons || []);
         return;
       }
+      updateJob(jobId, { status: 'done' });
       finishStages(false);
       setProgress(1);
       closeStream(stream);
       setBusy(false);
       statusCard.hidden = true;
       if (!resumed) toast('Transcript ready');
-      resultCard.scrollIntoView({ behavior: scrollBehavior(), block: 'start' });
     });
     stream.addEventListener('review-required', (event) => {
       const data = JSON.parse(event.data);
-      showReview(data.reasons || [], data.review_expires_at);
+      showReview(jobId, data.reasons || [], data.review_expires_at);
     });
-    stream.addEventListener('review-completed', (event) => completeReview(JSON.parse(event.data).decision));
+    stream.addEventListener('review-completed', (event) => completeReview(jobId, JSON.parse(event.data).decision));
     stream.addEventListener('canceled', () => {
-      $('run-title').textContent = 'Canceled';
+      updateJob(jobId, { status: 'canceled' });
+      runTitle.textContent = 'Canceled';
       progressLabel.textContent = 'This transcription was canceled.';
       setConnectionState('Canceled', 'error');
       finishStages(true);
@@ -1008,7 +1551,8 @@
     stream.addEventListener('error-event', (event) => {
       let message = 'Something went wrong.';
       try { message = JSON.parse(event.data).message; } catch (_) { /* keep default */ }
-      $('run-title').textContent = 'Transcription failed';
+      updateJob(jobId, { status: 'failed' });
+      runTitle.textContent = 'Transcription failed';
       progressLabel.textContent = message;
       appendLog(`Error: ${message}`);
       setConnectionState('Failed', 'error');
@@ -1028,14 +1572,17 @@
   }
 
   async function handleStreamError(stream, jobId) {
-    if (currentStream !== stream || checkingJobStatus) return;
-    checkingJobStatus = true;
+    if (currentStream !== stream || checkingStreams.has(stream)) return;
+    checkingStreams.add(stream);
+    const onScreen = () => currentStream === stream;
     setConnectionState('Reconnecting', 'pending');
     try {
       const response = await fetch(`/api/jobs/${encodeURIComponent(jobId)}`);
       if (response.status === 404) {
         forgetJob(jobId);
+        if (!onScreen()) return;
         markJobUnavailable(
+          jobId,
           awaitingReview ? 'The review window has closed.' : 'This transcript is no longer on the server. Transcripts are kept for a limited time after they finish.',
           awaitingReview ? 'Expired' : 'Unavailable'
         );
@@ -1043,20 +1590,22 @@
       }
       if (!response.ok) throw new Error(`status check returned ${response.status}`);
       const state = await response.json();
+      if (!onScreen()) return;
       if (state.status === 'awaiting_review') {
-        showReview([], state.review_expires_at);
+        showReview(jobId, [], state.review_expires_at);
         return;
       }
       if (state.status === 'expired') {
-        markJobUnavailable('The review window has closed.', 'Expired');
+        markJobUnavailable(jobId, 'The review window has closed.', 'Expired');
         return;
       }
       progressLabel.textContent = 'Connection dropped; reconnecting…';
     } catch (_) {
+      if (!onScreen()) return;
       setConnectionState('Offline', 'error');
       progressLabel.textContent = 'Connection dropped; retrying…';
     } finally {
-      checkingJobStatus = false;
+      checkingStreams.delete(stream);
     }
   }
 
@@ -1085,11 +1634,11 @@
     if (!reviewExpiresAt || !awaitingReview) return;
     const remaining = reviewExpiresAt.getTime() - Date.now();
     if (remaining <= 0) {
-      markJobUnavailable('The review window has closed.', 'Expired');
+      markJobUnavailable(currentJobId, 'The review window has closed.', 'Expired');
       return;
     }
     const due = reviewExpiresAt.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-    reviewDeadline.textContent = `Decide by ${due} · ${formatDuration(remaining / 1000)} left`;
+    reviewDeadline.textContent = `Decide by ${due}, ${formatDuration(remaining / 1000)} left`;
     reviewDeadline.hidden = false;
   }
 
@@ -1103,8 +1652,9 @@
     reviewTimer = window.setInterval(updateReviewDeadline, 1000);
   }
 
-  function showReview(reasons, expiresAt) {
+  function showReview(jobId, reasons, expiresAt) {
     awaitingReview = true;
+    updateJob(jobId, { status: 'review' });
     reviewPanel.hidden = false;
     reviewActions.hidden = false;
     reviewNote.disabled = false;
@@ -1126,8 +1676,9 @@
     setBusy(false);
   }
 
-  function markJobUnavailable(message, badge = 'Unavailable') {
+  function markJobUnavailable(jobId, message, badge = 'Unavailable') {
     const wasAwaitingReview = awaitingReview;
+    updateJob(jobId, { status: 'expired' });
     awaitingReview = false;
     clearReviewTimer();
     if (wasAwaitingReview) {
@@ -1138,7 +1689,7 @@
     } else {
       statusCard.hidden = false;
       resultCard.hidden = true;
-      $('run-title').textContent = 'Not available';
+      runTitle.textContent = 'Not available';
       progressLabel.textContent = message;
       setConnectionState(badge, 'error');
       finishStages(true);
@@ -1151,20 +1702,25 @@
   }
 
   // announce is false for decisions replayed from the job's history.
-  function completeReview(decision, announce = false) {
+  function completeReview(jobId, decision, announce = false) {
     awaitingReview = false;
+    updateJob(jobId, { status: decision === 'accept' ? 'done' : 'rejected' });
     clearReviewTimer();
     reviewPanel.hidden = true;
     if (currentStream) closeStream(currentStream);
     setBusy(false);
+    setRowStatus(decision === 'accept' ? 'Done' : 'Rejected', decision === 'accept' ? 'done' : 'rejected');
     if (announce) toast(decision === 'accept' ? 'Transcript accepted' : 'Transcript rejected');
   }
 
   async function submitReview(decision) {
+    const jobId = currentJobId;
+    const run = runToken;
+    const onScreen = () => run === runToken;
     acceptReview.disabled = true;
     rejectReview.disabled = true;
     try {
-      const response = await fetch(`/api/jobs/${encodeURIComponent(currentJobId)}/review`, {
+      const response = await fetch(`/api/jobs/${encodeURIComponent(jobId)}/review`, {
         method: 'POST',
         headers: authHeaders({ 'Content-Type': 'application/json' }),
         body: JSON.stringify({ decision, note: reviewNote.value.trim() }),
@@ -1174,15 +1730,21 @@
         error.status = response.status;
         throw error;
       }
-      completeReview(decision, true);
+      if (onScreen()) {
+        completeReview(jobId, decision, true);
+      } else {
+        updateJob(jobId, { status: decision === 'accept' ? 'done' : 'rejected' });
+        toast(decision === 'accept' ? 'Transcript accepted' : 'Transcript rejected');
+      }
     } catch (error) {
-      if ([404, 409, 410].includes(error.status)) {
-        markJobUnavailable('Review is no longer available for this transcript.', 'Expired');
+      if (onScreen() && [404, 409, 410].includes(error.status)) {
+        markJobUnavailable(jobId, 'Review is no longer available for this transcript.', 'Expired');
         return;
       }
       toast(`Could not save the review: ${error.message}`);
+      if (!onScreen()) void refreshStatuses();
     } finally {
-      if (awaitingReview) {
+      if (onScreen() && awaitingReview) {
         acceptReview.disabled = false;
         rejectReview.disabled = false;
       }
@@ -1191,6 +1753,7 @@
 
   cancelJob.addEventListener('click', async () => {
     if (!currentJobId) return;
+    const run = runToken;
     cancelJob.disabled = true;
     try {
       const response = await fetch(`/api/jobs/${encodeURIComponent(currentJobId)}/cancel`, {
@@ -1199,6 +1762,7 @@
         body: '{}',
       });
       if (!response.ok) throw new Error(await errorMessage(response));
+      if (run !== runToken) return;
       progressLabel.textContent = 'Canceling…';
       setConnectionState('Canceling', 'pending');
     } catch (error) {
@@ -1228,24 +1792,53 @@
     return seen;
   }
 
+  function initials(name) {
+    const words = name.trim().split(/\s+/);
+    if (words.length > 1 && /^\d+$/.test(words[words.length - 1])) return words[words.length - 1];
+    return words.slice(0, 2).map((word) => [...word][0] || '').join('').toUpperCase();
+  }
+
+  function avatar(speaker) {
+    const node = el('span', 'avatar', initials(displayName(speaker)));
+    node.dataset.avatar = speaker;
+    node.style.setProperty('--speaker', colorFor(speaker));
+    node.setAttribute('aria-hidden', 'true');
+    return node;
+  }
+
   function renderSummary(result) {
     const segments = result.segments || [];
     const metadata = result.metadata || {};
-    const speakerCount = speakersOf(segments).length;
-    const parts = [
-      formatDuration(metadata.duration),
-      `${speakerCount} speaker${speakerCount === 1 ? '' : 's'}`,
-      (MODELS[result.model_used] && MODELS[result.model_used].label) || result.model_used,
-      result.judge_used ? 'reviewed by a judge' : '',
-      `done in ${formatDuration(result.processing_time)}`,
-    ].filter(Boolean);
-    const summary = $('result-summary');
-    summary.replaceChildren(...parts.map((part) => el('span', '', part)));
-    const gaps = segments.filter((segment) => segment.speaker === GAP_SPEAKER).length;
-    if (gaps) summary.append(el('span', 'warn', `${gaps} gap${gaps === 1 ? '' : 's'} to check`));
-    if (result.judge_used && result.quality && result.quality.overall_score) {
-      summary.append(el('span', '', `quality ${Math.round(result.quality.overall_score)}/100`));
-    }
+    const review = result.agent_run && result.agent_run.human_review;
+    const waiting = Boolean(review && review.status === 'required');
+    const rows = [
+      ['Status', waiting ? 'Needs review' : 'Done'],
+      ['Length', formatDuration(metadata.duration)],
+      ['Model', (MODELS[result.model_used] && MODELS[result.model_used].label) || result.model_used],
+      ['Took', formatDuration(result.processing_time)],
+      ['Words', segments.filter((segment) => segment.speaker !== GAP_SPEAKER).reduce((sum, segment) => sum + (segment.text || '').split(/\s+/).filter(Boolean).length, 0).toLocaleString()],
+      ['Reviewed', result.judge_used ? 'By a judge' : ''],
+      ['Quality', result.judge_used && result.quality && result.quality.overall_score ? `${Math.round(result.quality.overall_score)} of 100` : ''],
+    ].filter(([, value]) => value);
+    $('result-summary').replaceChildren(...rows.map(([label, value]) => {
+      const row = el('div', 'prop');
+      const text = el('span', 'prop-text tabular');
+      if (label === 'Status') text.append(statusIcon(waiting ? 'review' : 'done'));
+      text.append(el('span', '', value));
+      row.append(el('span', 'prop-label', label), text);
+      return row;
+    }));
+    const gaps = segments.filter((segment) => segment.speaker === GAP_SPEAKER);
+    const gapJump = $('gap-jump');
+    gapJump.hidden = gaps.length === 0;
+    gapJump.textContent = gaps.length === 1 ? 'One part has no transcript. Go to it' : `${gaps.length} parts have no transcript. Go to the first`;
+    gapJump.onclick = () => focusRow(segments.indexOf(gaps[0]));
+    updateJob(currentJobId, { duration: metadata.duration });
+  }
+
+  function setRowStatus(label, status) {
+    const text = $('result-summary').querySelector('.prop-text');
+    if (text) text.replaceChildren(statusIcon(status), el('span', '', label));
   }
 
   function segmentEnd(segments, index) {
@@ -1266,9 +1859,6 @@
     speakersOf(segments).forEach((speaker) => {
       const lane = el('div', 'lane');
       lane.style.setProperty('--speaker', colorFor(speaker));
-      const label = el('span', 'lane-label', displayName(speaker));
-      label.dataset.speaker = speaker;
-      lane.append(label);
       lanes.set(speaker, lane);
     });
     let gapLane = null;
@@ -1278,27 +1868,35 @@
       const isGap = segment.speaker === GAP_SPEAKER;
       if (isGap && !gapLane) {
         gapLane = el('div', 'lane gaps');
-        gapLane.style.setProperty('--speaker', 'var(--signal)');
-        gapLane.append(el('span', 'lane-label', 'Gaps'));
+        gapLane.style.setProperty('--speaker', 'var(--gap)');
       }
       const bar = el('span', isGap ? 'bar gap' : 'bar');
       bar.style.left = `${(start / timelineDuration) * 100}%`;
       bar.style.width = `${(Math.max(end - start, 0.2) / timelineDuration) * 100}%`;
-      bar.title = `${formatClock(start)} · ${isGap ? 'No transcript' : displayName(segment.speaker)}: ${segment.text.slice(0, 120)}`;
+      bar.title = `${formatClock(start)} ${isGap ? 'No transcript' : displayName(segment.speaker)}: ${segment.text.slice(0, 120)}`;
       bar.dataset.index = String(index);
       (isGap ? gapLane : lanes.get(segment.speaker)).append(bar);
     });
     timelineLanes.replaceChildren(...lanes.values(), ...(gapLane ? [gapLane] : []));
-
-    const ticks = 5;
-    timelineAxis.replaceChildren(...Array.from({ length: ticks + 1 }, (_, i) => {
-      const tick = el('span', '', formatClock((timelineDuration * i) / ticks));
-      tick.style.left = `${(i / ticks) * 100}%`;
-      return tick;
-    }));
-    playhead.hidden = true;
+    timeline.toggleAttribute('data-dense', timelineLanes.childElementCount > 6);
+    waveColors = [];
+    wave.hidden = !jobPeaks || !jobAudioURL;
+    timeline.classList.toggle('has-wave', !wave.hidden);
+    if (!wave.hidden) paintPlayer();
+    seek.max = String(timelineDuration);
+    seek.hidden = !jobAudioURL;
+    $('player-total').textContent = formatClock(timelineDuration);
+    // A late waveform redraws a player that may already be part-way through.
+    if (jobAudioURL && audioPlayer.src === jobAudioURL && audioPlayer.currentTime > 0) {
+      placePlayhead();
+    } else {
+      seek.value = '0';
+      seek.setAttribute('aria-valuetext', formatClock(0));
+      playerCurrent.textContent = formatClock(0);
+      playhead.hidden = true;
+    }
     timelineHint.textContent = jobAudioURL
-      ? 'Click a bar or line to play from there. Space plays and pauses; / searches.'
+      ? ''
       : 'Click a bar to jump to that line. To play along, transcribe a file in this tab.';
   }
 
@@ -1333,10 +1931,7 @@
     }
     const target = rowAt(seconds);
     if (!target) return;
-    if (searchInput.value) {
-      searchInput.value = '';
-      applySearch();
-    }
+    clearSearch();
     activateTab(tabs[0]);
     target.row.scrollIntoView({ block: 'center', behavior: scrollBehavior() });
     target.row.classList.remove('flash');
@@ -1344,49 +1939,70 @@
     target.row.classList.add('flash');
   }
 
-  function renderChips(segments) {
-    speakerChips.replaceChildren(...speakersOf(segments).map((speaker) => {
-      const chip = el('button', 'chip');
-      chip.type = 'button';
-      chip.style.setProperty('--speaker', colorFor(speaker));
-      chip.title = `Rename ${speaker}`;
-      chip.append(el('span', 'chip-name', displayName(speaker)), el('span', 'chip-edit', 'Rename'));
-      chip.addEventListener('click', () => editChip(chip, speaker));
-      return chip;
+  function renderSpeakers(segments) {
+    const talk = new Map();
+    let total = 0;
+    segments.forEach((segment, index) => {
+      if (segment.speaker === GAP_SPEAKER) return;
+      const seconds = Math.max(0, segmentEnd(segments, index) - segmentStart(segment));
+      talk.set(segment.speaker, (talk.get(segment.speaker) || 0) + seconds);
+      total += seconds;
+    });
+    const speakers = speakersOf(segments);
+    $('share-bar').replaceChildren(...speakers.map((speaker) => {
+      const part = el('i');
+      part.style.setProperty('--speaker', colorFor(speaker));
+      part.style.flexGrow = String(talk.get(speaker) || 0.01);
+      return part;
+    }));
+    speakerList.replaceChildren(...speakers.map((speaker) => {
+      const item = el('li');
+      const button = el('button', 'speaker-button');
+      button.type = 'button';
+      button.dataset.speaker = speaker;
+      button.title = 'Rename';
+      const share = total > 0 ? Math.round((talk.get(speaker) / total) * 100) : 0;
+      button.setAttribute('aria-label', `Rename ${displayName(speaker)}, ${share}% of talking time`);
+      button.append(avatar(speaker), el('span', 'speaker-name', displayName(speaker)), el('span', 'side-meta tabular', `${share}%`));
+      button.addEventListener('click', () => editSpeaker(item, speaker));
+      item.append(button);
+      return item;
     }));
   }
 
-  function editChip(chip, speaker) {
-    if (chip.querySelector('input')) return;
+  function editSpeaker(item, speaker) {
     const input = el('input');
     input.type = 'text';
     input.value = speakerNames.get(speaker) || '';
     input.placeholder = speaker;
     input.maxLength = 120;
     input.setAttribute('aria-label', `New name for ${speaker}`);
-    chip.replaceChildren(input);
+    item.replaceChildren(input);
     input.focus();
     let done = false;
-    const commit = (save) => {
+    const commit = (save, refocus) => {
       if (done) return;
       done = true;
       if (save) {
         speakerNames.set(speaker, input.value.trim());
         refreshSpeakerNames();
       }
-      renderChips(currentResult.result.segments || []);
+      renderSpeakers(currentResult.result.segments || []);
+      if (refocus) {
+        const button = [...speakerList.querySelectorAll('.speaker-button')].find((node) => node.dataset.speaker === speaker);
+        if (button) button.focus();
+      }
     };
     input.addEventListener('keydown', (event) => {
-      if (event.key === 'Enter') { event.preventDefault(); commit(true); }
-      if (event.key === 'Escape') { event.preventDefault(); commit(false); }
+      if (event.key === 'Enter') { event.preventDefault(); commit(true, true); }
+      if (event.key === 'Escape') { event.preventDefault(); commit(false, true); }
     });
-    input.addEventListener('blur', () => commit(true));
-    input.addEventListener('click', (event) => event.stopPropagation());
+    input.addEventListener('blur', () => commit(true, false));
   }
 
   function refreshSpeakerNames() {
     transcriptView.querySelectorAll('.segment-speaker[data-speaker]').forEach((node) => { node.textContent = displayName(node.dataset.speaker); });
-    timelineLanes.querySelectorAll('.lane-label[data-speaker]').forEach((node) => { node.textContent = displayName(node.dataset.speaker); });
+    transcriptView.querySelectorAll('[data-avatar]').forEach((node) => { node.textContent = initials(displayName(node.dataset.avatar)); });
     if (!panes.subtitles.hidden) void refreshSubtitles();
   }
 
@@ -1399,24 +2015,64 @@
       if (gap) row.classList.add('gap');
       else if (segment.speaker === previousSpeaker) row.classList.add('same-speaker');
       previousSpeaker = segment.speaker;
-      row.style.setProperty('--speaker', gap ? 'var(--signal)' : colorFor(segment.speaker));
+      row.style.setProperty('--speaker', gap ? 'var(--gap)' : colorFor(segment.speaker));
       const start = segmentStart(segment);
       const time = el('button', 'segment-time', formatClock(start));
       time.type = 'button';
       time.disabled = !jobAudioURL;
       time.title = jobAudioURL ? 'Play from here' : '';
       time.addEventListener('click', () => jumpTo(start));
-      const speaker = el('span', 'segment-speaker', gap ? 'No transcript for this part' : displayName(segment.speaker));
+      const speaker = el('span', 'segment-speaker', gap ? 'Gap' : displayName(segment.speaker));
       if (!gap) speaker.dataset.speaker = segment.speaker;
       const text = el('p', 'segment-text', segment.text);
-      row.append(time, speaker, text);
+      const copy = el('button', 'icon-button segment-copy');
+      copy.type = 'button';
+      copy.title = 'Copy line';
+      copy.setAttribute('aria-label', 'Copy line');
+      copy.append(icon('copy'));
+      copy.addEventListener('click', () => copyLine(index));
+      const mark = gap ? el('span', 'avatar gap-mark', '!') : avatar(segment.speaker);
+      row.append(time, mark, speaker, text, copy);
       fragment.append(row);
       return { row, text, raw: segment.text, start, end: segmentEnd(segments, index) };
     });
     transcriptView.replaceChildren(fragment);
     activeRow = null;
+    focusedRow = -1;
     applySearch();
   }
+
+  async function copyText(text, message) {
+    try {
+      await navigator.clipboard.writeText(text);
+      toast(message);
+    } catch (_) {
+      toast('The browser blocked copying.');
+    }
+  }
+
+  function copyLine(index) {
+    const segment = currentResult.result.segments[index];
+    if (segment) void copyText(segment.text, 'Line copied');
+  }
+
+  function focusRow(index) {
+    if (!segmentRows[index]) return;
+    if (segmentRows[index].row.hidden) clearSearch();
+    if (segmentRows[focusedRow]) segmentRows[focusedRow].row.classList.remove('focused');
+    focusedRow = index;
+    activateTab(tabs[0]);
+    segmentRows[index].row.classList.add('focused');
+    segmentRows[index].row.scrollIntoView({ block: 'nearest', behavior: scrollBehavior() });
+  }
+
+  function moveRow(step) {
+    const start = focusedRow >= 0 ? focusedRow : segmentRows.findIndex((item) => item.row === activeRow) - (step > 0 ? 0 : -1);
+    let index = focusedRow < 0 && !activeRow ? (step > 0 ? 0 : segmentRows.length - 1) : start + step;
+    while (segmentRows[index] && segmentRows[index].row.hidden) index += step;
+    focusRow(index);
+  }
+
 
   function applySearch() {
     const query = searchInput.value.trim().toLowerCase();
@@ -1453,20 +2109,74 @@
   }
   searchInput.addEventListener('input', applySearch);
 
+  function clearSearch() {
+    if (!searchInput.value) return;
+    searchInput.value = '';
+    applySearch();
+  }
+
   // timeupdate fires only ~4 times a second, so the playhead follows the audio
   // every frame while playing. Moving it with transform avoids layout work.
   function placePlayhead() {
     if (timelineDuration <= 0) return;
     const fraction = Math.min(1, audioPlayer.currentTime / timelineDuration);
-    playhead.style.transform = `translateX(${timelineLanes.offsetLeft + timelineLanes.offsetWidth * fraction}px)`;
+    playhead.style.transform = `translateX(${timeline.clientWidth * fraction}px)`;
+    paintPlayer();
     playhead.hidden = false;
+    seek.value = String(audioPlayer.currentTime);
+    const clock = formatClock(audioPlayer.currentTime);
+    if (playerCurrent.textContent !== clock) {
+      playerCurrent.textContent = clock;
+      seek.setAttribute('aria-valuetext', clock);
+    }
   }
+
+  function syncPlayToggle() {
+    const playing = !audioPlayer.paused;
+    playToggle.classList.toggle('playing', playing);
+    playToggle.setAttribute('aria-label', playing ? 'Pause' : 'Play');
+  }
+
+  function togglePlay() {
+    if (audioPlayer.paused) void audioPlayer.play().catch(() => toast('This browser cannot play the recording.'));
+    else audioPlayer.pause();
+  }
+
+  // Hovering the waveform shows who says what there.
+  timeline.addEventListener('pointermove', (event) => {
+    if (wave.hidden || event.pointerType === 'touch') return;
+    const box = timeline.getBoundingClientRect();
+    const fraction = Math.min(1, Math.max(0, (event.clientX - box.left) / box.width));
+    const seconds = fraction * timelineDuration;
+    const index = segmentRows.findIndex((row) => seconds >= row.start && seconds <= row.end);
+    const segment = index >= 0 ? currentResult.result.segments[index] : null;
+    waveTip.replaceChildren(el('span', 'tabular', formatClock(seconds)));
+    if (segment) waveTip.append(el('strong', '', segment.speaker === GAP_SPEAKER ? 'Gap' : displayName(segment.speaker)), el('span', 'wave-quote', segment.text));
+    waveTip.hidden = false;
+    const half = waveTip.offsetWidth / 2;
+    waveTip.style.left = `${Math.min(Math.max(half, fraction * box.width), box.width - half)}px`;
+  });
+  timeline.addEventListener('pointerleave', () => { waveTip.hidden = true; });
+
+  playToggle.addEventListener('click', togglePlay);
+  ['pause', 'ended', 'emptied'].forEach((name) => audioPlayer.addEventListener(name, syncPlayToggle));
+  seek.addEventListener('input', () => {
+    audioPlayer.currentTime = Number(seek.value);
+    placePlayhead();
+    const target = rowAt(Number(seek.value));
+    if (target && followAudio.checked && !target.row.hidden) target.row.scrollIntoView({ block: 'nearest' });
+  });
+  playbackRate.addEventListener('change', () => { audioPlayer.playbackRate = Number(playbackRate.value); });
+  // Loading a new recording resets the rate.
+  audioPlayer.addEventListener('loadedmetadata', () => { audioPlayer.playbackRate = Number(playbackRate.value); });
+
   let playheadFrame = 0;
   function followPlayhead() {
     placePlayhead();
     playheadFrame = audioPlayer.paused ? 0 : window.requestAnimationFrame(followPlayhead);
   }
   audioPlayer.addEventListener('play', () => {
+    syncPlayToggle();
     window.cancelAnimationFrame(playheadFrame);
     playheadFrame = window.requestAnimationFrame(followPlayhead);
   });
@@ -1488,10 +2198,15 @@
 
   function renderResult(payload) {
     const result = payload.result;
-    $('app').classList.add('has-job');
-    emptyState.hidden = true;
     resultCard.hidden = false;
-    $('result-title').textContent = (currentJobName || (result.metadata && result.metadata.filename) || 'Transcript').replace(/\.[^.]+$/, '');
+    // Leave the form alone if the user is already preparing the next recording.
+    const focused = document.activeElement;
+    if (!workspace.hidden && (!focused || focused === document.body || statusCard.contains(focused))) resultTitle.focus({ preventScroll: true });
+    resultScroll.scrollTop = 0;
+    const entry = readHistory().find((item) => item.id === currentJobId);
+    $('result-crumb').textContent = entry ? `${dayLabel(entry.at) === 'Earlier' ? new Date(entry.at).toLocaleDateString() : dayLabel(entry.at)} at ${new Date(entry.at).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}` : 'Transcript';
+    resultTitle.textContent = (currentJobName || (result.metadata && result.metadata.filename) || 'Transcript').replace(/\.[^.]+$/, '');
+    resultTitle.title = resultTitle.textContent;
     const reviewed = Boolean(result.judge_used);
     tabs.forEach((tab) => { if (tab.hasAttribute('data-pipeline-only')) tab.hidden = !reviewed; });
     speakerNames.clear();
@@ -1500,10 +2215,11 @@
 
     renderSummary(result);
     renderTimeline(result);
-    renderChips(result.segments || []);
+    renderSpeakers(result.segments || []);
     renderTranscript(result.segments || []);
 
     player.hidden = !jobAudioURL;
+    $('player-options').hidden = !jobAudioURL;
     if (jobAudioURL) {
       if (audioPlayer.src !== jobAudioURL) audioPlayer.src = jobAudioURL;
     } else {
@@ -1519,7 +2235,6 @@
     ].join('\n');
     panes.quality.textContent = JSON.stringify(result.quality, null, 2);
     panes.evidence.textContent = JSON.stringify(result.agent_run || {}, null, 2);
-    exportStatus.textContent = '';
     activateTab(tabs[0]);
     renderHistory();
   }
@@ -1533,6 +2248,7 @@
       t.tabIndex = active ? 0 : -1;
       panes[t.dataset.tab].hidden = !active;
     });
+    $('search').hidden = tab.dataset.tab !== 'transcript';
     if (focus) tab.focus();
     if (tab.dataset.tab === 'subtitles') void refreshSubtitles();
   }
@@ -1580,113 +2296,252 @@
   }
 
   function renderFormats() {
-    formatGrid.replaceChildren(...FORMATS.map((format) => {
-      const button = el('button', 'format-option');
+    $('format-list').replaceChildren(...FORMATS.map((format) => {
+      const button = el('button', 'menu-item');
       button.type = 'button';
-      button.setAttribute('role', 'radio');
-      button.dataset.format = format.id;
-      const label = el('span', 'format-label');
-      label.append(el('span', 'format-name', format.label), el('span', 'format-use', format.use));
-      button.append(label, el('span', 'format-ext', format.ext));
-      button.addEventListener('click', () => selectFormat(format.id));
+      button.append(el('span', '', format.label), el('span', 'menu-meta', format.ext));
+      button.addEventListener('click', () => {
+        $('export-menu').hidePopover();
+        void downloadAs(format.id);
+      });
       return button;
     }));
-    selectFormat(storage.get(localStorage, 'export-format', 'docx'));
   }
 
-  function selectFormat(id) {
-    const format = FORMATS.find((item) => item.id === id) || FORMATS[0];
-    selectedFormat = format.id;
-    storage.set(localStorage, 'export-format', format.id);
-    formatGrid.querySelectorAll('.format-option').forEach((button) => {
-      const checked = button.dataset.format === format.id;
-      button.classList.toggle('selected', checked);
-      button.setAttribute('aria-checked', String(checked));
-      button.tabIndex = checked ? 0 : -1;
-    });
-    timestampsOption.hidden = !format.timestamps;
-    exportDownload.textContent = `Download ${format.ext}`;
-    exportCopy.hidden = Boolean(format.binary);
-  }
-
-  formatGrid.addEventListener('keydown', (event) => {
-    if (!['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown'].includes(event.key)) return;
-    event.preventDefault();
-    const index = FORMATS.findIndex((item) => item.id === selectedFormat);
-    const step = ['ArrowRight', 'ArrowDown'].includes(event.key) ? 1 : -1;
-    const next = FORMATS[(index + step + FORMATS.length) % FORMATS.length];
-    selectFormat(next.id);
-    formatGrid.querySelector(`[data-format="${next.id}"]`).focus();
-  });
-
-  function downloadName(response) {
+  function downloadName(response, format) {
     const header = response.headers.get('Content-Disposition') || '';
     const match = /filename\*=UTF-8''([^;]+)|filename="([^"]+)"/i.exec(header);
     if (match) return match[1] ? decodeURIComponent(match[1]) : match[2];
-    return `transcript.${selectedFormat}`;
+    return `transcript.${format}`;
   }
 
-  exportDownload.addEventListener('click', async () => {
-    exportDownload.disabled = true;
-    exportStatus.textContent = 'Preparing…';
+  async function downloadAs(format) {
+    $('export-button').disabled = true;
     try {
-      const response = await fetchExport(selectedFormat, exportTimestamps.checked);
-      const blob = await response.blob();
-      const url = URL.createObjectURL(blob);
+      const response = await fetchExport(format, exportTimestamps.checked);
+      const url = URL.createObjectURL(await response.blob());
       const link = el('a');
       link.href = url;
-      link.download = downloadName(response);
+      link.download = downloadName(response, format);
       document.body.append(link);
       link.click();
       link.remove();
       window.setTimeout(() => URL.revokeObjectURL(url), 1000);
-      exportStatus.textContent = '';
       toast(`Downloaded ${link.download}`);
     } catch (error) {
-      exportStatus.textContent = `Download failed: ${error.message}`;
+      toast(`Download failed: ${error.message}`);
     } finally {
-      exportDownload.disabled = false;
+      $('export-button').disabled = false;
     }
-  });
+  }
 
-  exportCopy.addEventListener('click', async () => {
-    exportCopy.disabled = true;
+  async function copyAs(format) {
     try {
-      const response = await fetchExport(selectedFormat, exportTimestamps.checked);
-      await navigator.clipboard.writeText(await response.text());
-      exportStatus.textContent = '';
-      toast('Copied to clipboard');
+      const response = await fetchExport(format, exportTimestamps.checked);
+      await copyText(await response.text(), 'Copied to clipboard');
     } catch (error) {
-      exportStatus.textContent = `Copy failed: ${error.message}`;
-    } finally {
-      exportCopy.disabled = false;
+      toast(`Copy failed: ${error.message}`);
+    }
+  }
+  document.querySelectorAll('[data-copy]').forEach((button) => button.addEventListener('click', () => {
+    $('copy-menu').hidePopover();
+    void copyAs(button.dataset.copy);
+  }));
+
+  // ---- Command menu --------------------------------------------------------------
+  const isMac = /mac|iphone|ipad/i.test(navigator.platform);
+  const keyText = (text) => text.replace('mod', isMac ? '⌘' : 'Ctrl');
+  document.querySelectorAll('kbd').forEach((node) => { node.textContent = keyText(node.textContent); });
+
+  let paletteItems = [];
+  let paletteIndex = 0;
+
+  function commands() {
+    const open = !workspace.hidden && !resultCard.hidden && Boolean(currentResult);
+    const list = [
+      { group: 'Commands', label: 'New transcription', icon: 'plus', kbd: 'N', run: () => showView('compose', fileTitle) },
+      { group: 'Commands', label: 'Choose a recording', icon: 'upload', run: () => { showView('compose'); fileInput.click(); } },
+    ];
+    if (open) {
+      if (jobAudioURL) list.push({ group: 'Commands', label: audioPlayer.paused ? 'Play recording' : 'Pause recording', icon: audioPlayer.paused ? 'play' : 'pause', kbd: 'Space', run: togglePlay });
+      list.push({ group: 'Commands', label: 'Copy transcript as text', icon: 'copy', run: () => copyAs('txt') });
+      FORMATS.forEach((format) => list.push({ group: 'Commands', label: `Export as ${format.label}`, icon: 'download', meta: format.ext, run: () => downloadAs(format.id) }));
+    }
+    list.push(
+      { group: 'Commands', label: 'Show or hide details', icon: 'panel', kbd: ']', run: toggleDetails },
+      { group: 'Commands', label: 'API keys', icon: 'key', run: () => openKeys() },
+      { group: 'Commands', label: 'Keyboard shortcuts', icon: 'keyboard', kbd: '?', run: openShortcuts },
+      ...Object.entries(THEMES).filter(([id]) => id !== currentTheme()).map(([id, label]) => ({ group: 'Commands', label: `Use ${label.toLowerCase()}`, icon: 'theme', run: () => setTheme(id) })),
+    );
+    const history = readHistory();
+    if (history.some((item) => jobStatus(item) === 'expired')) {
+      list.push({ group: 'Commands', label: 'Clear expired transcripts from the list', icon: 'x', run: () => {
+        writeHistory(history.filter((item) => jobStatus(item) !== 'expired'));
+        renderHistory();
+      } });
+    }
+    history.forEach((item) => list.push({ group: 'Transcripts', label: item.name || 'Recording', status: jobStatus(item), fraction: isLive(item) ? liveFraction : 0, meta: relativeTime(item.at), run: () => openFromHistory(item) }));
+    return list;
+  }
+
+  function lineMatches(query) {
+    if (query.length < 2 || !currentResult || resultCard.hidden) return [];
+    return (currentResult.result.segments || [])
+      .map((segment, index) => ({ segment, index }))
+      .filter(({ segment }) => segment.text.toLowerCase().includes(query))
+      .slice(0, 6)
+      .map(({ segment, index }) => ({
+        group: 'In this transcript', label: segment.text, icon: 'wave', meta: formatClock(segmentStart(segment)),
+        run: () => { showView('job'); focusRow(index); },
+      }));
+  }
+
+  function renderPalette() {
+    const query = paletteInput.value.trim().toLowerCase();
+    const words = query.split(/\s+/).filter(Boolean);
+    const found = commands().filter((item) => words.every((word) => item.label.toLowerCase().includes(word)));
+    const order = query ? ['Transcripts', 'In this transcript', 'Commands'] : ['Commands', 'Transcripts'];
+    const all = [...found, ...lineMatches(query)];
+    paletteItems = order.flatMap((group) => all.filter((item) => item.group === group));
+    paletteIndex = 0;
+    const nodes = [];
+    let group = '';
+    paletteItems.forEach((item, index) => {
+      if (item.group !== group) {
+        group = item.group;
+        nodes.push(el('p', 'menu-label', group));
+      }
+      const row = el('div', 'palette-item');
+      row.id = `palette-${index}`;
+      row.setAttribute('role', 'option');
+      row.append(item.status ? statusIcon(item.status, item.fraction) : icon(item.icon), el('span', 'palette-text', item.label));
+      if (item.meta) row.append(el('span', 'menu-meta tabular', item.meta));
+      if (item.kbd) row.append(el('kbd', '', keyText(item.kbd)));
+      row.addEventListener('pointermove', () => selectPalette(index, false));
+      row.addEventListener('click', () => runPalette(index));
+      nodes.push(row);
+    });
+    if (!nodes.length) nodes.push(el('p', 'palette-empty', 'Nothing matches.'));
+    paletteList.replaceChildren(...nodes);
+    selectPalette(0, true);
+  }
+
+  function selectPalette(index, scroll) {
+    if (!paletteItems.length) {
+      paletteInput.removeAttribute('aria-activedescendant');
+      return;
+    }
+    paletteIndex = (index + paletteItems.length) % paletteItems.length;
+    paletteList.querySelectorAll('.palette-item').forEach((row, i) => row.setAttribute('aria-selected', String(i === paletteIndex)));
+    const row = $(`palette-${paletteIndex}`);
+    paletteInput.setAttribute('aria-activedescendant', row.id);
+    if (scroll) row.scrollIntoView({ block: 'nearest' });
+  }
+
+  function runPalette(index) {
+    const item = paletteItems[index];
+    if (!item) return;
+    palette.close();
+    item.run();
+  }
+
+  function openPalette() {
+    if (palette.open) {
+      palette.close();
+      return;
+    }
+    if (document.querySelector('dialog[open]')) return;
+    paletteInput.value = '';
+    palette.showModal();
+    renderPalette();
+    paletteInput.focus();
+  }
+
+  function openShortcuts() {
+    if (!document.querySelector('dialog[open]')) $('shortcuts-dialog').showModal();
+  }
+
+  $('open-palette').addEventListener('click', openPalette);
+  $('shortcuts-button').addEventListener('click', openShortcuts);
+  [palette, $('shortcuts-dialog')].forEach((dialog) => dialog.addEventListener('click', (event) => {
+    if (event.target === dialog) dialog.close();
+  }));
+  paletteInput.addEventListener('input', renderPalette);
+  paletteInput.addEventListener('keydown', (event) => {
+    if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+      event.preventDefault();
+      selectPalette(paletteIndex + (event.key === 'ArrowDown' ? 1 : -1), true);
+    } else if (event.key === 'Enter') {
+      event.preventDefault();
+      runPalette(paletteIndex);
     }
   });
 
   // ---- Keyboard shortcuts ----------------------------------------------------------
   document.addEventListener('keydown', (event) => {
-    if (event.defaultPrevented || event.metaKey || event.ctrlKey || event.altKey || isTyping(event.target)) return;
-    if (resultCard.hidden || keysDialog.open) return;
-    if (event.key === '/') {
+    if (event.defaultPrevented) return;
+    const mod = isMac ? event.metaKey : event.ctrlKey;
+    if (mod && event.key.toLowerCase() === 'k') {
+      event.preventDefault();
+      openPalette();
+      return;
+    }
+    if (document.querySelector('dialog[open]')) return;
+    if (mod && event.key === 'Enter' && !compose.hidden) {
+      event.preventDefault();
+      if (!submitBtn.disabled) form.requestSubmit(submitBtn);
+      return;
+    }
+    if (event.key === 'Escape' && sidebar.classList.contains('open')) closeSidebar();
+    if (event.metaKey || event.ctrlKey || event.altKey || isTyping(event.target) || document.querySelector('.menu:popover-open')) return;
+    const key = event.key.length === 1 ? event.key.toLowerCase() : event.key;
+    if (key === 'n') {
+      event.preventDefault();
+      showView('compose', fileTitle);
+    } else if (key === '?') {
+      openShortcuts();
+    } else if (key === ']') {
+      toggleDetails();
+    } else if (!compose.hidden) {
+      if (key === ' ' && filePeaks && [document.body, fileTitle].includes(event.target)) {
+        event.preventDefault();
+        togglePreview();
+      }
+    } else if (!resultCard.hidden && currentResult) {
+      resultKey(event, key);
+    }
+  });
+
+  function resultKey(event, key) {
+    const onControl = event.target.closest('button, a, summary, select, input:not([type="range"]), [role="tab"]');
+    // A line the search has hidden is not one to act on.
+    const line = segmentRows[focusedRow] && !segmentRows[focusedRow].row.hidden ? segmentRows[focusedRow] : null;
+    if (key === '/') {
       event.preventDefault();
       activateTab(tabs[0]);
       searchInput.focus();
-    } else if (event.key === ' ' && jobAudioURL && event.target === document.body) {
+    } else if (key === 'j' || key === 'k') {
+      moveRow(key === 'j' ? 1 : -1);
+    } else if (key === 'c' && line) {
+      copyLine(focusedRow);
+    } else if (key === 'Enter' && line && !onControl) {
+      jumpTo(line.start);
+    } else if (key === ' ' && jobAudioURL && !onControl) {
       event.preventDefault();
-      if (audioPlayer.paused) void audioPlayer.play().catch(() => {});
-      else audioPlayer.pause();
+      togglePlay();
     }
-  });
+  }
 
   // ---- Start --------------------------------------------------------------------
   renderFormats();
   renderHistory();
   restoreSettings();
   syncForm();
-  void loadConfig();
+  navCompose.setAttribute('aria-current', 'page');
+  void loadConfig().then(refreshStatuses);
   const resumable = storage.get(sessionStorage, ACTIVE_JOB_KEY, '');
   if (resumable) {
     const entry = readHistory().find((item) => item.id === resumable);
-    openJob(resumable, entry ? entry.name : '');
+    openJob(resumable, entry ? entry.name : '', entry ? entry.model : '');
   }
 })();

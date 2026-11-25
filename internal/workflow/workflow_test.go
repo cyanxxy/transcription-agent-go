@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -120,7 +121,7 @@ func TestMinimumAudioTokenBudgetRejectsImpossibleRun(t *testing.T) {
 func TestMinimumAudioTokenBudgetCountsOnlyGuaranteedAdaptiveCandidate(t *testing.T) {
 	deps, err := config.NewTranscriptionDeps(
 		"k",
-		config.WithModelName("gemini-3.8-flash"),
+		config.WithModelName("gemini-4-hydrogen"),
 		config.WithTempDir(t.TempDir()),
 		config.WithCandidateStrategy("dual_gemini"),
 		config.WithAgentMaxTokens(1_000_000),
@@ -284,7 +285,7 @@ func TestRunUnitWithJudgeRejectsOutOfSpanOutput(t *testing.T) {
 			w.WriteHeader(http.StatusBadRequest)
 			return
 		}
-		text := `{"segments":[{"timestamp":"[00:20:00]","speaker":"S","text":"invented boundary"}],"selected_candidate_ids":["gemini_3.8_flash"],"processing_notes":["judge output"]}`
+		text := `{"segments":[{"timestamp":"[00:20:00]","speaker":"S","text":"invented boundary"}],"selected_candidate_ids":["gemini_4_hydrogen"],"processing_notes":["judge output"]}`
 		if interactionInputHasType(body, "audio") {
 			text = `{"segments":[{"timestamp":"[00:00:00]","speaker":"S","text":"candidate evidence"}]}`
 		}
@@ -300,7 +301,7 @@ func TestRunUnitWithJudgeRejectsOutOfSpanOutput(t *testing.T) {
 		t.Fatal(err)
 	}
 	wfl, err := New("key",
-		config.WithModelName("gemini-3.8-flash"), config.WithCandidateStrategy("single_gemini"),
+		config.WithModelName("gemini-4-hydrogen"), config.WithCandidateStrategy("single_gemini"),
 		config.WithAgenticMode(false),
 		config.WithTempDir(t.TempDir()),
 	)
@@ -322,7 +323,7 @@ func TestRunUnitWithJudgeRejectsOutOfSpanOutput(t *testing.T) {
 	if len(result.finalSegments) != 1 || result.finalSegments[0].Timestamp != "[00:01:00]" || result.finalSegments[0].Text != "candidate evidence" {
 		t.Fatalf("out-of-span judge output was accepted: %#v", result.finalSegments)
 	}
-	if len(result.selectedCandidateIDs) != 1 || result.selectedCandidateIDs[0] != "gemini_3.8_flash" {
+	if len(result.selectedCandidateIDs) != 1 || result.selectedCandidateIDs[0] != "gemini_4_hydrogen" {
 		t.Fatalf("fallback provenance is wrong: %#v", result.selectedCandidateIDs)
 	}
 	if !strings.Contains(strings.Join(result.judgeNotes, " "), "rejected by span validation") {
@@ -378,7 +379,7 @@ func TestDualGeminiCandidatesShareOneFilesUpload(t *testing.T) {
 	if err := os.WriteFile(audioPath, []byte("wav"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	wfl, err := New("key", config.WithModelName("gemini-3.8-flash"), config.WithCandidateStrategy("dual_gemini"), config.WithAgenticMode(false), config.WithTempDir(t.TempDir()))
+	wfl, err := New("key", config.WithModelName("gemini-4-hydrogen"), config.WithCandidateStrategy("dual_gemini"), config.WithAgenticMode(false), config.WithTempDir(t.TempDir()))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -578,7 +579,7 @@ func TestTranscribeInjectsFormatSkill(t *testing.T) {
 	}
 
 	const transcriptText = `{"segments":[{"timestamp":"[00:00:00]","speaker":"Alice","text":"Hello world"}]}`
-	const cannedText = `{"segments":[{"timestamp":"[00:00:00]","speaker":"Alice","text":"Hello world"}],"selected_candidate_ids":["gemini_3.8_flash"],"processing_notes":["ok"]}`
+	const cannedText = `{"segments":[{"timestamp":"[00:00:00]","speaker":"Alice","text":"Hello world"}],"selected_candidate_ids":["gemini_4_hydrogen"],"processing_notes":["ok"]}`
 
 	var mu sync.Mutex
 	var bodies []string
@@ -632,7 +633,7 @@ func TestTranscribeInjectsFormatSkill(t *testing.T) {
 
 	c := gemini.NewClient("k").WithEndpoint(srv.URL)
 	wfl, err := workflowNewForTest(t,
-		config.WithModelName("gemini-3.8-flash"), config.WithCandidateStrategy("single_gemini"),
+		config.WithModelName("gemini-4-hydrogen"), config.WithCandidateStrategy("single_gemini"),
 		config.WithChunkConcurrency(1),
 		config.WithTempDir(t.TempDir()),
 	)
@@ -747,6 +748,143 @@ func TestExternalSpeechDirectWorkflow(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+// A fake Azure that follows the documented MAI-Transcribe-2 contract hears a
+// scripted conversation: each chunk reports only its own words, with phrases as
+// long as a speaker talks and speaker numbers assigned per request.
+func TestMicrosoftChunkedWorkflowKeepsEveryWordOnce(t *testing.T) {
+	if _, err := exec.LookPath("ffmpeg"); err != nil {
+		t.Skip("ffmpeg missing")
+	}
+	old := http.DefaultClient
+	defer func() { http.DefaultClient = old }()
+	type word struct {
+		text    string
+		speaker int
+	}
+	const wordMS, totalMS = 500, 62000
+	var script []word
+	for i := 0; i < totalMS/wordMS; i++ {
+		speaker := 0
+		if i >= 6 && i < 100 { // one 47-second monologue crosses every seam but the last
+			speaker = 1
+		}
+		script = append(script, word{fmt.Sprintf("word%d", i), speaker})
+	}
+	const chunkMS, overlapMS = 20000, 5000
+	var requests atomic.Int32
+	http.DefaultClient = &http.Client{Transport: externalSpeechTransport(func(r *http.Request) (*http.Response, error) {
+		defer r.Body.Close()
+		reply := func(status int, body string) (*http.Response, error) {
+			return &http.Response{StatusCode: status, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(body))}, nil
+		}
+		if r.Method != http.MethodPost || r.URL.String() != "https://test.cognitiveservices.azure.com/speechtotext/transcriptions:transcribe?api-version=2025-10-15" || r.Header.Get("Ocp-Apim-Subscription-Key") != "test" {
+			return reply(404, "")
+		}
+		if err := r.ParseMultipartForm(64 << 20); err != nil {
+			return reply(400, "")
+		}
+		defer r.MultipartForm.RemoveAll()
+		decoder := json.NewDecoder(strings.NewReader(r.FormValue("definition")))
+		decoder.DisallowUnknownFields()
+		var definition struct {
+			Locales      []string               `json:"locales"`
+			Diarization  struct{ Enabled bool } `json:"diarization"`
+			EnhancedMode struct {
+				Enabled      bool   `json:"enabled"`
+				Model        string `json:"model"`
+				ModelOptions struct {
+					Timestamps      string `json:"timestamps"`
+					TranscribeStyle string `json:"transcribeStyle"`
+				} `json:"modelOptions"`
+			} `json:"enhancedMode"`
+		}
+		if err := decoder.Decode(&definition); err != nil || !definition.EnhancedMode.Enabled || definition.EnhancedMode.Model != "MAI-Transcribe-2" ||
+			definition.EnhancedMode.ModelOptions.Timestamps != "word" || !definition.Diarization.Enabled || len(definition.Locales) != 1 || definition.Locales[0] != "en" {
+			t.Errorf("definition rejected: %+v %v", definition, err)
+			return reply(400, "")
+		}
+		file, header, err := r.FormFile("audio")
+		if err != nil || filepath.Ext(header.Filename) != ".wav" {
+			return reply(400, "")
+		}
+		file.Close()
+		// Chunks run one at a time, so the request number gives the offset.
+		offset := int(requests.Add(1)-1) * (chunkMS - overlapMS)
+		lengthMS := int(header.Size-44) / 48 // 24 kHz mono 16-bit
+		type wireWord struct {
+			Text     string `json:"text"`
+			Offset   int    `json:"offsetMilliseconds"`
+			Duration int    `json:"durationMilliseconds"`
+		}
+		type phrase struct {
+			Offset   int        `json:"offsetMilliseconds"`
+			Duration int        `json:"durationMilliseconds"`
+			Text     string     `json:"text"`
+			Speaker  int        `json:"speaker"`
+			Locale   string     `json:"locale"`
+			Words    []wireWord `json:"words"`
+		}
+		var phrases []phrase
+		local := map[int]int{}
+		previous := -1
+		for i, w := range script {
+			start := i*wordMS - offset
+			if start < 0 || start+wordMS > lengthMS+wordMS/2 {
+				continue
+			}
+			if _, ok := local[w.speaker]; !ok {
+				local[w.speaker] = len(local)
+			}
+			if w.speaker != previous {
+				phrases = append(phrases, phrase{Offset: start, Speaker: local[w.speaker], Locale: "en"})
+				previous = w.speaker
+			}
+			last := &phrases[len(phrases)-1]
+			last.Words = append(last.Words, wireWord{w.text, start, wordMS - 50})
+			last.Text = strings.TrimSpace(last.Text + " " + w.text)
+			last.Duration = start + wordMS - 50 - last.Offset
+		}
+		body, _ := json.Marshal(map[string]any{"durationMilliseconds": lengthMS, "phrases": phrases})
+		return reply(200, string(body))
+	})}
+
+	tmp := t.TempDir()
+	path := filepath.Join(tmp, "input.wav")
+	if err := exec.Command("ffmpeg", "-v", "error", "-f", "lavfi", "-i", "sine=frequency=440:duration=62", "-y", path).Run(); err != nil {
+		t.Fatal(err)
+	}
+	w, err := workflowNewForTest(t, config.WithModelName(config.MicrosoftTranscriptionModel), config.WithChunkDurationMS(chunkMS), config.WithChunkOverlapMS(overlapMS), config.WithChunkStrategy("fixed"), config.WithChunkConcurrency(1), config.WithTempDir(tmp), func(d *config.TranscriptionDeps) {
+		d.AzureSpeechKey = "test"
+		d.AzureSpeechEndpoint = "https://test.cognitiveservices.azure.com"
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	w.Client = nil
+	result, err := w.Transcribe(context.Background(), TranscribeInput{FilePath: path, Filename: "input.wav", UserContext: &models.TranscriptContext{LanguageCodes: []string{"en-US"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if requests.Load() != 4 {
+		t.Errorf("%d requests, want 4", requests.Load())
+	}
+	var got, want []string
+	for _, segment := range result.Segments {
+		if segment.Start == nil || segment.End == nil || *segment.End-*segment.Start > 21 {
+			t.Errorf("segment timing too coarse: %+v", segment)
+		}
+		for _, text := range strings.Fields(segment.Text) {
+			got = append(got, segment.Speaker+" "+text)
+		}
+	}
+	for _, w := range script {
+		want = append(want, fmt.Sprintf("Speaker %d %s", w.speaker+1, w.text))
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("got %d words, want %d\n%v", len(got), len(want), got)
 	}
 }
 

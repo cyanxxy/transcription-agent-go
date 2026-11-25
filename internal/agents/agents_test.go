@@ -653,7 +653,7 @@ func TestTranscriptionAgentRunUsesUploadedFileAndOffsetsChunk(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	deps, err := config.NewTranscriptionDeps("test-key", config.WithCandidateStrategy("single_gemini"), config.WithModelName("gemini-3.8-flash"))
+	deps, err := config.NewTranscriptionDeps("test-key", config.WithCandidateStrategy("single_gemini"), config.WithModelName("gemini-4-hydrogen"))
 	if err != nil {
 		t.Fatal(err)
 	}

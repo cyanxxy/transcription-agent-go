@@ -1,6 +1,7 @@
 package agents
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -15,6 +16,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/cyanxxy/transcription-agent-go/internal/config"
 	"github.com/cyanxxy/transcription-agent-go/internal/gemini"
@@ -41,14 +44,14 @@ func ValidateSpeechCredentials(d *config.TranscriptionDeps) error {
 }
 
 // runExternalSpeech transcribes with Meta or Microsoft and returns provider
-// turns with absolute offsets and request-local speaker labels.
+// turns or words with absolute offsets and request-local speaker labels.
 func (a *TranscriptionAgent) runExternalSpeech(ctx context.Context, in TranscribeInput) ([]TimedUnit, error) {
 	d := a.Deps
 	if err := ValidateSpeechCredentials(d); err != nil {
 		return nil, err
 	}
-	if d.ModelName == config.MetaTranscriptionModel && in.AudioDurationSeconds > 600 {
-		return nil, fmt.Errorf("meta file transcription is limited to 10 minutes per chunk")
+	if in.AudioDurationSeconds > 600 {
+		return nil, fmt.Errorf("%s transcription is limited to 10 minutes per chunk", d.ModelName)
 	}
 	// Both APIs accept WAV. Normalize every input, including short M4A/MP4 uploads.
 	wav, err := os.CreateTemp(d.TempDir, "speech-*.wav")
@@ -76,7 +79,8 @@ func (a *TranscriptionAgent) runExternalSpeech(ctx context.Context, in Transcrib
 }
 
 // Requests follow Meta's official file cookbook and Azure Fast Transcription
-// api-version=2025-10-15 (MAI enhancedMode). Multipart bodies stay on disk so
+// api-version=2025-10-15 (MAI enhancedMode, checked 2026-11-25:
+// https://learn.microsoft.com/azure/ai-services/speech-service/mai-transcribe). Multipart bodies stay on disk so
 // retries and parallel chunks do not duplicate entire recordings in memory.
 func transcribeSpeechWAV(ctx context.Context, d *config.TranscriptionDeps, path string, client *http.Client) ([]models.TranscriptSegment, error) {
 	units, err := transcribeSpeechUnits(ctx, d, path, client)
@@ -96,14 +100,17 @@ func transcribeSpeechUnits(ctx context.Context, d *config.TranscriptionDeps, pat
 		endpoint = strings.TrimRight(d.AzureSpeechEndpoint, "/") + "/speechtotext/transcriptions:transcribe?api-version=2025-10-15"
 		key, header, auth = d.AzureSpeechKey, "Ocp-Apim-Subscription-Key", ""
 		field = "definition"
-		definition := map[string]any{"enhancedMode": map[string]any{"enabled": true, "model": d.ModelName, "modelOptions": map[string]any{"timestamps": "segment", "transcribeStyle": "verbatim"}}, "diarization": map[string]any{"enabled": true}}
-		// MAI-Transcribe-2 accepts a single forced locale and otherwise
+		definition := map[string]any{"enhancedMode": map[string]any{"enabled": true, "model": d.ModelName, "modelOptions": map[string]any{"timestamps": "word", "transcribeStyle": "verbatim"}}, "diarization": map[string]any{"enabled": true}}
+		// MAI-Transcribe-2 accepts a single forced language and otherwise
 		// auto-detects (including code switching), so only one code is sent.
 		if len(d.LanguageCodes) == 1 {
-			definition["locales"] = d.LanguageCodes
+			if language := microsoftLanguage(d.LanguageCodes[0]); language != "" {
+				definition["locales"] = []string{language}
+			}
 		}
 		options = definition
-		limit = 300 << 20
+		// The REST reference caps audio below 250 MB; other pages differ.
+		limit = 250_000_000
 	}
 	audio, err := os.Open(path)
 	if err != nil {
@@ -126,7 +133,9 @@ func transcribeSpeechUnits(ctx context.Context, d *config.TranscriptionDeps, pat
 	writer := multipart.NewWriter(body)
 	h := textproto.MIMEHeader{}
 	h.Set("Content-Disposition", fmt.Sprintf(`form-data; name="%s"`, field))
-	h.Set("Content-Type", "application/json")
+	if d.ModelName == config.MetaTranscriptionModel {
+		h.Set("Content-Type", "application/json")
+	} // Azure documents definition as a plain form field.
 	part, err := writer.CreatePart(h)
 	if err != nil {
 		return nil, err
@@ -195,7 +204,8 @@ func transcribeSpeechUnits(ctx context.Context, d *config.TranscriptionDeps, pat
 		if res.StatusCode >= 200 && res.StatusCode < 300 {
 			return parseSpeechUnits(d.ModelName, data)
 		}
-		if attempt < 2 && (res.StatusCode == 429 || res.StatusCode >= 500) {
+		// A 408 can take minutes to arrive, so it is retried only once.
+		if (attempt < 2 && (res.StatusCode == 429 || res.StatusCode >= 500)) || (attempt < 1 && res.StatusCode == 408) {
 			delay := time.Duration(1<<attempt) * time.Second
 			if sec, err := strconv.Atoi(res.Header.Get("Retry-After")); err == nil && sec > 0 {
 				delay = time.Duration(min(sec, 120)) * time.Second
@@ -218,17 +228,30 @@ func transcribeSpeechUnits(ctx context.Context, d *config.TranscriptionDeps, pat
 		case 400:
 			hint = "check audio limits and provider resource/model configuration"
 		}
+		if d.ModelName == config.MicrosoftTranscriptionModel {
+			switch {
+			case res.StatusCode == 408 || bytes.Contains(data, []byte("diarization_unavailable")):
+				hint = "Microsoft's speaker labeling is unavailable or timed out; retry later, use shorter chunks, or choose another model"
+			case res.StatusCode == 400:
+				hint = "check that the Speech resource is in a region that supports MAI-Transcribe (" + microsoftRegions + ")"
+			case res.StatusCode == 403:
+				hint = "check the key, and that the Speech resource uses the Standard (S0) tier"
+			case res.StatusCode == 404:
+				hint = "check the Azure Speech endpoint"
+			}
+		}
 		return nil, fmt.Errorf("%s HTTP %d: %s", d.ModelName, res.StatusCode, hint)
 	}
 	return nil, fmt.Errorf("speech retries exhausted")
 }
 
-// parseSpeechUnits returns provider turns sorted by start time, with
+// parseSpeechUnits returns provider turns or words sorted by start time, with
 // request-relative offsets and provider speaker labels.
 func parseSpeechUnits(model string, data []byte) ([]TimedUnit, error) {
 	type turn struct {
 		Start, End    *float64
 		Text, Speaker string
+		Words         []microsoftWord
 	}
 	var turns []turn
 	if model == config.MetaTranscriptionModel {
@@ -245,15 +268,16 @@ func parseSpeechUnits(model string, data []byte) ([]TimedUnit, error) {
 			return nil, fmt.Errorf("decode Meta transcript: %w", err)
 		}
 		for _, t := range response.Turns {
-			turns = append(turns, turn{t.Start, t.End, t.Text, t.Speaker})
+			turns = append(turns, turn{Start: t.Start, End: t.End, Text: t.Text, Speaker: t.Speaker})
 		}
 	} else {
 		var response struct {
 			Phrases []struct {
-				Start    *float64 `json:"offsetMilliseconds"`
-				Duration *float64 `json:"durationMilliseconds"`
-				Text     string   `json:"text"`
-				Speaker  *int     `json:"speaker"`
+				Start    *float64        `json:"offsetMilliseconds"`
+				Duration *float64        `json:"durationMilliseconds"`
+				Text     string          `json:"text"`
+				Speaker  *int            `json:"speaker"`
+				Words    []microsoftWord `json:"words"`
 			} `json:"phrases"`
 		}
 		if err := json.Unmarshal(data, &response); err != nil {
@@ -269,7 +293,7 @@ func parseSpeechUnits(model string, data []byte) ([]TimedUnit, error) {
 				value := *p.Start + *p.Duration
 				end = &value
 			}
-			turns = append(turns, turn{p.Start, end, p.Text, speaker})
+			turns = append(turns, turn{p.Start, end, p.Text, speaker, p.Words})
 		}
 	}
 	units := make([]TimedUnit, 0, len(turns))
@@ -278,6 +302,10 @@ func parseSpeechUnits(model string, data []byte) ([]TimedUnit, error) {
 			return nil, fmt.Errorf("speech response has a missing or negative timestamp")
 		}
 		if strings.TrimSpace(t.Text) == "" {
+			continue
+		}
+		if words := timedPhraseWords(t.Text, t.Speaker, t.Words); words != nil {
+			units = append(units, words...)
 			continue
 		}
 		start := int64(*t.Start)
@@ -294,6 +322,138 @@ func parseSpeechUnits(model string, data []byte) ([]TimedUnit, error) {
 	}
 	sort.SliceStable(units, func(i, j int) bool { return units[i].StartMS < units[j].StartMS })
 	return units, nil
+}
+
+// microsoftRegions is the "Transcribe with MAI-Transcribe" column of
+// https://learn.microsoft.com/azure/ai-services/speech-service/regions.
+const microsoftRegions = "centralindia, eastus, northeurope, southeastasia, swedencentral, westeurope, westus, westus2"
+
+// microsoftLanguages are the codes MAI-Transcribe-2 documents.
+var microsoftLanguages = func() map[string]struct{} {
+	set := map[string]struct{}{}
+	for _, code := range strings.Fields(`af ar as az bg bn bs ca cs da de el en es et fa fi fil fr gl
+		gu he hi hu hy id is it ja kk kn ko lt lv mk ml mr ms nb ne nl or pa pl pt ro ru sk sl sv sw
+		ta te th tr uk ur vi yue zh`) {
+		set[code] = struct{}{}
+	}
+	return set
+}()
+
+// microsoftLanguage maps a BCP-47 code to the bare code MAI-Transcribe-2
+// lists, or "" to leave detection automatic: forcing a language is a very
+// strong hint, so an unlisted or ambiguous one is not sent.
+func microsoftLanguage(code string) string {
+	parts := strings.Split(code, "-")
+	language := parts[0]
+	switch language {
+	case "cmn":
+		language = "zh"
+	case "no":
+		language = "nb"
+	case "tl":
+		language = "fil"
+	}
+	if language == "zh" {
+		for _, part := range parts[1:] {
+			switch part {
+			case "Hant", "HK", "MO", "TW":
+				return "" // only Simplified Chinese and Cantonese (yue) are listed
+			}
+		}
+	}
+	if _, ok := microsoftLanguages[language]; !ok {
+		return ""
+	}
+	return language
+}
+
+type microsoftWord struct {
+	Text     string   `json:"text"`
+	Start    *float64 `json:"offsetMilliseconds"`
+	Duration *float64 `json:"durationMilliseconds"`
+}
+
+// timedPhraseWords splits a phrase's display text into word units. A phrase
+// can be minutes long (it lasts as long as one speaker), so it cannot be cut
+// where chunks overlap or matched to the neighboring chunk's speakers; words
+// can. Words may lack the display text's case and punctuation, so each one
+// only locates its time within that text. Words the display text does not
+// separate with a space (Chinese, Japanese, hyphens) stay together up to the
+// end of a sentence. It returns nil when the words do not spell the text, and
+// the caller keeps the whole phrase as one turn.
+func timedPhraseWords(text, speaker string, words []microsoftWord) []TimedUnit {
+	if len(words) == 0 {
+		return nil
+	}
+	type letter struct {
+		r  rune
+		at int
+	}
+	var letters []letter
+	for at, r := range text {
+		if isSpokenRune(r) {
+			letters = append(letters, letter{unicode.ToLower(r), at})
+		}
+	}
+	var units []TimedUnit
+	next, cut, previousAt := 0, 0, 0 // next unread letter; where the open unit's text begins; the previous word's last letter
+	for _, word := range words {
+		var spelled []rune
+		for _, r := range word.Text {
+			if isSpokenRune(r) {
+				spelled = append(spelled, unicode.ToLower(r))
+			}
+		}
+		if len(spelled) == 0 {
+			continue
+		}
+		if word.Start == nil || *word.Start < 0 || next+len(spelled) > len(letters) {
+			return nil
+		}
+		for i, r := range spelled {
+			if letters[next+i].r != r {
+				return nil
+			}
+		}
+		start := int64(*word.Start)
+		end := start
+		if word.Duration != nil && *word.Duration > 0 {
+			end = int64(*word.Start + *word.Duration)
+		}
+		if len(units) == 0 {
+			units = append(units, TimedUnit{Speaker: speaker, StartMS: start, EndMS: end})
+		} else {
+			last := &units[len(units)-1]
+			// The gap holds the previous word's last letter, then punctuation
+			// and spaces up to this word.
+			gap := text[previousAt:letters[next].at]
+			split := strings.LastIndexFunc(gap, unicode.IsSpace)
+			if split < 0 {
+				split = strings.LastIndexAny(gap, "。！？")
+			}
+			if split >= 0 {
+				boundary := previousAt + split
+				_, size := utf8.DecodeRuneInString(text[boundary:])
+				boundary += size // past the space or sentence mark
+				last.Text = strings.TrimSpace(text[cut:boundary])
+				cut = boundary
+				units = append(units, TimedUnit{Speaker: speaker, StartMS: max(start, last.StartMS), EndMS: max(end, last.StartMS)})
+			} else {
+				last.EndMS = max(last.EndMS, end)
+			}
+		}
+		next += len(spelled)
+		previousAt = letters[next-1].at
+	}
+	if len(units) == 0 || next != len(letters) {
+		return nil
+	}
+	units[len(units)-1].Text = strings.TrimSpace(text[cut:])
+	return units
+}
+
+func isSpokenRune(r rune) bool {
+	return unicode.IsLetter(r) || unicode.IsNumber(r) || unicode.IsMark(r)
 }
 
 func sleepSpeechRetry(ctx context.Context, delay time.Duration) error {

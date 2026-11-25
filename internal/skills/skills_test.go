@@ -159,13 +159,13 @@ func TestStrategyPlanSentinels(t *testing.T) {
 	if len(plan) != 2 {
 		t.Fatalf("expected 2 specs, got %d: %#v", len(plan), plan)
 	}
-	if plan[0].ModelName != "gemini-3.8-flash" {
+	if plan[0].ModelName != "gemini-4-hydrogen" {
 		t.Errorf("@model was not normalized: %q", plan[0].ModelName)
 	}
 	if plan[1].ModelName == plan[0].ModelName || plan[1].ModelName == "" {
 		t.Errorf("@secondary-auto unresolved: %q", plan[1].ModelName)
 	}
-	if plan[0].CandidateID != "gemini_3.8_flash" {
+	if plan[0].CandidateID != "gemini_4_hydrogen" {
 		t.Errorf("@auto id wrong: %q", plan[0].CandidateID)
 	}
 }
@@ -187,14 +187,14 @@ Use the configured strategy.
 	if err != nil {
 		t.Fatal(err)
 	}
-	plan, ok := reg.StrategyPlan("alias_strategy", "gemini-3.8-flash", "")
+	plan, ok := reg.StrategyPlan("alias_strategy", "gemini-4-hydrogen", "")
 	if !ok || len(plan) != 1 {
 		t.Fatalf("strategy plan not found: ok=%v plan=%#v", ok, plan)
 	}
-	if plan[0].ModelName != "gemini-3.8-flash" {
+	if plan[0].ModelName != "gemini-4-hydrogen" {
 		t.Fatalf("explicit model alias was not normalized: %#v", plan[0])
 	}
-	if plan[0].CandidateID != "gemini_3.8_flash" {
+	if plan[0].CandidateID != "gemini_4_hydrogen" {
 		t.Fatalf("auto id was not based on normalized model: %#v", plan[0])
 	}
 }
@@ -321,6 +321,19 @@ func TestRouterSelectsSkill(t *testing.T) {
 	}
 	if bytes.Contains(wire, []byte(`"tool_choice"`)) {
 		t.Fatalf("router should rely on the documented default auto tool choice: %s", wire)
+	}
+
+	// Thinking shares the output cap on models that think at length.
+	for model, want := range map[string]gemini.InteractionGenerationConfig{
+		"gemini-3.5-flash-lite": {MaxOutputTokens: 1024},
+		"gemini-4-hydrogen":     {MaxOutputTokens: 65536, ThinkingLevel: "low"},
+	} {
+		if _, _, err := NewRouter(reg, generator, model).RouteFormat(context.Background(), "medical"); err != nil {
+			t.Fatal(err)
+		}
+		if got := *generator.req.GenerationConfig; got != want {
+			t.Errorf("%s generation config = %+v, want %+v", model, got, want)
+		}
 	}
 
 	// No function call => no selection.
